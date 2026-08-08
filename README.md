@@ -33,7 +33,24 @@ python UndertaleExtractor.py
    ```
 3. Scroll through sprites, textures, audio, music, etc.  
    Use **Prev / Next** — the app shows 36 files per page so it won’t freeze.
-4. **Click any file** to download it to your Downloads folder
+4. Open **Rooms** and **click a room to enter it in-game**  
+   (close Undertale first, then open the game and press **Continue**)
+5. Click other files (sprites/audio/…) to download them
+
+### Enter rooms in-game
+1. Close Undertale completely  
+2. In the app, open the **Rooms** category  
+3. Click the room you want (or press **Enter Room In-Game**)  
+4. Start Undertale → **Continue**
+
+Your save (`%LOCALAPPDATA%\UNDERTALE\file0`) is updated and a `.bak` backup is created.  
+Some rooms trigger the Annoying Dog screen (dogcheck) — that’s normal for unused rooms.
+
+If the save folder isn’t found automatically, click **Save Folder…** and select:
+```
+C:\Users\<you>\AppData\Local\UNDERTALE
+```
+
 
 ### Extra buttons
 - **Download Folder…** — change where clicked files are saved  
