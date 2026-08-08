@@ -14,6 +14,7 @@ from .assets import AssetKind, GameAsset
 from .dogcheck import (
     disable_dogcheck,
     dogcheck_exit_stubbed,
+    is_dogcheck_room,
     restore_data_win_backup,
 )
 from .live_teleport import (
@@ -777,11 +778,13 @@ class UndertaleExtractorApp(ctk.CTk):
         )
         thumb_label.pack(pady=(10, 4))
 
-        display = (
-            friendly_room_label(asset.name, int(asset.meta.get("room_id", 0)))
-            if asset.is_room
-            else asset.display_name
-        )
+        if asset.is_room:
+            rid = int(asset.meta.get("room_id", 0))
+            display = friendly_room_label(asset.name, rid)
+            if is_dogcheck_room(rid):
+                display = f"{display} ⚠"
+        else:
+            display = asset.display_name
         name_label = ctk.CTkLabel(
             frame,
             text=display[:28] + ("…" if len(display) > 28 else ""),
@@ -852,12 +855,20 @@ class UndertaleExtractorApp(ctk.CTk):
         self.selected = asset
         if asset.is_room:
             room_id = int(asset.meta.get("room_id", -1))
-            self.preview_name.configure(text=friendly_room_label(asset.name, room_id))
+            title = friendly_room_label(asset.name, room_id)
+            if is_dogcheck_room(room_id):
+                title = f"{title}  ⚠ dog"
+            self.preview_name.configure(text=title)
             self.preview_meta.configure(
                 text=(
                     f"Room ID {room_id}\n"
                     f"Size {asset.meta.get('width', '?')}×{asset.meta.get('height', '?')}\n"
-                    "Click to enter while Undertale is open"
+                    + (
+                        "Dogcheck room — Annoying Dog until patches disable it\n"
+                        if is_dogcheck_room(room_id)
+                        else ""
+                    )
+                    + "Click to enter while Undertale is open"
                 )
             )
             self.download_btn.configure(state="disabled")
@@ -904,9 +915,23 @@ class UndertaleExtractorApp(ctk.CTk):
             return
 
         label = friendly_room_label(self.selected.name, room_id)
+        if is_dogcheck_room(room_id):
+            label = f"{label}  (dogcheck room)"
 
         # Prefer live teleport while Undertale is running.
         if undertale_is_running():
+            if is_dogcheck_room(room_id):
+                cont = messagebox.askokcancel(
+                    "Dogcheck room",
+                    f"{label}\n\n"
+                    "Vanilla Undertale blocks this room with the Annoying Dog "
+                    "unless dogcheck is disabled.\n\n"
+                    "If you still see the dog: close Undertale → Enable live patches "
+                    "→ restart the game.\n\n"
+                    "Jump anyway?",
+                )
+                if not cont:
+                    return
             self._set_status(f"Jumping to {label} in the open game…")
             self.update_idletasks()
             try:
