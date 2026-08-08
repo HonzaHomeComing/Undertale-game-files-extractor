@@ -45,6 +45,15 @@ python UndertaleExtractor.py
 python UndertaleExtractor.py "C:\Program Files (x86)\Steam\steamapps\common\Undertale" --extract-all exported
 ```
 
-## Notes
-- You need your own copy of Undertale (game files are not included)
-- Works with `data.win` from the Windows / Steam version
+## Optional companion: PNG → Blender
+
+`png_to_blender.py` turns PNG sprites into Blender-ready `.obj` models.
+
+```bat
+pip install Pillow
+python png_to_blender.py my_sprite.png
+```
+
+Then in Blender: **File → Import → Wavefront (.obj)**
+
+Or double-click `png_to_blender.py` for a small window. Modes: `voxels` (pixel cubes), `plane`, `height`.
