@@ -777,27 +777,78 @@ def is_windows() -> bool:
     return sys.platform.startswith("win")
 
 
+# Window titles that mention Undertale but are NOT the game (this app, tools, …).
+_NOT_GAME_TITLE_SNIPPETS = (
+    "extractor",
+    "wiper",
+    "mod tool",
+    "modtool",
+    "undertale file",
+    "data wiper",
+    "png_to_blender",
+)
+
+
+def _title_looks_like_game(title: str) -> bool:
+    """True only for the real game window, not this extractor."""
+    t = title.strip()
+    if not t:
+        return False
+    low = t.lower()
+    if any(s in low for s in _NOT_GAME_TITLE_SNIPPETS):
+        return False
+    # Steam / GameMaker default title is exactly "UNDERTALE"
+    return low == "undertale"
+
+
 def find_undertale_hwnd() -> int:
-    """Return HWND for the Undertale window, or 0."""
+    """Return HWND for the Undertale *game* window, or 0."""
     if not is_windows():
         return 0
     user32 = ctypes.windll.user32
-    for title in ("UNDERTALE", "Undertale", "undertale"):
-        hwnd = user32.FindWindowW(None, title)
+
+    # Prefer a window owned by UNDERTALE.exe (authoritative).
+    pid = _pid_by_name(("UNDERTALE.exe", "undertale.exe", "Undertale.exe"))
+    if pid:
+        hwnd = _hwnd_for_pid(pid)
         if hwnd:
-            return int(hwnd)
+            return hwnd
+
+    # Exact title match only — never substring "undertale" (matches this app's title).
+    for title in ("UNDERTALE", "Undertale", "undertale"):
+        hwnd = int(user32.FindWindowW(None, title) or 0)
+        if not hwnd:
+            continue
+        if _hwnd_pid(hwnd) == os.getpid():
+            continue
+        return hwnd
+    return 0
+
+
+def _hwnd_pid(hwnd: int) -> int:
+    pid = wintypes.DWORD()
+    ctypes.windll.user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+    return int(pid.value)
+
+
+def _hwnd_for_pid(pid: int) -> int:
+    """Find a visible top-level window belonging to pid."""
+    if not is_windows() or not pid:
+        return 0
+    user32 = ctypes.windll.user32
     found: list[int] = []
 
     @ctypes.WINFUNCTYPE(ctypes.c_bool, wintypes.HWND, wintypes.LPARAM)
     def enum_proc(hwnd, _lparam):
+        if _hwnd_pid(int(hwnd)) != pid:
+            return True
+        if not user32.IsWindowVisible(hwnd):
+            return True
         length = user32.GetWindowTextLengthW(hwnd)
         if length <= 0:
             return True
-        buf = ctypes.create_unicode_buffer(length + 1)
-        user32.GetWindowTextW(hwnd, buf, length + 1)
-        if "undertale" in buf.value.lower() and user32.IsWindowVisible(hwnd):
-            found.append(int(hwnd))
-        return True
+        found.append(int(hwnd))
+        return False  # stop
 
     user32.EnumWindows(enum_proc, 0)
     return found[0] if found else 0
@@ -806,12 +857,7 @@ def find_undertale_hwnd() -> int:
 def find_undertale_pid() -> int | None:
     if not is_windows():
         return None
-    hwnd = find_undertale_hwnd()
-    if hwnd:
-        pid = wintypes.DWORD()
-        ctypes.windll.user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
-        if pid.value:
-            return int(pid.value)
+    # Process name first — do not trust window titles (extractor title contains "Undertale").
     return _pid_by_name(("UNDERTALE.exe", "undertale.exe", "Undertale.exe"))
 
 
