@@ -37,6 +37,16 @@ python UndertaleExtractor.py
    (close Undertale first, then open the game and press **Continue**)
 5. Click other files (sprites/audio/…) to download them
 
+### Launch + Debug Toolkit
+1. Open your Undertale folder  
+2. Click **Launch Undertale** (applies safe patches, then starts `UNDERTALE.exe`)  
+3. Click **Debug Toolkit** for:
+   - **Stats** — LOVE, HP, AT, DF, EXP, gold, kills  
+   - **Items** — all 8 inventory slots + weapon/armor  
+   - **Fights** — pick a battlegroup and **Start Fight** (debug Home key)
+
+If the game will not start after patching, click **Restore data.win**, then **Launch Undertale** again.
+
 ### Enter rooms in-game (live)
 1. Open your Undertale folder in the extractor (**browsing does not lock the game**)
 2. **Close Undertale** if it is running, then click **Enable live patches**

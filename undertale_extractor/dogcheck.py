@@ -242,10 +242,12 @@ def _find_first_pop(data: bytes, bc_off: int, length: int) -> tuple[int, int, by
 
 def _rebuild_dogcheck_always_pass(data: bytearray, bc_off: int, length: int, name: str) -> str | None:
     """
-    Replace scr_dogcheck body with:
+    Replace the start of scr_dogcheck with:
         dogcheck = 1;
         exit;
-    using the original Pop's variable operand (so the name/id stays correct).
+    Leave the rest of the blob untouched (unreachable) so we never overwrite
+    neighboring scripts if the reported length is wrong — that used to stop
+    Undertale from launching.
     """
     found = _find_first_pop(bytes(data), bc_off, length)
     if found is None:
@@ -257,24 +259,17 @@ def _rebuild_dogcheck_always_pass(data: bytearray, bc_off: int, length: int, nam
     if use_v15:
         push = struct.pack("<I", (OP_PUSHI_V15 << 24) | 1)
     else:
-        # Bytecode 14 Push Int16 value 1 (type Int16 in low nibble area varies;
-        # 0xC0000001 is widely seen for push.e 1).
         push = struct.pack("<I", (OP_PUSH << 24) | 1)
 
-    body = bytearray(push + pop_bytes)
-    already = (
-        bytes(data[bc_off : bc_off + len(body)]) == bytes(body)
-        and length > len(body)
-        and bytes(data[bc_off + len(body) : bc_off + len(body) + 4]) == exit_word
-    )
+    stub = push + pop_bytes + exit_word
+    if length < len(stub):
+        return None
+
+    already = bytes(data[bc_off : bc_off + len(stub)]) == stub
     if already:
         return f"rebuild:{name}=already"
 
-    while len(body) + 4 <= length:
-        body.extend(exit_word)
-    if len(body) < length:
-        body.extend(b"\x00" * (length - len(body)))
-    data[bc_off : bc_off + length] = body[:length]
+    data[bc_off : bc_off + len(stub)] = stub
     return f"rebuild:{name}"
 
 
