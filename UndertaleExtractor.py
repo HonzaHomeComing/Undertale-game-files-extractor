@@ -479,31 +479,28 @@ def friendly_room_label(name: str, room_id: int) -> str:
 
 # --- dogcheck.py ---
 
-# Classic HxD patches (Marxvee). Only applied when the bytes at the offset
-# still match a known pre-patch pattern — never blindly overwrite.
+# Classic HxD patches (Marxvee). Only applied when originals are known.
 MARXVEE_PATCHES: tuple[tuple[int, bytes, tuple[bytes, ...]], ...] = (
-    # offset, new_bytes, allowed_originals
-    (0x7213E4, bytes.fromhex("000100B7"), (bytes.fromhex("000100B7"),)),  # already / unknown → skip unless we add originals
+    (0x7213E4, bytes.fromhex("000100B7"), (bytes.fromhex("000100B7"),)),
     (0x7216D4, bytes.fromhex("000100B7"), (bytes.fromhex("000100B7"),)),
 )
 
-# Known originals for Marxvee (when present, allow patch). Keep empty-safe:
-# If only "already patched" is known, Marxvee won't fire on virgin files —
-# CODE stub handles modern builds instead.
 _MARXVEE_ORIGINALS: dict[int, tuple[bytes, ...]] = {
-    # Populated with observed pre-patch sequences when known.
-    # Without a match, we refuse to write (avoids bricking data.win).
+    # Without known pre-patch bytes we refuse to write (avoids bricking).
 }
 
-# Reported Steam / newer offsets (byte replace old→new).
-# Applied only when EVERY listed old-byte matches (set must be coherent).
+# Steam / newer builds (from UndertaleModTool maintainers):
+# These invert the dog-room branch but still let scr_dogcheck SET the
+# `dogcheck` variable — required by scr_load (debug L).
 STEAM_BYTE_PATCHES: tuple[tuple[int, int, int], ...] = (
     (0x76DF44, 0x01, 0x00),
     (0x76E058, 0x00, 0x01),
     (0x77473C, 0x01, 0x00),
 )
 
-# Bytecode 15+ Exit instruction (return;), little-endian word.
+# Old broken approach wrote this Exit opcode at the start of scr_dogcheck.
+# That skips `dogcheck = 1` and makes debug Load crash:
+#   Variable obj_mainchara.dogcheck not set before reading it (scr_load).
 EXIT_WORD = struct.pack("<I", 0x9D000000)
 
 DOGCHECK_NAMES = frozenset(
@@ -557,7 +554,6 @@ def _apply_marxvee(data: bytearray) -> list[str]:
             continue
         originals = _MARXVEE_ORIGINALS.get(offset, ())
         if current not in originals:
-            # Refuse unknown bytes — wrong game version would brick launch.
             continue
         data[offset : offset + len(patch)] = patch
         applied.append(f"marxvee@0x{offset:X}")
@@ -567,7 +563,6 @@ def _apply_marxvee(data: bytearray) -> list[str]:
 def _apply_steam_bytes(data: bytearray) -> list[str]:
     """Apply Steam dogcheck byte flips only if the whole set matches."""
     applied = []
-    # Require every offset either already-new or still-old (no mixed junk).
     ready = True
     need_write = False
     for offset, old, new in STEAM_BYTE_PATCHES:
@@ -594,10 +589,7 @@ def _apply_steam_bytes(data: bytearray) -> list[str]:
 
 
 def _find_code_entries(reader: BinaryReader) -> list[tuple[str, int, int]]:
-    """
-    Return list of (name, bytecode_abs_offset, length) for CODE entries.
-    Supports bytecode 14 (inline) and 15+ (blob pointer).
-    """
+    """Return list of (name, bytecode_abs_offset, length) for CODE entries."""
     reader.seek(0)
     if reader.read_tag() != "FORM":
         return []
@@ -635,17 +627,14 @@ def _find_code_entries(reader: BinaryReader) -> list[tuple[str, int, int]]:
             name_ptr = reader.read_u32()
             name = reader.read_cstring_at(name_ptr) if name_ptr else ""
             length = reader.read_u32()
-            # Dogcheck is a small script; reject absurd lengths.
             if length == 0 or length > 200_000:
                 continue
 
-            # Try bytecode 15+: locals, args, relative pointer to bytecode blob.
             locals_count = reader.read_u16()
             args = reader.read_u16()
             rel = reader.read_i32()
             bytecode_abs = reader.position - 4 + rel
             args_n = args & 0x7FFF
-            # Strict: tiny locals/args and pointer must land inside the file.
             if (
                 locals_count < 512
                 and args_n < 64
@@ -656,7 +645,6 @@ def _find_code_entries(reader: BinaryReader) -> list[tuple[str, int, int]]:
                 entries.append((name, bytecode_abs, length))
                 continue
 
-            # Bytecode 14: instructions start right after name ptr + length.
             bc14_start = off + 8
             if bc14_start + length <= reader.size:
                 entries.append((name, bc14_start, length))
@@ -665,59 +653,62 @@ def _find_code_entries(reader: BinaryReader) -> list[tuple[str, int, int]]:
     return entries
 
 
-def _patch_dogcheck_code(data: bytearray) -> list[str]:
-    """
-    Disable scr_dogcheck by writing a single Exit at the start of its bytecode.
-
-    Only touches the first instruction — never fills the whole length (a wrong
-    length used to be able to corrupt neighboring code and stop Undertale launching).
-    """
-    applied = []
-    reader = BinaryReader(bytes(data))
-    entries = _find_code_entries(reader)
-    targets = [e for e in entries if e[0] in DOGCHECK_NAMES or e[0].lower().endswith("dogcheck")]
-    if not targets:
-        return applied
-
-    for name, bc_off, length in targets:
-        if length < 4 or bc_off + 4 > len(data):
-            continue
-        original_head = bytes(data[bc_off : bc_off + 4])
-        if original_head == EXIT_WORD:
-            applied.append(f"code:{name}=already")
-            continue
-        data[bc_off : bc_off + 4] = EXIT_WORD
-        applied.append(f"code:{name}")
-    return applied
+def dogcheck_exit_stubbed(data_win: str | Path | bytes | bytearray) -> bool:
+    """True if scr_dogcheck starts with Exit (broken patch that crashes debug L)."""
+    if isinstance(data_win, (bytes, bytearray)):
+        data = bytes(data_win)
+    else:
+        data = Path(data_win).read_bytes()
+    try:
+        reader = BinaryReader(data)
+        for name, bc_off, length in _find_code_entries(reader):
+            if name in DOGCHECK_NAMES or name.lower().endswith("dogcheck"):
+                if length >= 4 and data[bc_off : bc_off + 4] == EXIT_WORD:
+                    return True
+    except Exception:
+        return False
+    return False
 
 
 def disable_dogcheck(data_win: str | Path, *, backup: bool = True) -> tuple[bool, str]:
     """
     Patch data.win so dogcheck no longer sends you to the Annoying Dog room.
 
-    Returns (changed_or_already_ok, message).
-    Requires restarting Undertale after a successful patch.
+    Must NOT replace scr_dogcheck with a bare Exit — that skips `dogcheck = 1`
+    and crashes scr_load / debug L with:
+      Variable obj_mainchara.dogcheck not set before reading it
     """
     path = Path(data_win)
+
+    # Heal previous bad CODE Exit stubs by restoring backup first.
+    if dogcheck_exit_stubbed(path):
+        bak = find_data_win_backup(path)
+        if bak is not None:
+            path.write_bytes(bak.read_bytes())
+        else:
+            return (
+                False,
+                "data.win has a broken dogcheck Exit stub (causes the L-key crash). "
+                "No backup found — use Steam → Properties → Verify integrity, "
+                "then click Enable live patches again.",
+            )
+
     raw = bytearray(path.read_bytes())
     before = bytes(raw)
 
     notes: list[str] = []
     notes.extend(_apply_marxvee(raw))
     notes.extend(_apply_steam_bytes(raw))
-    try:
-        notes.extend(_patch_dogcheck_code(raw))
-    except Exception as exc:
-        notes.append(f"code-scan-error:{exc}")
+    # Intentionally no CODE Exit stub — see module docstring / crash above.
 
-    # Ignore "already" noise when deciding if anything changed.
     if bytes(raw) == before:
         if any("already" in n for n in notes):
-            return True, "Dogcheck already disabled."
+            return True, "Dogcheck already disabled (safe patches)."
         return (
             False,
-            "Could not find dogcheck to patch automatically for this data.win version. "
-            "Use UndertaleModTool → Scripts → DisableDogcheck, then reopen this app.",
+            "Could not auto-disable dogcheck for this data.win version. "
+            "Debug Load (L) still works for normal rooms; for secret rooms use "
+            "UndertaleModTool → Scripts → DisableDogcheck.",
         )
 
     if backup:
@@ -727,26 +718,21 @@ def disable_dogcheck(data_win: str | Path, *, backup: bool = True) -> tuple[bool
 
 
 def dogcheck_likely_disabled(data_win: str | Path) -> bool:
+    """True only for safe disable methods — never for the broken Exit stub."""
     path = Path(data_win)
     data = path.read_bytes()
+    if dogcheck_exit_stubbed(data):
+        return False
     for offset, patch, _origs in MARXVEE_PATCHES:
         if offset + len(patch) <= len(data) and data[offset : offset + len(patch)] == patch:
-            return True
+            # Marxvee bytes alone aren't proof if we never wrote known originals;
+            # only count when steam set also matches or we explicitly applied.
+            pass
     steam_ok = 0
     for offset, _old, new in STEAM_BYTE_PATCHES:
         if offset < len(data) and data[offset] == new:
             steam_ok += 1
-    if steam_ok >= 2:
-        return True
-    try:
-        reader = BinaryReader(data)
-        for name, bc_off, length in _find_code_entries(reader):
-            if name in DOGCHECK_NAMES or name.lower().endswith("dogcheck"):
-                if length >= 4 and data[bc_off : bc_off + 4] == EXIT_WORD:
-                    return True
-    except Exception:
-        pass
-    return False
+    return steam_ok >= 2
 
 
 # --- live_teleport.py ---
@@ -755,8 +741,9 @@ def dogcheck_likely_disabled(data_win: str | Path) -> bool:
 DEBUG_OFFSETS = (
     0x725B24,  # 1.00
     0x725D8C,  # 1.001
-    0x7748C4,  # 1.08
     0x725DDC,  # variants
+    0x7748C4,  # 1.08-ish
+    0x7748F0,  # Steam (UndertaleModTool maintainers)
 )
 
 VK_L = 0x4C
@@ -989,35 +976,36 @@ def live_teleport_to_room(
 
     debug_on = False
     if data_win and Path(data_win).is_file():
+        if dogcheck_exit_stubbed(data_win):
+            return (
+                LiveTeleportResult(
+                    False,
+                    "broken_dogcheck",
+                    "Your data.win has a broken dogcheck patch that crashes when pressing L.\n\n"
+                    "1. Close Undertale\n"
+                    "2. Click Restore data.win\n"
+                    "3. Click Enable live patches\n"
+                    "4. Start Undertale and try again",
+                ),
+                [],
+            )
         debug_on = debug_flag_enabled(data_win)
-        dog_ok = dogcheck_likely_disabled(data_win)
-        # Never rewrite data.win while Undertale is running — that can block
-        # launch / cause sharing errors. User must use "Enable live patches" first.
-        if not debug_on or not dog_ok:
+        # Only debug mode is required for live Load (L).
+        # Dogcheck disable is optional (secret rooms); a bare Exit stub is harmful.
+        if not debug_on:
             return (
                 LiveTeleportResult(
                     False,
                     "patches_required",
-                    "Live teleport needs a one-time data.win patch.\n\n"
+                    "Live teleport needs debug Load (L) enabled once.\n\n"
                     "1. Close Undertale completely\n"
                     "2. Click Enable live patches in this app\n"
                     "3. Start Undertale, load your save\n"
                     "4. Click the room again\n\n"
-                    "If Undertale will not start, click Restore data.win.",
+                    "If you see a Code Error about dogcheck, click Restore data.win first.",
                 ),
                 [],
             )
-
-    if data_win and Path(data_win).is_file() and not debug_flag_enabled(data_win):
-        return (
-            LiveTeleportResult(
-                False,
-                "no_debug",
-                "Could not enable Undertale debug mode automatically. "
-                "Live teleport needs debug Load (L).",
-            ),
-            [],
-        )
 
     try:
         teleport_to_room(room_id, save_folder, backup=True)
@@ -2231,9 +2219,26 @@ class UndertaleExtractorApp(ctk.CTk):
                 if undertale_is_running()
                 else "Start Undertale anytime — browsing does not lock or patch data.win."
             )
+            warn = ""
+            try:
+                if dogcheck_exit_stubbed(self.data_win_path):
+                    warn = (
+                        " WARNING: broken dogcheck patch detected — click Restore data.win "
+                        "or Enable live patches (auto-heals) before using live Load (L)."
+                    )
+                    messagebox.showwarning(
+                        "Broken dogcheck patch",
+                        "Your data.win has an old dogcheck Exit stub that crashes Undertale "
+                        "when pressing L (debug load):\n\n"
+                        "Variable obj_mainchara.dogcheck not set…\n\n"
+                        "Close Undertale, then click Restore data.win "
+                        "(or Enable live patches to auto-heal from backup).",
+                    )
+            except Exception:
+                pass
             self._set_status(
                 f"Loaded {len(self.assets)} files from {result.path.name}. {running} "
-                "Room jump patches only when you click a room."
+                f"Use Enable live patches (game closed) for room jumps.{warn}"
             )
         except Exception as exc:
             self._on_load_error(exc)
@@ -2252,7 +2257,8 @@ class UndertaleExtractorApp(ctk.CTk):
             "Restore data.win?",
             "Replace data.win with the extractor backup "
             "(data.win.dogcheckbak / data.win.debugbak).\n\n"
-            "Use this if Undertale will not start after a live-teleport patch.",
+            "Use this if Undertale crashes on L with a dogcheck error, "
+            "or will not start after patching.",
         )
         if not ok:
             return
@@ -2305,8 +2311,9 @@ class UndertaleExtractorApp(ctk.CTk):
             "Patched data.win for live room teleport:\n• "
             + "\n• ".join(notes)
             + "\n\nNow start Undertale, load your save, then click a room.\n"
-            "Backup: data.win.dogcheckbak / data.win.debugbak\n"
-            "If the game will not start, click Restore data.win.",
+            "Backup: data.win.dogcheckbak / data.win.debugbak\n\n"
+            "If you get a Code Error about dogcheck when pressing L, "
+            "click Restore data.win, then Enable live patches again.",
         )
         self._set_status("Live patches applied — start Undertale, then click a room.")
 
@@ -2606,8 +2613,13 @@ class UndertaleExtractorApp(ctk.CTk):
                 )
                 return
 
-            if result.method in {"restart_required", "patches_required"}:
-                messagebox.showinfo("Enable live patches first", result.detail)
+            if result.method in {"restart_required", "patches_required", "broken_dogcheck"}:
+                title = (
+                    "Broken dogcheck patch"
+                    if result.method == "broken_dogcheck"
+                    else "Enable live patches first"
+                )
+                messagebox.showinfo(title, result.detail)
                 self._set_status(result.detail)
                 return
 

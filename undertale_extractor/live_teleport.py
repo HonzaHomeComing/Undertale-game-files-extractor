@@ -10,15 +10,16 @@ from ctypes import wintypes
 from dataclasses import dataclass
 from pathlib import Path
 
-from .dogcheck import disable_dogcheck, dogcheck_likely_disabled
+from .dogcheck import dogcheck_exit_stubbed
 from .teleport import teleport_to_room
 
 # Known data.win offsets where debug flag is a single byte (0 → 1).
 DEBUG_OFFSETS = (
     0x725B24,  # 1.00
     0x725D8C,  # 1.001
-    0x7748C4,  # 1.08
     0x725DDC,  # variants
+    0x7748C4,  # 1.08-ish
+    0x7748F0,  # Steam (UndertaleModTool maintainers)
 )
 
 VK_L = 0x4C
@@ -251,35 +252,36 @@ def live_teleport_to_room(
 
     debug_on = False
     if data_win and Path(data_win).is_file():
+        if dogcheck_exit_stubbed(data_win):
+            return (
+                LiveTeleportResult(
+                    False,
+                    "broken_dogcheck",
+                    "Your data.win has a broken dogcheck patch that crashes when pressing L.\n\n"
+                    "1. Close Undertale\n"
+                    "2. Click Restore data.win\n"
+                    "3. Click Enable live patches\n"
+                    "4. Start Undertale and try again",
+                ),
+                [],
+            )
         debug_on = debug_flag_enabled(data_win)
-        dog_ok = dogcheck_likely_disabled(data_win)
-        # Never rewrite data.win while Undertale is running — that can block
-        # launch / cause sharing errors. User must use "Enable live patches" first.
-        if not debug_on or not dog_ok:
+        # Only debug mode is required for live Load (L).
+        # Dogcheck disable is optional (secret rooms); a bare Exit stub is harmful.
+        if not debug_on:
             return (
                 LiveTeleportResult(
                     False,
                     "patches_required",
-                    "Live teleport needs a one-time data.win patch.\n\n"
+                    "Live teleport needs debug Load (L) enabled once.\n\n"
                     "1. Close Undertale completely\n"
                     "2. Click Enable live patches in this app\n"
                     "3. Start Undertale, load your save\n"
                     "4. Click the room again\n\n"
-                    "If Undertale will not start, click Restore data.win.",
+                    "If you see a Code Error about dogcheck, click Restore data.win first.",
                 ),
                 [],
             )
-
-    if data_win and Path(data_win).is_file() and not debug_flag_enabled(data_win):
-        return (
-            LiveTeleportResult(
-                False,
-                "no_debug",
-                "Could not enable Undertale debug mode automatically. "
-                "Live teleport needs debug Load (L).",
-            ),
-            [],
-        )
 
     try:
         teleport_to_room(room_id, save_folder, backup=True)
