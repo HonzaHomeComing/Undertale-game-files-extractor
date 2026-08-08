@@ -1,62 +1,49 @@
-# Undertale Game File Extractor
+# Undertale File Extractor (Windows)
 
-A windowed desktop app that opens your Undertale install, extracts the packed game assets from `data.win`, lets you scroll through them, and downloads any file you click.
+One Python file that opens a window, extracts Undertale game files from `data.win`, lets you scroll through them, and **downloads a file when you click it**.
 
-## Features
+## File to run
 
-- Open an Undertale folder (or `data.win` / `game.unx` directly)
-- Browse **sprites**, **textures**, **backgrounds**, **audio**, **music**, and **fonts**
-- Scrollable thumbnail grid with search and category filters
-- **Click a file to download it** to your Downloads folder
-- Export all visible files at once
-- Also picks up loose `mus_*.ogg` files next to the game data
+**`UndertaleExtractor.py`** — this is the whole app.
 
-## Requirements
+## How to use on Windows
 
-- Python 3.10+
-- A legal copy of Undertale (this tool does not include game files)
-- Tkinter (usually bundled with Python; on Linux: `sudo apt install python3-tk`)
+### 1. Install Python
+Download Python 3.10+ from https://www.python.org/downloads/  
+During setup, check **Add python.exe to PATH**.
 
-## Install
-
-```bash
-pip install -r requirements.txt
+### 2. Install packages
+Open **Command Prompt** and run:
+```bat
+pip install Pillow customtkinter
 ```
 
-## Run the app
-
-```bash
-python run.py
+### 3. Run the app
+- Double-click `UndertaleExtractor.py`  
+  **or**
+```bat
+python UndertaleExtractor.py
 ```
 
-Or:
-
-```bash
-python -m undertale_extractor
-```
-
+### 4. Open Undertale
 1. Click **Open Undertale Folder**
-2. Select the folder that contains `data.win` (Steam: usually `…/steamapps/common/Undertale`)
-3. Scroll through the extracted files
-4. Click any image or audio file to download it
+2. Select your Undertale install folder (the one that contains `data.win`), for example:
+   ```
+   C:\Program Files (x86)\Steam\steamapps\common\Undertale
+   ```
+3. Scroll through sprites, textures, audio, music, etc.
+4. **Click any file** to download it to your Downloads folder
 
-You can change the download folder with **Download Folder…**, or use **Save As…** for a one-off location.
+### Extra buttons
+- **Download Folder…** — change where clicked files are saved  
+- **Save As…** — pick a custom save location  
+- **Export All Visible** — save everything currently on screen  
 
-## CLI bulk extract
-
-```bash
-python -m undertale_extractor "/path/to/Undertale" --extract-all ./exported
-```
-
-## Tests
-
-```bash
-pip install -r requirements.txt pytest
-python -m pytest -q
+## Optional: extract everything without the window
+```bat
+python UndertaleExtractor.py "C:\Program Files (x86)\Steam\steamapps\common\Undertale" --extract-all exported
 ```
 
 ## Notes
-
-- Works with Undertale’s GameMaker `data.win` (Windows) and `game.unx` (Linux)
-- Sprites are cropped from texture pages using the game’s TPAG data
-- For personal / modding use with a game you own
+- You need your own copy of Undertale (game files are not included)
+- Works with `data.win` from the Windows / Steam version

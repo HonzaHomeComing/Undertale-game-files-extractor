@@ -327,9 +327,9 @@ class UndertaleExtractorApp(ctk.CTk):
         if not path:
             # Also allow picking data.win directly
             file_path = filedialog.askopenfilename(
-                title="Or select data.win / game.unx",
+                title="Or select data.win",
                 filetypes=[
-                    ("GameMaker data", "data.win game.unx game.ios"),
+                    ("Undertale data.win", "*.win"),
                     ("All files", "*.*"),
                 ],
             )
