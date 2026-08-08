@@ -59,13 +59,12 @@ def test_live_teleport_not_running_message(tmp_path: Path):
     assert result.method in {"not_running", "unsupported"}
 
 
-def test_live_teleport_restart_required(tmp_path: Path):
+def test_live_teleport_patches_gate(tmp_path: Path):
     if not lt.is_windows():
         return
-    # Can't easily fake a running process on CI; just ensure API accepts data_win
     data = bytearray(0x780000)
     path = tmp_path / "data.win"
     path.write_bytes(data)
-    # Without a running game this returns not_running before restart check
+    # Without a running game this returns not_running before patch check
     result, _ = lt.live_teleport_to_room(5, data_win=path)
-    assert result.method in {"not_running", "unsupported", "restart_required"}
+    assert result.method in {"not_running", "unsupported", "patches_required", "restart_required"}

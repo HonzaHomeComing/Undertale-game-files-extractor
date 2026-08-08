@@ -2,8 +2,32 @@
 
 from __future__ import annotations
 
+import os
+import shutil
 import struct
+import tempfile
 from pathlib import Path
+
+
+def read_game_file_bytes(path: str | Path) -> bytes:
+    """
+    Read a game file without holding a long-lived lock on the install copy.
+
+    Copies to a temp file first so Steam / Undertale can open data.win while
+    this app is browsing (Windows exclusive opens used to block launch).
+    """
+    path = Path(path)
+    tmp_dir = Path(tempfile.gettempdir()) / "undertale_extractor_read"
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+    tmp_path = tmp_dir / f"{os.getpid()}_{path.name}"
+    try:
+        shutil.copy2(path, tmp_path)
+        return tmp_path.read_bytes()
+    finally:
+        try:
+            tmp_path.unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
 class BinaryReader:
@@ -15,7 +39,7 @@ class BinaryReader:
 
     @classmethod
     def from_path(cls, path: str | Path) -> "BinaryReader":
-        return cls(Path(path).read_bytes())
+        return cls(read_game_file_bytes(path))
 
     @property
     def position(self) -> int:

@@ -11,8 +11,9 @@ import customtkinter as ctk
 from PIL import Image
 
 from .assets import AssetKind, GameAsset
-from .dogcheck import disable_dogcheck
+from .dogcheck import disable_dogcheck, dogcheck_likely_disabled, restore_data_win_backup
 from .live_teleport import (
+    debug_flag_enabled,
     enable_debug_mode,
     live_teleport_to_room,
     undertale_is_running,
@@ -167,6 +168,30 @@ class UndertaleExtractorApp(ctk.CTk):
             width=110,
         )
         self.save_dir_btn.pack(side="left", padx=4)
+
+        self.restore_btn = ctk.CTkButton(
+            actions,
+            text="Restore data.win",
+            command=self.restore_data_win,
+            fg_color=COLORS["border"],
+            hover_color="#c4baa8",
+            text_color=COLORS["ink"],
+            width=130,
+            state="disabled",
+        )
+        self.restore_btn.pack(side="left", padx=4)
+
+        self.patch_btn = ctk.CTkButton(
+            actions,
+            text="Enable live patches",
+            command=self.enable_live_patches,
+            fg_color=COLORS["border"],
+            hover_color="#c4baa8",
+            text_color=COLORS["ink"],
+            width=140,
+            state="disabled",
+        )
+        self.patch_btn.pack(side="left", padx=4)
 
         # Sidebar categories
         sidebar = ctk.CTkFrame(self, fg_color=COLORS["panel"], corner_radius=0, width=200)
@@ -484,28 +509,13 @@ class UndertaleExtractorApp(ctk.CTk):
             self._thumb_cache.clear()
             self._live_room_addrs = []
             self.export_all_btn.configure(state="normal")
+            self.restore_btn.configure(state="normal")
+            self.patch_btn.configure(state="normal")
             self.page = 0
             self._update_counts()
-            # Prepare debug mode + disable dogcheck for live room jumping.
-            setup_notes = []
-            try:
-                if enable_debug_mode(self.data_win_path, backup=True):
-                    setup_notes.append("debug on")
-            except Exception:
-                pass
-            try:
-                ok, msg = disable_dogcheck(self.data_win_path, backup=True)
-                if ok:
-                    setup_notes.append("dogcheck off")
-                    if "Restart" in msg:
-                        messagebox.showinfo(
-                            "Dogcheck disabled",
-                            "Undertale’s Annoying Dog blocker is now disabled in data.win.\n\n"
-                            "Restart Undertale once, load your save, then click rooms again.\n\n"
-                            "(A backup was saved as data.win.dogcheckbak)",
-                        )
-            except Exception as exc:
-                setup_notes.append(f"dogcheck failed: {exc}")
+            # Do NOT patch data.win on open — that rewrote the install file and could
+            # stop Undertale launching while / after this app loaded the folder.
+            # Live teleport applies debug + dogcheck patches only when you click a room.
             try:
                 if self.save_dir:
                     info = read_save_info(self.save_dir)
@@ -517,14 +527,86 @@ class UndertaleExtractorApp(ctk.CTk):
             running = (
                 "Undertale is open — click a room to jump live."
                 if undertale_is_running()
-                else "Start Undertale, load your save, then click a room."
+                else "Start Undertale anytime — browsing does not lock or patch data.win."
             )
-            extra = f" Setup: {', '.join(setup_notes)}." if setup_notes else ""
             self._set_status(
-                f"Loaded {len(self.assets)} files from {result.path.name}. {running}{extra}"
+                f"Loaded {len(self.assets)} files from {result.path.name}. {running} "
+                "Room jump patches only when you click a room."
             )
         except Exception as exc:
             self._on_load_error(exc)
+
+    def restore_data_win(self) -> None:
+        if not self.data_win_path:
+            messagebox.showinfo("No game open", "Open your Undertale folder first.")
+            return
+        if undertale_is_running():
+            messagebox.showwarning(
+                "Close Undertale first",
+                "Close Undertale completely, then click Restore data.win again.",
+            )
+            return
+        ok = messagebox.askokcancel(
+            "Restore data.win?",
+            "Replace data.win with the extractor backup "
+            "(data.win.dogcheckbak / data.win.debugbak).\n\n"
+            "Use this if Undertale will not start after a live-teleport patch.",
+        )
+        if not ok:
+            return
+        success, msg = restore_data_win_backup(self.data_win_path)
+        if success:
+            messagebox.showinfo("Restored", msg)
+            self._set_status(msg)
+        else:
+            messagebox.showerror("Restore failed", msg)
+
+    def enable_live_patches(self) -> None:
+        """Patch data.win for live room jumps — only while Undertale is closed."""
+        if not self.data_win_path:
+            messagebox.showinfo("No game open", "Open your Undertale folder first.")
+            return
+        if undertale_is_running():
+            messagebox.showwarning(
+                "Close Undertale first",
+                "Undertale must be fully closed before patching data.win.\n"
+                "Close the game, click Enable live patches, then start Undertale again.",
+            )
+            return
+        notes = []
+        try:
+            if enable_debug_mode(self.data_win_path, backup=True):
+                notes.append("debug load (L) enabled")
+        except OSError as exc:
+            messagebox.showerror(
+                "Could not patch",
+                f"Windows blocked writing data.win:\n{exc}\n\n"
+                "Close Undertale/Steam overlays and try again.",
+            )
+            return
+        except Exception as exc:
+            notes.append(f"debug failed: {exc}")
+        try:
+            ok, msg = disable_dogcheck(self.data_win_path, backup=True)
+            if ok:
+                notes.append("dogcheck disabled")
+            else:
+                notes.append(msg)
+        except OSError as exc:
+            messagebox.showerror("Could not patch", str(exc))
+            return
+        except Exception as exc:
+            notes.append(f"dogcheck failed: {exc}")
+
+        messagebox.showinfo(
+            "Live patches ready",
+            "Patched data.win for live room teleport:\n• "
+            + "\n• ".join(notes)
+            + "\n\nNow start Undertale, load your save, then click a room.\n"
+            "Backup: data.win.dogcheckbak / data.win.debugbak\n"
+            "If the game will not start, click Restore data.win.",
+        )
+        self._set_status("Live patches applied — start Undertale, then click a room.")
 
     def _on_load_error(self, exc: Exception) -> None:
         self._loading = False
@@ -822,8 +904,8 @@ class UndertaleExtractorApp(ctk.CTk):
                 )
                 return
 
-            if result.method == "restart_required":
-                messagebox.showinfo("Restart Undertale once", result.detail)
+            if result.method in {"restart_required", "patches_required"}:
+                messagebox.showinfo("Enable live patches first", result.detail)
                 self._set_status(result.detail)
                 return
 
