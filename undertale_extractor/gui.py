@@ -225,7 +225,6 @@ class UndertaleExtractorApp(ctk.CTk):
             text_color=COLORS["muted"],
         )
         self.preview_canvas.pack(padx=16, pady=8)
-        self._preview_image: ctk.CTkImage | None = None
 
         self.preview_name = ctk.CTkLabel(
             preview,
