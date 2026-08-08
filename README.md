@@ -37,19 +37,16 @@ python UndertaleExtractor.py
    (close Undertale first, then open the game and press **Continue**)
 5. Click other files (sprites/audio/…) to download them
 
-### Enter rooms in-game
-1. Close Undertale completely  
-2. In the app, open the **Rooms** category  
-3. Click the room you want (or press **Enter Room In-Game**)  
-4. Start Undertale → **Continue**
+### Enter rooms in-game (live)
+1. Open Undertale and load your save (leave it running)
+2. In the extractor, open **Rooms**
+3. **Click a room** — you should jump there immediately
 
-Your save (`%LOCALAPPDATA%\UNDERTALE\file0`) is updated and a `.bak` backup is created.  
-Some rooms trigger the Annoying Dog screen (dogcheck) — that’s normal for unused rooms.
+First time only: the app enables Undertale’s debug warp flag in `data.win`.  
+If a click does nothing, **restart Undertale once**, then try again.
 
-If the save folder isn’t found automatically, click **Save Folder…** and select:
-```
-C:\Users\<you>\AppData\Local\UNDERTALE
-```
+If live jump can’t find your room in memory, save once at a save point and retry.  
+Save-file fallback (title screen → Continue) still works if the game is closed.
 
 
 ### Extra buttons
