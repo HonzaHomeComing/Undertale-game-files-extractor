@@ -1,11 +1,13 @@
 """
 Undertale File Extractor
 ========================
-Browse files and click Rooms to enter them while Undertale is open.
+Browse files, live-teleport rooms, launch a patched game, and edit saves.
 
-Open the folder to browse (does not lock or patch data.win).
-Use Enable live patches (Undertale closed) for live room jumps.
-Use Restore data.win if the game will not start after patching.
+Buttons:
+  Enable live patches — debug Load (L) + safe dogcheck disable
+  Launch Undertale — force-start UNDERTALE.exe with current data.win
+  Debug Toolkit — stats, inventory, fights (Home battlegroup)
+  Restore data.win — undo patches if the game will not start
 
 Windows: pip install Pillow customtkinter
          python UndertaleExtractor.py
@@ -20,6 +22,7 @@ import os
 import re
 import shutil
 import struct
+import subprocess
 import sys
 import tempfile
 import threading
@@ -40,7 +43,7 @@ except ImportError:
     input("Press Enter to exit...")
     raise SystemExit(1)
 
-__version__ = "1.5.0"
+__version__ = "1.6.0"
 
 
 # --- assets.py ---
@@ -714,10 +717,12 @@ def _find_first_pop(data: bytes, bc_off: int, length: int) -> tuple[int, int, by
 
 def _rebuild_dogcheck_always_pass(data: bytearray, bc_off: int, length: int, name: str) -> str | None:
     """
-    Replace scr_dogcheck body with:
+    Replace the start of scr_dogcheck with:
         dogcheck = 1;
         exit;
-    using the original Pop's variable operand (so the name/id stays correct).
+    Leave the rest of the blob untouched (unreachable) so we never overwrite
+    neighboring scripts if the reported length is wrong — that used to stop
+    Undertale from launching.
     """
     found = _find_first_pop(bytes(data), bc_off, length)
     if found is None:
@@ -729,24 +734,17 @@ def _rebuild_dogcheck_always_pass(data: bytearray, bc_off: int, length: int, nam
     if use_v15:
         push = struct.pack("<I", (OP_PUSHI_V15 << 24) | 1)
     else:
-        # Bytecode 14 Push Int16 value 1 (type Int16 in low nibble area varies;
-        # 0xC0000001 is widely seen for push.e 1).
         push = struct.pack("<I", (OP_PUSH << 24) | 1)
 
-    body = bytearray(push + pop_bytes)
-    already = (
-        bytes(data[bc_off : bc_off + len(body)]) == bytes(body)
-        and length > len(body)
-        and bytes(data[bc_off + len(body) : bc_off + len(body) + 4]) == exit_word
-    )
+    stub = push + pop_bytes + exit_word
+    if length < len(stub):
+        return None
+
+    already = bytes(data[bc_off : bc_off + len(stub)]) == stub
     if already:
         return f"rebuild:{name}=already"
 
-    while len(body) + 4 <= length:
-        body.extend(exit_word)
-    if len(body) < length:
-        body.extend(b"\x00" * (length - len(body)))
-    data[bc_off : bc_off + length] = body[:length]
+    data[bc_off : bc_off + len(stub)] = stub
     return f"rebuild:{name}"
 
 
@@ -1228,6 +1226,867 @@ def live_teleport_to_room(
         ),
         [],
     )
+
+
+# --- launcher.py ---
+
+EXE_NAMES = ("UNDERTALE.exe", "Undertale.exe", "undertale.exe")
+
+
+def find_undertale_exe(game_dir: str | Path | None = None, data_win: str | Path | None = None) -> Path | None:
+    """Locate UNDERTALE.exe next to data.win or in game_dir."""
+    candidates: list[Path] = []
+    if data_win:
+        p = Path(data_win)
+        candidates.append(p.parent if p.is_file() else p)
+    if game_dir:
+        candidates.append(Path(game_dir))
+    seen: set[Path] = set()
+    for folder in candidates:
+        try:
+            key = folder.resolve()
+        except OSError:
+            key = folder
+        if key in seen:
+            continue
+        seen.add(key)
+        for name in EXE_NAMES:
+            exe = folder / name
+            if exe.is_file():
+                return exe
+    return None
+
+
+def launch_undertale(
+    *,
+    data_win: str | Path | None = None,
+    game_dir: str | Path | None = None,
+) -> tuple[bool, str]:
+    """
+    Force-start Undertale using the patched data.win in the install folder.
+    Returns (ok, message).
+    """
+    exe = find_undertale_exe(game_dir=game_dir, data_win=data_win)
+    if exe is None:
+        return (
+            False,
+            "Could not find UNDERTALE.exe.\n"
+            "Open your Undertale folder in this app first "
+            "(the folder that contains data.win and UNDERTALE.exe).",
+        )
+    cwd = exe.parent
+    try:
+        if sys.platform.startswith("win"):
+            # Detach so closing the extractor does not kill the game.
+            flags = getattr(subprocess, "DETACHED_PROCESS", 0x00000008)
+            flags |= getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200)
+            subprocess.Popen(
+                [str(exe)],
+                cwd=str(cwd),
+                close_fds=True,
+                creationflags=flags,
+                env=os.environ.copy(),
+            )
+        else:
+            subprocess.Popen([str(exe)], cwd=str(cwd), start_new_session=True)
+    except OSError as exc:
+        return False, f"Failed to start Undertale:\n{exc}"
+    return True, f"Started {exe.name} from:\n{cwd}"
+
+
+# --- save_editor.py ---
+
+# 0-based line indices in file0 (community / Flowey's Time Machine layout).
+LINE_NAME = 0
+LINE_LOVE = 1
+LINE_HP = 2
+LINE_MAXHP = 3
+LINE_AT = 4
+LINE_WEAPON_AT = 5
+LINE_DF = 6
+LINE_ARMOR_DF = 7
+LINE_EXP = 9
+LINE_GOLD = 10
+LINE_KILLS = 11
+# Inventory slots at 12,14,16,18,20,22,24,26 (0-based)
+INV_SLOTS = (12, 14, 16, 18, 20, 22, 24, 26)
+LINE_WEAPON = 28
+LINE_ARMOR = 29
+
+# Flowey's Time Machine item list (index == item id).
+ITEMS: tuple[str, ...] = (
+    "Empty",
+    "Monster Candy",
+    "Croquet Roll",
+    "Stick",
+    "Bandage",
+    "Rock Candy",
+    "Pumpkin Rings",
+    "Spider Donut",
+    "Stoic Onion",
+    "Ghost Fruit",
+    "Spider Cider",
+    "Butterscotch Pie",
+    "Faded Ribbon",
+    "Toy Knife",
+    "Tough Glove",
+    "Manly Bandana",
+    "Snowman Piece",
+    "Nice Cream",
+    "Puppydough Icecream",
+    "Bisicle",
+    "Unisicle",
+    "Cinnamon Bun",
+    "Temmie Flakes",
+    "Abandoned Quiche",
+    "Old Tutu",
+    "Ballet Shoes",
+    "Punch Card",
+    "Annoying Dog",
+    "Dog Salad",
+    "Dog Residue (1)",
+    "Dog Residue (2)",
+    "Dog Residue (3)",
+    "Dog Residue (4)",
+    "Dog Residue (5)",
+    "Dog Residue (6)",
+    "Astronaut Food",
+    "Instant Noodles",
+    "Crab Apple",
+    "Hot Dog...?",
+    "Hot Cat",
+    "Glamburger",
+    "Sea Tea",
+    "Starfait",
+    "Legendary Hero",
+    "Cloudy Glasses",
+    "Torn Notebook",
+    "Stained Apron",
+    "Burnt Pan",
+    "Cowboy Hat",
+    "Empty Gun",
+    "Heart Locket",
+    "Worn Dagger",
+    "Real Knife",
+    "The Locket",
+    "Bad Memory",
+    "Dream",
+    "Undyne's Letter",
+    "Undyne Letter EX",
+    "Potato Chisps",
+    "Junk Food",
+    "Mystery Key",
+    "Face Steak",
+    "Hush Puppy",
+    "Snail Pie",
+    "temy armor",
+)
+
+WEAPONS: dict[int, str] = {
+    3: "Stick",
+    13: "Toy Knife",
+    14: "Tough Glove",
+    25: "Ballet Shoes",
+    45: "Torn Notebook",
+    47: "Burnt Pan",
+    49: "Empty Gun",
+    51: "Worn Dagger",
+    52: "Real Knife",
+}
+
+ARMORS: dict[int, str] = {
+    4: "Bandage",
+    12: "Faded Ribbon",
+    15: "Manly Bandana",
+    24: "Old Tutu",
+    44: "Cloudy Glasses",
+    46: "Stained Apron",
+    48: "Cowboy Hat",
+    50: "Heart Locket",
+    53: "The Locket",
+    64: "temy armor",
+}
+
+
+def item_name(item_id: int) -> str:
+    if 0 <= item_id < len(ITEMS):
+        return ITEMS[item_id]
+    return f"Item {item_id}"
+
+
+@dataclass
+class PlayerStats:
+    name: str = "CHARA"
+    love: int = 1
+    hp: int = 20
+    max_hp: int = 20
+    at: int = 10
+    weapon_at: int = 0
+    df: int = 10
+    armor_df: int = 0
+    exp: int = 0
+    gold: int = 0
+    kills: int = 0
+    inventory: list[int] | None = None
+    weapon: int = 3
+    armor: int = 4
+    room: int | None = None
+
+    def __post_init__(self) -> None:
+        if self.inventory is None:
+            self.inventory = [0] * 8
+
+
+def _fmt(existing: str, value: int | float | str) -> str:
+    if isinstance(value, str):
+        return value
+    existing = existing.strip()
+    if "." in existing:
+        return f"{float(value):.6f}"
+    return str(int(value))
+
+
+def _read_int(lines: list[str], idx: int, default: int = 0) -> int:
+    if idx >= len(lines):
+        return default
+    try:
+        return int(float(lines[idx].strip()))
+    except ValueError:
+        return default
+
+
+def read_player_stats(save_folder: str | Path | None = None) -> PlayerStats:
+    info = read_save_info(save_folder)
+    lines = info.file0.read_text(encoding="utf-8", errors="replace").splitlines()
+    inv = [_read_int(lines, i) for i in INV_SLOTS]
+    return PlayerStats(
+        name=lines[LINE_NAME].strip() if lines else "CHARA",
+        love=_read_int(lines, LINE_LOVE, 1),
+        hp=_read_int(lines, LINE_HP, 20),
+        max_hp=_read_int(lines, LINE_MAXHP, 20),
+        at=_read_int(lines, LINE_AT, 10),
+        weapon_at=_read_int(lines, LINE_WEAPON_AT, 0),
+        df=_read_int(lines, LINE_DF, 10),
+        armor_df=_read_int(lines, LINE_ARMOR_DF, 0),
+        exp=_read_int(lines, LINE_EXP, 0),
+        gold=_read_int(lines, LINE_GOLD, 0),
+        kills=_read_int(lines, LINE_KILLS, 0),
+        inventory=inv,
+        weapon=_read_int(lines, LINE_WEAPON, 3),
+        armor=_read_int(lines, LINE_ARMOR, 4),
+        room=info.current_room,
+    )
+
+
+def write_player_stats(
+    stats: PlayerStats,
+    save_folder: str | Path | None = None,
+    *,
+    backup: bool = True,
+    also_file9: bool = True,
+) -> Path:
+    """Write stats/inventory into file0 (and file9). Returns file0 path."""
+    info = read_save_info(save_folder)
+    lines = info.file0.read_text(encoding="utf-8", errors="replace").splitlines()
+    # Ensure enough lines for room index
+    while len(lines) <= max(INV_SLOTS[-1], LINE_ARMOR, ROOM_LINE_INDEX):
+        lines.append("0")
+
+    if backup:
+        shutil.copy2(info.file0, info.file0.with_suffix(info.file0.suffix + ".bak"))
+
+    def set_line(idx: int, value: int | str) -> None:
+        lines[idx] = _fmt(lines[idx], value)
+
+    set_line(LINE_NAME, stats.name)
+    set_line(LINE_LOVE, stats.love)
+    set_line(LINE_HP, stats.hp)
+    set_line(LINE_MAXHP, stats.max_hp)
+    set_line(LINE_AT, stats.at)
+    set_line(LINE_WEAPON_AT, stats.weapon_at)
+    set_line(LINE_DF, stats.df)
+    set_line(LINE_ARMOR_DF, stats.armor_df)
+    set_line(LINE_EXP, stats.exp)
+    set_line(LINE_GOLD, stats.gold)
+    set_line(LINE_KILLS, stats.kills)
+    inv = list(stats.inventory or [0] * 8)
+    while len(inv) < 8:
+        inv.append(0)
+    for slot, idx in enumerate(INV_SLOTS):
+        set_line(idx, int(inv[slot]))
+    set_line(LINE_WEAPON, stats.weapon)
+    set_line(LINE_ARMOR, stats.armor)
+
+    payload = "\n".join(lines)
+    if info.file0.read_bytes().endswith(b"\n"):
+        payload += "\n"
+    info.file0.write_text(payload, encoding="utf-8")
+
+    if also_file9:
+        file9 = info.folder / "file9"
+        if file9.is_file():
+            if backup:
+                shutil.copy2(file9, file9.with_suffix(file9.suffix + ".bak"))
+            file9.write_text(payload if payload.endswith("\n") else payload + "\n", encoding="utf-8")
+    return info.file0
+
+
+def default_save_folder() -> Path | None:
+    return default_save_dir()
+
+
+# --- battles.py ---
+
+# data.win offsets for the Home-key battlegroup id (little-endian int32).
+HOME_BATTLEGROUP_OFFSETS = (
+    0x9F553C,  # 1.00
+    0x9EB414,  # 1.001
+    0x9EB918,  # 1.001 Linux
+    0xBD8200,  # 1.06 / later
+)
+
+VK_HOME = 0x24
+
+
+@dataclass(frozen=True)
+class Battlegroup:
+    id: int
+    name: str
+
+
+# Curated list — major encounters + notable groups (from scr_battlegroup).
+BATTLEGROUPS: tuple[Battlegroup, ...] = (
+    Battlegroup(2, "Dummy"),
+    Battlegroup(3, "Fake Froggit"),
+    Battlegroup(4, "Froggit"),
+    Battlegroup(5, "Whimsun"),
+    Battlegroup(6, "Froggit + Whimsun"),
+    Battlegroup(7, "Moldsmal"),
+    Battlegroup(9, "Froggit + Froggit"),
+    Battlegroup(13, "Loox"),
+    Battlegroup(18, "Vegetoid"),
+    Battlegroup(20, "Napstablook"),
+    Battlegroup(22, "Toriel"),
+    Battlegroup(23, "Doggo"),
+    Battlegroup(24, "Lesser Dog"),
+    Battlegroup(25, "Dogamy + Dogaressa"),
+    Battlegroup(26, "Greater Dog"),
+    Battlegroup(27, "Papyrus"),
+    Battlegroup(28, "Gyftrot"),
+    Battlegroup(40, "Aaron"),
+    Battlegroup(41, "Temmie"),
+    Battlegroup(44, "Shyren"),
+    Battlegroup(45, "Mad Dummy"),
+    Battlegroup(47, "Undyne"),
+    Battlegroup(48, "Mettaton (quiz)"),
+    Battlegroup(49, "Royal Guards"),
+    Battlegroup(50, "Tsunderplane"),
+    Battlegroup(51, "Vulkin"),
+    Battlegroup(52, "Pyrope"),
+    Battlegroup(56, "Muffet"),
+    Battlegroup(57, "Mettaton (second)"),
+    Battlegroup(58, "Undyne (date fight)"),
+    Battlegroup(59, "Madjick"),
+    Battlegroup(60, "Knight Knight"),
+    Battlegroup(61, "Final Froggit"),
+    Battlegroup(76, "Royal Guards (alt)"),
+    Battlegroup(80, "Mettaton (third)"),
+    Battlegroup(81, "Mettaton EX"),
+    Battlegroup(82, "Lemon Bread"),
+    Battlegroup(83, "Reaper Bird"),
+    Battlegroup(84, "Snowdrake's Mother"),
+    Battlegroup(85, "Memoryheads"),
+    Battlegroup(86, "Endogeny"),
+    Battlegroup(91, "Monster Kid"),
+    Battlegroup(92, "Undyne the Undying"),
+    Battlegroup(93, "Glad Dummy"),
+    Battlegroup(94, "Mettaton NEO"),
+    Battlegroup(95, "Sans"),
+    Battlegroup(100, "Asgore (intro)"),
+    Battlegroup(101, "Asgore"),
+    Battlegroup(135, "Glyde"),
+    Battlegroup(140, "So Sorry"),
+    Battlegroup(255, "Asriel"),
+    Battlegroup(256, "Asriel (final)"),
+)
+
+
+def set_home_battlegroup(data_win: str | Path, battlegroup_id: int, *, backup: bool = True) -> tuple[bool, str]:
+    """
+    Write the debug Home-key battlegroup id into data.win at known offsets.
+    Close Undertale before calling for a reliable write; if the game is already
+    running with debug on, the in-memory value may not update until restart —
+    but sending Home still uses whatever is loaded. Prefer set-then-restart, or
+    set while closed then Launch.
+    """
+    if battlegroup_id < 0 or battlegroup_id > 1000:
+        return False, "Battlegroup id must be between 0 and 1000."
+    path = Path(data_win)
+    data = bytearray(path.read_bytes())
+    wrote = []
+    for offset in HOME_BATTLEGROUP_OFFSETS:
+        if offset + 4 > len(data):
+            continue
+        current = struct.unpack_from("<I", data, offset)[0]
+        # Only patch if it already looks like a battlegroup slot (0..400).
+        if current > 400:
+            continue
+        if current == battlegroup_id:
+            wrote.append(f"0x{offset:X}=already")
+            continue
+        if backup:
+            bak = path.with_suffix(path.suffix + ".battlebak")
+            if not bak.exists():
+                bak.write_bytes(path.read_bytes())
+        struct.pack_into("<I", data, offset, int(battlegroup_id))
+        wrote.append(f"0x{offset:X}")
+    if not wrote:
+        return (
+            False,
+            "Could not find a Home battlegroup slot in this data.win.\n"
+            "Enable live patches (debug), or set the fight in UndertaleModTool.",
+        )
+    path.write_bytes(data)
+    return True, f"Home battlegroup set to {battlegroup_id} ({', '.join(wrote)})."
+
+
+def trigger_home_fight() -> tuple[bool, str]:
+    """Focus Undertale and press Home to start the current battlegroup fight."""
+    if not undertale_is_running():
+        return False, "Undertale is not running. Launch it first, load a save, then start the fight."
+    if not find_undertale_hwnd():
+        return False, "Could not find the UNDERTALE window."
+    if not _send_key_to_undertale(VK_HOME, presses=1):
+        return False, "Could not send the Home key. Click the Undertale window and press Home."
+    time.sleep(0.15)
+    return True, "Sent Home — fight should start if debug mode is on."
+
+
+def start_fight(
+    battlegroup_id: int,
+    *,
+    data_win: str | Path | None = None,
+    ensure_debug: bool = True,
+) -> tuple[bool, str]:
+    """
+    Set Home battlegroup (if data_win given) and trigger the fight.
+    If Undertale is running, data.win writes may not apply until restart —
+    we still try Home with the currently loaded debug battlegroup, and tell
+    the user to relaunch if needed.
+    """
+    notes = []
+    if data_win and Path(data_win).is_file():
+        if ensure_debug and not debug_flag_enabled(data_win):
+            try:
+                if not undertale_is_running():
+                    enable_debug_mode(data_win, backup=True)
+                    notes.append("enabled debug")
+            except Exception as exc:
+                notes.append(f"debug failed: {exc}")
+        if undertale_is_running():
+            notes.append(
+                "Undertale is open — Home battlegroup patch needs a restart to take effect. "
+                "Close the game, click Launch Patched Undertale, load a save, then Start Fight again."
+            )
+            # Still try Home in case the value was already set from a previous launch.
+        else:
+            ok, msg = set_home_battlegroup(data_win, battlegroup_id, backup=True)
+            notes.append(msg)
+            if not ok:
+                return False, " | ".join(notes)
+
+    if not undertale_is_running():
+        return (
+            False,
+            "Battlegroup saved. Launch Undertale, load your save, then click Start Fight "
+            "(or press Home in-game).\n" + " | ".join(notes),
+        )
+
+    ok, msg = trigger_home_fight()
+    notes.append(msg)
+    return ok, " | ".join(notes)
+
+
+# --- toolkit.py ---
+
+COLORS = {
+    "bg": "#e8e2d6",
+    "panel": "#f4efe6",
+    "ink": "#1c1915",
+    "muted": "#5c564c",
+    "accent": "#c45c26",
+    "accent_hover": "#a64b1c",
+    "border": "#d2c8b6",
+    "success": "#2f6b4f",
+}
+
+
+class DebugToolkit(ctk.CTkToplevel):
+    def __init__(
+        self,
+        master,
+        *,
+        data_win: Path | None,
+        save_dir: Path | None,
+        on_status=None,
+    ):
+        super().__init__(master)
+        self.title("Undertale Debug Toolkit")
+        self.geometry("640x560")
+        self.minsize(560, 480)
+        self.configure(fg_color=COLORS["bg"])
+        self.data_win = Path(data_win) if data_win else None
+        self.save_dir = Path(save_dir) if save_dir else None
+        self.on_status = on_status
+        self._stats = PlayerStats()
+        self._inv_vars: list[ctk.StringVar] = []
+
+        ctk.CTkLabel(
+            self,
+            text="Debug Toolkit",
+            font=ctk.CTkFont(family="Courier New", size=22, weight="bold"),
+            text_color=COLORS["ink"],
+        ).pack(anchor="w", padx=16, pady=(14, 2))
+        ctk.CTkLabel(
+            self,
+            text="Launch the patched game, edit stats/items, start any fight (debug Home).",
+            text_color=COLORS["muted"],
+            font=ctk.CTkFont(size=12),
+        ).pack(anchor="w", padx=16, pady=(0, 8))
+
+        launch_row = ctk.CTkFrame(self, fg_color="transparent")
+        launch_row.pack(fill="x", padx=16, pady=4)
+        ctk.CTkButton(
+            launch_row,
+            text="Launch Patched Undertale",
+            command=self.launch_patched,
+            fg_color=COLORS["accent"],
+            hover_color=COLORS["accent_hover"],
+            text_color="#fffaf2",
+            width=200,
+        ).pack(side="left", padx=(0, 8))
+        ctk.CTkButton(
+            launch_row,
+            text="Prepare patches",
+            command=self.prepare_patches,
+            fg_color=COLORS["ink"],
+            hover_color="#33302b",
+            text_color="#fffaf2",
+            width=140,
+        ).pack(side="left")
+
+        self.tabs = ctk.CTkTabview(self, fg_color=COLORS["panel"])
+        self.tabs.pack(fill="both", expand=True, padx=16, pady=8)
+        self.tabs.add("Stats")
+        self.tabs.add("Items")
+        self.tabs.add("Fights")
+        self._build_stats_tab(self.tabs.tab("Stats"))
+        self._build_items_tab(self.tabs.tab("Items"))
+        self._build_fights_tab(self.tabs.tab("Fights"))
+
+        self.status = ctk.CTkLabel(self, text="", text_color=COLORS["muted"], wraplength=600)
+        self.status.pack(anchor="w", padx=16, pady=(0, 12))
+
+        self.after(100, self.reload_from_save)
+
+    def _say(self, msg: str) -> None:
+        self.status.configure(text=msg)
+        if self.on_status:
+            self.on_status(msg)
+
+    def prepare_patches(self) -> None:
+        if not self.data_win or not self.data_win.is_file():
+            messagebox.showinfo("No game", "Open your Undertale folder in the main window first.", parent=self)
+            return
+        if undertale_is_running():
+            messagebox.showwarning(
+                "Close Undertale first",
+                "Close Undertale completely before preparing patches.",
+                parent=self,
+            )
+            return
+        notes = []
+        try:
+            if enable_debug_mode(self.data_win, backup=True):
+                notes.append("debug ON")
+        except Exception as exc:
+            notes.append(f"debug failed: {exc}")
+        try:
+            ok, msg = disable_dogcheck(self.data_win, backup=True)
+            ok = ok and dogcheck_likely_disabled(self.data_win)
+            notes.append("dogcheck OFF" if ok else f"dogcheck still ON — {msg}")
+        except Exception as exc:
+            notes.append(f"dogcheck failed: {exc}")
+        messagebox.showinfo("Patches", "\n".join(notes) + "\n\nThen click Launch Patched Undertale.", parent=self)
+        self._say("Patches: " + "; ".join(notes))
+
+    def launch_patched(self) -> None:
+        if not self.data_win or not self.data_win.is_file():
+            messagebox.showinfo("No game", "Open your Undertale folder in the main window first.", parent=self)
+            return
+        if undertale_is_running():
+            messagebox.showinfo("Already running", "Undertale is already open.", parent=self)
+            return
+        # Ensure debug at least; dogcheck best-effort (safe stub won't brick launch).
+        try:
+            enable_debug_mode(self.data_win, backup=True)
+        except Exception:
+            pass
+        try:
+            disable_dogcheck(self.data_win, backup=True)
+        except Exception:
+            pass
+        ok, msg = launch_undertale(data_win=self.data_win)
+        if ok:
+            messagebox.showinfo(
+                "Launched",
+                msg
+                + "\n\nLoad your save (Continue). Use Stats/Items/Fights tabs anytime.\n"
+                "For fights: pick a battle → Start Fight (or press Home in-game).",
+                parent=self,
+            )
+            self._say(msg)
+        else:
+            messagebox.showerror("Launch failed", msg, parent=self)
+
+    def reload_from_save(self) -> None:
+        try:
+            self._stats = read_player_stats(self.save_dir)
+        except Exception as exc:
+            self._say(f"Could not read save: {exc}")
+            return
+        s = self._stats
+        self.var_name.set(s.name)
+        self.var_love.set(str(s.love))
+        self.var_hp.set(str(s.hp))
+        self.var_maxhp.set(str(s.max_hp))
+        self.var_at.set(str(s.at))
+        self.var_df.set(str(s.df))
+        self.var_exp.set(str(s.exp))
+        self.var_gold.set(str(s.gold))
+        self.var_kills.set(str(s.kills))
+        for i, var in enumerate(self._inv_vars):
+            iid = s.inventory[i] if s.inventory and i < len(s.inventory) else 0
+            var.set(f"{iid}: {item_name(iid)}")
+        self.var_weapon.set(f"{s.weapon}: {WEAPONS.get(s.weapon, item_name(s.weapon))}")
+        self.var_armor.set(f"{s.armor}: {ARMORS.get(s.armor, item_name(s.armor))}")
+        self._say(f"Loaded save ({s.name}, LV {s.love}, room {s.room}).")
+
+    def _build_stats_tab(self, tab) -> None:
+        grid = ctk.CTkFrame(tab, fg_color="transparent")
+        grid.pack(fill="both", expand=True, padx=8, pady=8)
+        self.var_name = ctk.StringVar()
+        self.var_love = ctk.StringVar()
+        self.var_hp = ctk.StringVar()
+        self.var_maxhp = ctk.StringVar()
+        self.var_at = ctk.StringVar()
+        self.var_df = ctk.StringVar()
+        self.var_exp = ctk.StringVar()
+        self.var_gold = ctk.StringVar()
+        self.var_kills = ctk.StringVar()
+        fields = [
+            ("Name", self.var_name),
+            ("LOVE", self.var_love),
+            ("HP", self.var_hp),
+            ("Max HP", self.var_maxhp),
+            ("AT", self.var_at),
+            ("DF", self.var_df),
+            ("EXP", self.var_exp),
+            ("Gold", self.var_gold),
+            ("Kills", self.var_kills),
+        ]
+        for row, (label, var) in enumerate(fields):
+            ctk.CTkLabel(grid, text=label, width=80, anchor="w").grid(row=row, column=0, sticky="w", pady=3)
+            ctk.CTkEntry(grid, textvariable=var, width=220).grid(row=row, column=1, sticky="w", pady=3)
+        btns = ctk.CTkFrame(tab, fg_color="transparent")
+        btns.pack(fill="x", padx=8, pady=8)
+        ctk.CTkButton(btns, text="Reload", command=self.reload_from_save, width=100).pack(side="left", padx=4)
+        ctk.CTkButton(
+            btns,
+            text="Save stats",
+            command=self.save_stats,
+            fg_color=COLORS["accent"],
+            hover_color=COLORS["accent_hover"],
+            width=120,
+        ).pack(side="left", padx=4)
+        ctk.CTkButton(btns, text="Max out", command=self.max_stats, width=100).pack(side="left", padx=4)
+
+    def _parse_stats(self) -> PlayerStats:
+        s = self._stats
+
+        def num(var, default=0):
+            try:
+                return int(float(var.get().strip()))
+            except ValueError:
+                return default
+
+        return PlayerStats(
+            name=self.var_name.get().strip() or s.name,
+            love=num(self.var_love, s.love),
+            hp=num(self.var_hp, s.hp),
+            max_hp=num(self.var_maxhp, s.max_hp),
+            at=num(self.var_at, s.at),
+            weapon_at=s.weapon_at,
+            df=num(self.var_df, s.df),
+            armor_df=s.armor_df,
+            exp=num(self.var_exp, s.exp),
+            gold=num(self.var_gold, s.gold),
+            kills=num(self.var_kills, s.kills),
+            inventory=list(s.inventory or [0] * 8),
+            weapon=s.weapon,
+            armor=s.armor,
+            room=s.room,
+        )
+
+    def max_stats(self) -> None:
+        self.var_love.set("20")
+        self.var_hp.set("99")
+        self.var_maxhp.set("99")
+        self.var_at.set("99")
+        self.var_df.set("99")
+        self.var_exp.set("99999")
+        self.var_gold.set("99999")
+
+    def save_stats(self) -> None:
+        try:
+            stats = self._parse_stats()
+            # Keep inventory/equip from current _stats / item tab vars
+            stats.inventory = self._inventory_from_vars()
+            stats.weapon = self._id_from_combo(self.var_weapon.get(), stats.weapon)
+            stats.armor = self._id_from_combo(self.var_armor.get(), stats.armor)
+            path = write_player_stats(stats, self.save_dir, backup=True)
+            self._stats = stats
+            self._say(f"Saved stats to {path}")
+            messagebox.showinfo("Saved", f"Stats written to:\n{path}\n\nLoad/Continue in Undertale (or press L).", parent=self)
+        except Exception as exc:
+            messagebox.showerror("Save failed", str(exc), parent=self)
+
+    def _id_from_combo(self, text: str, default: int = 0) -> int:
+        text = (text or "").strip()
+        if not text:
+            return default
+        try:
+            return int(text.split(":", 1)[0].strip())
+        except ValueError:
+            return default
+
+    def _inventory_from_vars(self) -> list[int]:
+        return [self._id_from_combo(v.get(), 0) for v in self._inv_vars]
+
+    def _build_items_tab(self, tab) -> None:
+        frame = ctk.CTkScrollableFrame(tab, fg_color="transparent")
+        frame.pack(fill="both", expand=True, padx=8, pady=8)
+        item_choices = [f"{i}: {name}" for i, name in enumerate(ITEMS)]
+        self._inv_vars = []
+        for slot in range(8):
+            ctk.CTkLabel(frame, text=f"Slot {slot + 1}", width=70, anchor="w").grid(
+                row=slot, column=0, sticky="w", pady=3
+            )
+            var = ctk.StringVar(value="0: Empty")
+            self._inv_vars.append(var)
+            ctk.CTkOptionMenu(frame, variable=var, values=item_choices, width=280).grid(
+                row=slot, column=1, sticky="w", pady=3
+            )
+        ctk.CTkLabel(frame, text="Weapon", width=70, anchor="w").grid(row=8, column=0, sticky="w", pady=6)
+        self.var_weapon = ctk.StringVar(value="3: Stick")
+        ctk.CTkOptionMenu(
+            frame,
+            variable=self.var_weapon,
+            values=[f"{i}: {n}" for i, n in sorted(WEAPONS.items())],
+            width=280,
+        ).grid(row=8, column=1, sticky="w", pady=6)
+        ctk.CTkLabel(frame, text="Armor", width=70, anchor="w").grid(row=9, column=0, sticky="w", pady=3)
+        self.var_armor = ctk.StringVar(value="4: Bandage")
+        ctk.CTkOptionMenu(
+            frame,
+            variable=self.var_armor,
+            values=[f"{i}: {n}" for i, n in sorted(ARMORS.items())],
+            width=280,
+        ).grid(row=9, column=1, sticky="w", pady=3)
+
+        btns = ctk.CTkFrame(tab, fg_color="transparent")
+        btns.pack(fill="x", padx=8, pady=8)
+        ctk.CTkButton(btns, text="Reload", command=self.reload_from_save, width=100).pack(side="left", padx=4)
+        ctk.CTkButton(
+            btns,
+            text="Save items",
+            command=self.save_items,
+            fg_color=COLORS["accent"],
+            hover_color=COLORS["accent_hover"],
+            width=120,
+        ).pack(side="left", padx=4)
+        ctk.CTkButton(btns, text="Fill pies", command=self.fill_pies, width=100).pack(side="left", padx=4)
+
+    def fill_pies(self) -> None:
+        pie = next((f"{i}: {n}" for i, n in enumerate(ITEMS) if n == "Butterscotch Pie"), "11: Butterscotch Pie")
+        for var in self._inv_vars:
+            var.set(pie)
+
+    def save_items(self) -> None:
+        try:
+            stats = self._parse_stats()
+            stats.inventory = self._inventory_from_vars()
+            stats.weapon = self._id_from_combo(self.var_weapon.get(), 3)
+            stats.armor = self._id_from_combo(self.var_armor.get(), 4)
+            path = write_player_stats(stats, self.save_dir, backup=True)
+            self._stats = stats
+            self._say(f"Saved items to {path}")
+            messagebox.showinfo("Saved", f"Inventory written to:\n{path}", parent=self)
+        except Exception as exc:
+            messagebox.showerror("Save failed", str(exc), parent=self)
+
+    def _build_fights_tab(self, tab) -> None:
+        ctk.CTkLabel(
+            tab,
+            text="Requires debug mode. Sets the Home-key battlegroup, then presses Home.",
+            text_color=COLORS["muted"],
+            wraplength=560,
+        ).pack(anchor="w", padx=8, pady=6)
+        self.fight_var = ctk.StringVar(
+            value=f"{BATTLEGROUPS[0].id}: {BATTLEGROUPS[0].name}"
+        )
+        values = [f"{b.id}: {b.name}" for b in BATTLEGROUPS]
+        ctk.CTkOptionMenu(tab, variable=self.fight_var, values=values, width=360).pack(
+            anchor="w", padx=8, pady=8
+        )
+        custom_row = ctk.CTkFrame(tab, fg_color="transparent")
+        custom_row.pack(fill="x", padx=8, pady=4)
+        ctk.CTkLabel(custom_row, text="Or id:").pack(side="left")
+        self.custom_fight = ctk.StringVar()
+        ctk.CTkEntry(custom_row, textvariable=self.custom_fight, width=80).pack(side="left", padx=6)
+        ctk.CTkButton(
+            tab,
+            text="Start Fight",
+            command=self.do_start_fight,
+            fg_color=COLORS["accent"],
+            hover_color=COLORS["accent_hover"],
+            width=160,
+        ).pack(anchor="w", padx=8, pady=12)
+        ctk.CTkLabel(
+            tab,
+            text="Tip: if Undertale is already open, close it → Launch Patched Undertale "
+            "→ Continue → Start Fight (so the Home battlegroup patch is loaded).",
+            text_color=COLORS["muted"],
+            wraplength=560,
+            justify="left",
+        ).pack(anchor="w", padx=8, pady=4)
+
+    def do_start_fight(self) -> None:
+        try:
+            if self.custom_fight.get().strip():
+                bg = int(self.custom_fight.get().strip())
+            else:
+                bg = self._id_from_combo(self.fight_var.get(), 0)
+        except ValueError:
+            messagebox.showerror("Bad id", "Enter a numeric battlegroup id.", parent=self)
+            return
+        ok, msg = start_fight(bg, data_win=self.data_win, ensure_debug=True)
+        if ok:
+            self._say(msg)
+            messagebox.showinfo("Fight", msg, parent=self)
+        else:
+            self._say(msg)
+            messagebox.showwarning("Fight", msg, parent=self)
 
 
 # --- parser.py ---
@@ -2070,6 +2929,31 @@ class UndertaleExtractorApp(ctk.CTk):
         )
         self.patch_btn.pack(side="left", padx=4)
 
+        self.launch_btn = ctk.CTkButton(
+            actions,
+            text="Launch Undertale",
+            command=self.launch_patched_undertale,
+            fg_color=COLORS["success"],
+            hover_color="#24553e",
+            text_color="#fffaf2",
+            width=140,
+            state="disabled",
+        )
+        self.launch_btn.pack(side="left", padx=4)
+
+        self.toolkit_btn = ctk.CTkButton(
+            actions,
+            text="Debug Toolkit",
+            command=self.open_debug_toolkit,
+            fg_color=COLORS["ink"],
+            hover_color="#33302b",
+            text_color="#fffaf2",
+            width=120,
+            state="disabled",
+        )
+        self.toolkit_btn.pack(side="left", padx=4)
+        self._toolkit: DebugToolkit | None = None
+
         # Sidebar categories
         sidebar = ctk.CTkFrame(self, fg_color=COLORS["panel"], corner_radius=0, width=200)
         sidebar.grid(row=1, column=0, sticky="nsw")
@@ -2388,6 +3272,8 @@ class UndertaleExtractorApp(ctk.CTk):
             self.export_all_btn.configure(state="normal")
             self.restore_btn.configure(state="normal")
             self.patch_btn.configure(state="normal")
+            self.launch_btn.configure(state="normal")
+            self.toolkit_btn.configure(state="normal")
             self.page = 0
             self._update_counts()
             # Do NOT patch data.win on open — that rewrote the install file and could
@@ -2525,6 +3411,50 @@ class UndertaleExtractorApp(ctk.CTk):
         else:
             messagebox.showerror("Patch incomplete", body)
             self._set_status("Live patches incomplete — see the error dialog.")
+
+    def launch_patched_undertale(self) -> None:
+        if not self.data_win_path:
+            messagebox.showinfo("No game open", "Open your Undertale folder first.")
+            return
+        if undertale_is_running():
+            messagebox.showinfo("Already running", "Undertale is already open.")
+            return
+        # Best-effort patches that keep the game launchable.
+        try:
+            enable_debug_mode(self.data_win_path, backup=True)
+        except Exception:
+            pass
+        try:
+            disable_dogcheck(self.data_win_path, backup=True)
+        except Exception:
+            pass
+        ok, msg = launch_undertale(data_win=self.data_win_path)
+        if ok:
+            messagebox.showinfo(
+                "Launched",
+                msg
+                + "\n\nClick Continue on the title screen.\n"
+                "Open Debug Toolkit for stats, items, and fights.",
+            )
+            self._set_status(msg)
+        else:
+            messagebox.showerror(
+                "Launch failed",
+                msg
+                + "\n\nIf the game will not start after dogcheck patches, "
+                "click Restore data.win, then Launch again.",
+            )
+
+    def open_debug_toolkit(self) -> None:
+        if self._toolkit is not None and self._toolkit.winfo_exists():
+            self._toolkit.focus()
+            return
+        self._toolkit = DebugToolkit(
+            self,
+            data_win=self.data_win_path,
+            save_dir=self.save_dir,
+            on_status=self._set_status,
+        )
 
     def _on_load_error(self, exc: Exception) -> None:
         self._loading = False

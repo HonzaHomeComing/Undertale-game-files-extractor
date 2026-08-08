@@ -18,6 +18,7 @@ from .dogcheck import (
     is_dogcheck_room,
     restore_data_win_backup,
 )
+from .launcher import launch_undertale
 from .live_teleport import (
     debug_flag_enabled,
     enable_debug_mode,
@@ -32,6 +33,7 @@ from .teleport import (
     read_save_info,
     teleport_to_room,
 )
+from .toolkit import DebugToolkit
 
 # Visual direction: ink-and-ember utility (not purple / cream-serif defaults)
 ctk.set_appearance_mode("light")
@@ -198,6 +200,31 @@ class UndertaleExtractorApp(ctk.CTk):
             state="disabled",
         )
         self.patch_btn.pack(side="left", padx=4)
+
+        self.launch_btn = ctk.CTkButton(
+            actions,
+            text="Launch Undertale",
+            command=self.launch_patched_undertale,
+            fg_color=COLORS["success"],
+            hover_color="#24553e",
+            text_color="#fffaf2",
+            width=140,
+            state="disabled",
+        )
+        self.launch_btn.pack(side="left", padx=4)
+
+        self.toolkit_btn = ctk.CTkButton(
+            actions,
+            text="Debug Toolkit",
+            command=self.open_debug_toolkit,
+            fg_color=COLORS["ink"],
+            hover_color="#33302b",
+            text_color="#fffaf2",
+            width=120,
+            state="disabled",
+        )
+        self.toolkit_btn.pack(side="left", padx=4)
+        self._toolkit: DebugToolkit | None = None
 
         # Sidebar categories
         sidebar = ctk.CTkFrame(self, fg_color=COLORS["panel"], corner_radius=0, width=200)
@@ -517,6 +544,8 @@ class UndertaleExtractorApp(ctk.CTk):
             self.export_all_btn.configure(state="normal")
             self.restore_btn.configure(state="normal")
             self.patch_btn.configure(state="normal")
+            self.launch_btn.configure(state="normal")
+            self.toolkit_btn.configure(state="normal")
             self.page = 0
             self._update_counts()
             # Do NOT patch data.win on open — that rewrote the install file and could
@@ -654,6 +683,50 @@ class UndertaleExtractorApp(ctk.CTk):
         else:
             messagebox.showerror("Patch incomplete", body)
             self._set_status("Live patches incomplete — see the error dialog.")
+
+    def launch_patched_undertale(self) -> None:
+        if not self.data_win_path:
+            messagebox.showinfo("No game open", "Open your Undertale folder first.")
+            return
+        if undertale_is_running():
+            messagebox.showinfo("Already running", "Undertale is already open.")
+            return
+        # Best-effort patches that keep the game launchable.
+        try:
+            enable_debug_mode(self.data_win_path, backup=True)
+        except Exception:
+            pass
+        try:
+            disable_dogcheck(self.data_win_path, backup=True)
+        except Exception:
+            pass
+        ok, msg = launch_undertale(data_win=self.data_win_path)
+        if ok:
+            messagebox.showinfo(
+                "Launched",
+                msg
+                + "\n\nClick Continue on the title screen.\n"
+                "Open Debug Toolkit for stats, items, and fights.",
+            )
+            self._set_status(msg)
+        else:
+            messagebox.showerror(
+                "Launch failed",
+                msg
+                + "\n\nIf the game will not start after dogcheck patches, "
+                "click Restore data.win, then Launch again.",
+            )
+
+    def open_debug_toolkit(self) -> None:
+        if self._toolkit is not None and self._toolkit.winfo_exists():
+            self._toolkit.focus()
+            return
+        self._toolkit = DebugToolkit(
+            self,
+            data_win=self.data_win_path,
+            save_dir=self.save_dir,
+            on_status=self._set_status,
+        )
 
     def _on_load_error(self, exc: Exception) -> None:
         self._loading = False
