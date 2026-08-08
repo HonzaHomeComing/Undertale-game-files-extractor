@@ -19,6 +19,7 @@ class AssetKind(str, Enum):
     AUDIO = "Audio"
     MUSIC = "Music"
     FONT = "Fonts"
+    ROOM = "Rooms"
     OTHER = "Other"
 
 
@@ -55,7 +56,13 @@ class GameAsset:
 
     @property
     def is_image(self) -> bool:
+        if self._image_fn is not None:
+            return True
         return self.extension.lower() in {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"}
+
+    @property
+    def is_room(self) -> bool:
+        return self.kind == AssetKind.ROOM or bool(self.meta.get("teleport"))
 
     @property
     def is_audio(self) -> bool:

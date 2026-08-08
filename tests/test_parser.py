@@ -60,6 +60,7 @@ def test_parse_extracts_expected_kinds(sample_game: Path):
     assert AssetKind.BACKGROUND in kinds
     assert AssetKind.AUDIO in kinds
     assert AssetKind.MUSIC in kinds
+    assert AssetKind.ROOM in kinds
     assert result.game_name == "UNDERTALE"
 
     sprites = [a for a in result.assets if a.kind == AssetKind.SPRITE]

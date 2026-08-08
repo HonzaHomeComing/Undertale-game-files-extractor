@@ -85,6 +85,8 @@ def build_minimal_data_win(path: str | Path) -> Path:
         ".wav",
         "snd_test.wav",
         "fnt_test",
+        "room_ruins1",
+        "room_torielhouse",
     ]
 
     # --- Build STRG chunk content ---
@@ -149,6 +151,8 @@ def build_minimal_data_win(path: str | Path) -> Path:
         name_snd = char_ptrs[3]
         name_ext = char_ptrs[4]
         name_file = char_ptrs[5]
+        name_room0 = char_ptrs[7]
+        name_room1 = char_ptrs[8]
 
         # TPAG — one entry, texture 0, full 32x32 (will patch absolute offset of entry)
         tpag_content = start_chunk("TPAG")
@@ -233,6 +237,21 @@ def build_minimal_data_win(path: str | Path) -> Path:
         out.extend(wav)
         struct.pack_into("<I", out, audo_off_table, aud_entry)
         end_chunk(audo_content)
+
+        # ROOM — two rooms with name + width/height
+        room_content = start_chunk("ROOM")
+        out.extend(struct.pack("<I", 2))
+        room_off_table = len(out)
+        out.extend(struct.pack("<II", 0, 0))
+        room0 = len(out)
+        out.extend(struct.pack("<I", name_room0))
+        out.extend(struct.pack("<ii", 320, 240))
+        room1 = len(out)
+        out.extend(struct.pack("<I", name_room1))
+        out.extend(struct.pack("<ii", 640, 480))
+        struct.pack_into("<I", out, room_off_table, room0)
+        struct.pack_into("<I", out, room_off_table + 4, room1)
+        end_chunk(room_content)
 
         # Patch FORM size
         form_size = len(out) - 8
