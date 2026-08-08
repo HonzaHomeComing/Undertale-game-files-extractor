@@ -11,6 +11,7 @@ import customtkinter as ctk
 from PIL import Image
 
 from .assets import AssetKind, GameAsset
+from .dogcheck import disable_dogcheck
 from .live_teleport import (
     enable_debug_mode,
     live_teleport_to_room,
@@ -485,15 +486,26 @@ class UndertaleExtractorApp(ctk.CTk):
             self.export_all_btn.configure(state="normal")
             self.page = 0
             self._update_counts()
-            # Prepare debug mode for live Insert/Del room warps (needs one game restart).
+            # Prepare debug mode + disable dogcheck for live room jumping.
+            setup_notes = []
             try:
                 if enable_debug_mode(self.data_win_path, backup=True):
-                    self._set_status(
-                        "Debug warp ready in data.win. If Undertale was already open, "
-                        "restart it once so live room click works."
-                    )
+                    setup_notes.append("debug on")
             except Exception:
                 pass
+            try:
+                ok, msg = disable_dogcheck(self.data_win_path, backup=True)
+                if ok:
+                    setup_notes.append("dogcheck off")
+                    if "Restart" in msg:
+                        messagebox.showinfo(
+                            "Dogcheck disabled",
+                            "Undertale’s Annoying Dog blocker is now disabled in data.win.\n\n"
+                            "Restart Undertale once, load your save, then click rooms again.\n\n"
+                            "(A backup was saved as data.win.dogcheckbak)",
+                        )
+            except Exception as exc:
+                setup_notes.append(f"dogcheck failed: {exc}")
             try:
                 if self.save_dir:
                     info = read_save_info(self.save_dir)
@@ -502,11 +514,14 @@ class UndertaleExtractorApp(ctk.CTk):
                 pass
             # Default to Rooms so teleporting is one click away.
             self.set_kind(AssetKind.ROOM)
-            running = "Undertale is open — click a room to jump live." if undertale_is_running() else (
-                "Start Undertale, load your save, then click a room."
+            running = (
+                "Undertale is open — click a room to jump live."
+                if undertale_is_running()
+                else "Start Undertale, load your save, then click a room."
             )
+            extra = f" Setup: {', '.join(setup_notes)}." if setup_notes else ""
             self._set_status(
-                f"Loaded {len(self.assets)} files from {result.path.name}. {running}"
+                f"Loaded {len(self.assets)} files from {result.path.name}. {running}{extra}"
             )
         except Exception as exc:
             self._on_load_error(exc)
