@@ -109,6 +109,15 @@ def test_game_asset_thumbnail():
     assert data[:8] == b"\x89PNG\r\n\x1a\n"
 
 
+def test_textures_are_lazy(sample_game: Path):
+    result = load_undertale_assets(sample_game)
+    assert result.textures
+    assert result._texture_image_cache == {}
+    img = result.get_texture_image(0)
+    assert img.size[0] > 0
+    assert 0 in result._texture_image_cache
+
+
 def test_missing_data_win(tmp_path: Path):
     with pytest.raises(FileNotFoundError):
         load_undertale_assets(tmp_path)

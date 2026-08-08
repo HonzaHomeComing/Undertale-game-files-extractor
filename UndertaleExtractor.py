@@ -15,6 +15,8 @@ How to run on Windows
       C:\\Program Files (x86)\\Steam\\steamapps\\common\\Undertale
    (or wherever your data.win is)
 5. Click any file to download it to your Downloads folder.
+
+Tip: the browser shows 36 files per page so Undertale does not freeze.
 """
 
 from __future__ import annotations
@@ -41,7 +43,7 @@ except ImportError:
     input("Press Enter to exit...")
     raise SystemExit(1)
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 
 
 # ----- binary helpers -----
@@ -316,9 +318,25 @@ class ParsedArchive:
     chunks: dict[str, tuple[int, int]] = field(default_factory=dict)
     assets: list[GameAsset] = field(default_factory=list)
     textures: list[bytes] = field(default_factory=list)
-    texture_images: list[Image.Image] = field(default_factory=list)
+    # Decoded on demand — decoding every atlas up-front freezes / OOMs on real Undertale.
+    _texture_image_cache: dict[int, Image.Image] = field(default_factory=dict, repr=False)
     tpag: list[TexturePageItem] = field(default_factory=list)
     sounds: list[SoundInfo] = field(default_factory=list)
+
+    def get_texture_image(self, index: int) -> Image.Image:
+        if index in self._texture_image_cache:
+            return self._texture_image_cache[index]
+        if index < 0 or index >= len(self.textures):
+            img = Image.new("RGBA", (1, 1), (0, 0, 0, 0))
+            self._texture_image_cache[index] = img
+            return img
+        blob = self.textures[index]
+        try:
+            img = Image.open(io.BytesIO(blob)).convert("RGBA")
+        except Exception:
+            img = Image.new("RGBA", (1, 1), (0, 0, 0, 0))
+        self._texture_image_cache[index] = img
+        return img
 
 
 def find_data_file(folder: str | Path) -> Path | None:
@@ -414,13 +432,19 @@ def _guess_audio_ext(blob: bytes) -> str:
 class DataWinParser:
     """Extract browsable assets from a GameMaker data file."""
 
-    def __init__(self, path: str | Path):
+    def __init__(self, path: str | Path, progress: Callable[[str], None] | None = None):
         self.path = Path(path)
+        self.progress = progress
         self.reader = BinaryReader.from_path(self.path)
         self.result = ParsedArchive(path=self.path)
 
+    def _say(self, message: str) -> None:
+        if self.progress:
+            self.progress(message)
+
     def parse(self) -> ParsedArchive:
         r = self.reader
+        self._say(f"Opening {self.path.name} ({self.path.stat().st_size // (1024 * 1024)} MB)…")
         if r.read_tag() != "FORM":
             raise ValueError(f"{self.path.name} is not a GameMaker FORM archive")
         form_size = r.read_u32()
@@ -433,13 +457,21 @@ class DataWinParser:
             self.result.chunks[tag] = (start, size)
             r.seek(start + size)
 
+        self._say("Reading game info…")
         self._parse_gen8()
+        self._say("Indexing textures…")
         self._parse_textures()
+        self._say("Reading sprite sheets…")
         self._parse_tpag()
+        self._say("Reading sound list…")
         self._parse_sounds()
+        self._say("Extracting audio…")
         self._parse_audio()
+        self._say("Indexing sprites…")
         self._parse_sprites()
+        self._say("Indexing backgrounds…")
         self._parse_backgrounds()
+        self._say("Indexing fonts…")
         self._parse_fonts()
         return self.result
 
@@ -523,17 +555,12 @@ class DataWinParser:
 
         self.result.textures = raw_textures
         for i, blob in enumerate(raw_textures):
-            try:
-                img = Image.open(io.BytesIO(blob)).convert("RGBA")
-            except Exception:
-                img = Image.new("RGBA", (1, 1), (0, 0, 0, 0))
-            self.result.texture_images.append(img)
 
             def make_data(b: bytes = blob) -> bytes:
                 return b
 
-            def make_image(im: Image.Image = img) -> Image.Image:
-                return im.copy()
+            def make_image(idx: int = i) -> Image.Image:
+                return self.result.get_texture_image(idx).copy()
 
             self.result.assets.append(
                 GameAsset(
@@ -661,14 +688,13 @@ class DataWinParser:
             )
 
     def _crop_sprite_frame(self, tpag: TexturePageItem) -> Image.Image:
-        if tpag.texture_id < 0 or tpag.texture_id >= len(self.result.texture_images):
-            return Image.new("RGBA", (max(1, tpag.width), max(1, tpag.height)), (0, 0, 0, 0))
-        sheet = self.result.texture_images[tpag.texture_id]
-        w, h = tpag.width, tpag.height
-        if w <= 0 or h <= 0:
+        w, h = max(1, tpag.width), max(1, tpag.height)
+        if tpag.texture_id < 0 or tpag.texture_id >= len(self.result.textures):
+            return Image.new("RGBA", (w, h), (0, 0, 0, 0))
+        sheet = self.result.get_texture_image(tpag.texture_id)
+        if tpag.width <= 0 or tpag.height <= 0:
             return Image.new("RGBA", (1, 1), (0, 0, 0, 0))
-        box = (tpag.x, tpag.y, tpag.x + w, tpag.y + h)
-        # Clamp to sheet
+        box = (tpag.x, tpag.y, tpag.x + tpag.width, tpag.y + tpag.height)
         sw, sh = sheet.size
         box = (
             max(0, min(box[0], sw)),
@@ -719,6 +745,9 @@ class DataWinParser:
 
             if not frames:
                 continue
+
+            if index % 200 == 0:
+                self._say(f"Indexing sprites… {index}/{count}")
 
             for fi, frame in enumerate(frames):
                 frame_name = name if len(frames) == 1 else f"{name}_{fi}"
@@ -841,9 +870,7 @@ def load_undertale_assets(
             "Could not find data.win (or game.unx). "
             "Select your Undertale install folder or the data file itself."
         )
-    if progress:
-        progress(f"Reading {data_file.name}…")
-    parser = DataWinParser(data_file)
+    parser = DataWinParser(data_file, progress=progress)
     result = parser.parse()
     if include_loose:
         if progress:
@@ -856,7 +883,7 @@ def load_undertale_assets(
             if key not in existing:
                 result.assets.append(asset)
     if progress:
-        progress(f"Loaded {len(result.assets)} files")
+        progress(f"Loaded {len(result.assets)} files — building browser…")
     return result
 
 
@@ -889,6 +916,9 @@ KIND_ORDER = [
     AssetKind.OTHER,
 ]
 
+# Undertale has thousands of sprites — never build the whole grid at once.
+PAGE_SIZE = 36
+
 
 def _default_download_dir() -> Path:
     home = Path.home()
@@ -910,12 +940,14 @@ class UndertaleExtractorApp(ctk.CTk):
         self.assets: list[GameAsset] = []
         self.filtered: list[GameAsset] = []
         self.selected: GameAsset | None = None
-        self.current_kind: AssetKind | None = None
+        self.current_kind: AssetKind | None = AssetKind.SPRITE
+        self.page = 0
         self.download_dir = _default_download_dir()
         self._thumb_cache: dict[str, ctk.CTkImage] = {}
         self._preview_image: ctk.CTkImage | None = None
         self._loading = False
         self.game_name = "Undertale"
+        self._render_token = 0
 
         self._build_ui()
         self.protocol("WM_DELETE_WINDOW", self.destroy)
@@ -1045,6 +1077,39 @@ class UndertaleExtractorApp(ctk.CTk):
         )
         self.status_label.grid(row=1, column=0, sticky="w", pady=(6, 0))
 
+        pager = ctk.CTkFrame(search_row, fg_color="transparent")
+        pager.grid(row=0, column=1, rowspan=2, padx=(12, 0))
+        self.prev_btn = ctk.CTkButton(
+            pager,
+            text="◀ Prev",
+            width=80,
+            command=self.prev_page,
+            fg_color=COLORS["border"],
+            hover_color="#c4baa8",
+            text_color=COLORS["ink"],
+            state="disabled",
+        )
+        self.prev_btn.pack(side="left", padx=2)
+        self.page_label = ctk.CTkLabel(
+            pager,
+            text="Page 0/0",
+            font=ctk.CTkFont(size=12),
+            text_color=COLORS["muted"],
+            width=90,
+        )
+        self.page_label.pack(side="left", padx=4)
+        self.next_btn = ctk.CTkButton(
+            pager,
+            text="Next ▶",
+            width=80,
+            command=self.next_page,
+            fg_color=COLORS["border"],
+            hover_color="#c4baa8",
+            text_color=COLORS["ink"],
+            state="disabled",
+        )
+        self.next_btn.pack(side="left", padx=2)
+
         self.scroll = ctk.CTkScrollableFrame(
             main,
             fg_color=COLORS["bg"],
@@ -1130,7 +1195,7 @@ class UndertaleExtractorApp(ctk.CTk):
         )
         self.dl_path_label.pack(anchor="w", padx=16, pady=16)
 
-        self._highlight_kind(None)
+        self._highlight_kind(AssetKind.SPRITE)
         self._show_empty_state()
 
     def _make_kind_button(self, parent, label: str, kind: AssetKind | None) -> ctk.CTkButton:
@@ -1174,11 +1239,10 @@ class UndertaleExtractorApp(ctk.CTk):
             return
         path = filedialog.askdirectory(title="Select Undertale install folder")
         if not path:
-            # Also allow picking data.win directly
             file_path = filedialog.askopenfilename(
-                title="Or select data.win / game.unx",
+                title="Or select data.win",
                 filetypes=[
-                    ("GameMaker data", "data.win game.unx game.ios"),
+                    ("Undertale data.win", "*.win"),
                     ("All files", "*.*"),
                 ],
             )
@@ -1187,39 +1251,72 @@ class UndertaleExtractorApp(ctk.CTk):
             path = file_path
         self._load_async(path)
 
+    def _set_status(self, message: str) -> None:
+        self.status_label.configure(text=message)
+
     def _load_async(self, path: str) -> None:
         self._loading = True
         self.open_btn.configure(state="disabled")
-        self.status_label.configure(text="Extracting game files…")
+        self.export_all_btn.configure(state="disabled")
+        self._set_status("Starting… this can take a minute for Undertale")
+        for child in self.scroll.winfo_children():
+            child.destroy()
+        ctk.CTkLabel(
+            self.scroll,
+            text="Extracting game files…\nPlease wait — do not close the window.",
+            font=ctk.CTkFont(family="Georgia", size=16),
+            text_color=COLORS["muted"],
+            justify="center",
+        ).pack(pady=60)
         self.update_idletasks()
+
+        def report(message: str) -> None:
+            # Bind message as default arg so later updates don't overwrite earlier ones.
+            self.after(0, lambda m=message: self._set_status(m))
 
         def work() -> None:
             try:
-                result = load_undertale_assets(path, progress=lambda m: self.after(0, lambda: self.status_label.configure(text=m)))
-                self.after(0, lambda: self._on_loaded(result))
+                result = load_undertale_assets(path, progress=report)
+                self.after(0, lambda r=result: self._on_loaded(r))
+            except MemoryError:
+                self.after(
+                    0,
+                    lambda: self._on_load_error(
+                        MemoryError(
+                            "Ran out of memory while reading data.win. "
+                            "Close other programs and try again."
+                        )
+                    ),
+                )
             except Exception as exc:
-                self.after(0, lambda: self._on_load_error(exc))
+                self.after(0, lambda e=exc: self._on_load_error(e))
 
         threading.Thread(target=work, daemon=True).start()
 
     def _on_loaded(self, result) -> None:
-        self._loading = False
-        self.open_btn.configure(state="normal")
-        self.assets = result.assets
-        self.game_name = result.game_name or "Undertale"
-        self.title(f"Undertale File Extractor — {self.game_name}")
-        self._thumb_cache.clear()
-        self.export_all_btn.configure(state="normal")
-        self.set_kind(None)
-        self.status_label.configure(
-            text=f"Loaded {len(self.assets)} files from {result.path.name}"
-        )
-        self._update_counts()
+        try:
+            self._loading = False
+            self.open_btn.configure(state="normal")
+            self.assets = result.assets
+            self.game_name = result.game_name or "Undertale"
+            self.title(f"Undertale File Extractor — {self.game_name}")
+            self._thumb_cache.clear()
+            self.export_all_btn.configure(state="normal")
+            self.page = 0
+            self._update_counts()
+            # Default to Sprites (paginated) instead of dumping every file into the UI.
+            self.set_kind(AssetKind.SPRITE)
+            self._set_status(
+                f"Loaded {len(self.assets)} files from {result.path.name} "
+                f"(showing {PAGE_SIZE} per page)"
+            )
+        except Exception as exc:
+            self._on_load_error(exc)
 
     def _on_load_error(self, exc: Exception) -> None:
         self._loading = False
         self.open_btn.configure(state="normal")
-        self.status_label.configure(text="Failed to load")
+        self._set_status("Failed to load")
         messagebox.showerror("Could not open game", str(exc))
 
     def _update_counts(self) -> None:
@@ -1239,24 +1336,52 @@ class UndertaleExtractorApp(ctk.CTk):
 
     def set_kind(self, kind: AssetKind | None) -> None:
         self.current_kind = kind
+        self.page = 0
         self._highlight_kind(kind)
         self.apply_filter()
 
     def apply_filter(self) -> None:
+        if self._loading and not self.assets:
+            return
         query = self.search_var.get().strip().lower()
         items = self.assets
         if self.current_kind is not None:
             items = [a for a in items if a.kind == self.current_kind]
         if query:
-            items = [a for a in items if query in a.display_name.lower() or query in a.id.lower()]
+            items = [
+                a
+                for a in items
+                if query in a.display_name.lower() or query in a.id.lower()
+            ]
         self.filtered = items
+        pages = max(1, (len(self.filtered) + PAGE_SIZE - 1) // PAGE_SIZE) if self.filtered else 0
+        if self.page >= pages and pages > 0:
+            self.page = pages - 1
         self._render_list()
 
+    def prev_page(self) -> None:
+        if self.page > 0:
+            self.page -= 1
+            self._render_list()
+
+    def next_page(self) -> None:
+        pages = max(1, (len(self.filtered) + PAGE_SIZE - 1) // PAGE_SIZE)
+        if self.page + 1 < pages:
+            self.page += 1
+            self._render_list()
+
     def _render_list(self) -> None:
+        self._render_token += 1
+        token = self._render_token
         for child in self.scroll.winfo_children():
             child.destroy()
 
-        if not self.filtered:
+        total = len(self.filtered)
+        pages = max(1, (total + PAGE_SIZE - 1) // PAGE_SIZE) if total else 0
+        if total == 0:
+            self.page_label.configure(text="Page 0/0")
+            self.prev_btn.configure(state="disabled")
+            self.next_btn.configure(state="disabled")
             empty = ctk.CTkLabel(
                 self.scroll,
                 text="No files match this filter",
@@ -1266,14 +1391,48 @@ class UndertaleExtractorApp(ctk.CTk):
             empty.pack(pady=40)
             return
 
-        # Grid of clickable rows / tiles
+        start = self.page * PAGE_SIZE
+        end = min(start + PAGE_SIZE, total)
+        page_items = self.filtered[start:end]
+        self.page_label.configure(text=f"Page {self.page + 1}/{pages}")
+        self.prev_btn.configure(state="normal" if self.page > 0 else "disabled")
+        self.next_btn.configure(state="normal" if self.page + 1 < pages else "disabled")
+
+        hint = ctk.CTkLabel(
+            self.scroll,
+            text=f"Showing {start + 1}–{end} of {total}  ·  click a file to download",
+            font=ctk.CTkFont(size=12),
+            text_color=COLORS["muted"],
+        )
+        hint.grid(row=0, column=0, columnspan=3, sticky="w", padx=8, pady=(4, 8))
+
         cols = 3
-        for i, asset in enumerate(self.filtered):
+        # Build tiles in small batches so the window stays responsive.
+        self._build_tiles_batch(page_items, cols, 0, token)
+
+    def _build_tiles_batch(
+        self,
+        page_items: list[GameAsset],
+        cols: int,
+        index: int,
+        token: int,
+        batch: int = 6,
+    ) -> None:
+        if token != self._render_token:
+            return
+        end = min(index + batch, len(page_items))
+        for i in range(index, end):
+            asset = page_items[i]
             row, col = divmod(i, cols)
             tile = self._make_tile(self.scroll, asset)
-            tile.grid(row=row, column=col, padx=8, pady=8, sticky="nsew")
+            tile.grid(row=row + 1, column=col, padx=8, pady=8, sticky="nsew")
         for c in range(cols):
             self.scroll.grid_columnconfigure(c, weight=1)
+        if end < len(page_items):
+            self.after(
+                1,
+                lambda: self._build_tiles_batch(page_items, cols, end, token, batch),
+            )
 
     def _make_tile(self, parent, asset: GameAsset) -> ctk.CTkFrame:
         frame = ctk.CTkFrame(
@@ -1283,12 +1442,22 @@ class UndertaleExtractorApp(ctk.CTk):
             border_width=1,
             border_color=COLORS["border"],
             width=220,
-            height=160,
+            height=150,
         )
         frame.grid_propagate(False)
 
-        thumb_label = ctk.CTkLabel(frame, text="", width=96, height=96, fg_color="transparent")
-        thumb_label.pack(pady=(12, 4))
+        # Lightweight placeholder first — real thumbnail filled later.
+        thumb_label = ctk.CTkLabel(
+            frame,
+            text=asset.extension.upper().lstrip(".") or "FILE",
+            width=88,
+            height=72,
+            fg_color=COLORS["panel"],
+            corner_radius=6,
+            text_color=COLORS["accent"],
+            font=ctk.CTkFont(size=12, weight="bold"),
+        )
+        thumb_label.pack(pady=(10, 4))
 
         name_label = ctk.CTkLabel(
             frame,
@@ -1304,7 +1473,7 @@ class UndertaleExtractorApp(ctk.CTk):
             font=ctk.CTkFont(size=11),
             text_color=COLORS["muted"],
         )
-        meta.pack(pady=(0, 10))
+        meta.pack(pady=(0, 8))
 
         def on_click(_event=None, a: GameAsset = asset) -> None:
             self.select_asset(a)
@@ -1315,11 +1484,19 @@ class UndertaleExtractorApp(ctk.CTk):
 
         for widget in (frame, thumb_label, name_label, meta):
             widget.bind("<Button-1>", on_click)
-            widget.bind("<Button-3>", on_select)  # right-click = preview only
+            widget.bind("<Button-3>", on_select)
             widget.bind("<Double-Button-1>", on_click)
 
-        # Load thumbnail async-ish
-        self.after(1, lambda: self._fill_thumb(thumb_label, asset))
+        if asset.is_image:
+            self.after(10, lambda: self._fill_thumb(thumb_label, asset))
+        else:
+            badge = {
+                AssetKind.AUDIO: "♪ AUDIO",
+                AssetKind.MUSIC: "♫ MUSIC",
+                AssetKind.FONT: "Aa FONT",
+                AssetKind.OTHER: "FILE",
+            }.get(asset.kind, asset.extension.upper() or "FILE")
+            thumb_label.configure(text=badge)
         return frame
 
     def _fill_thumb(self, label: ctk.CTkLabel, asset: GameAsset) -> None:
@@ -1329,23 +1506,16 @@ class UndertaleExtractorApp(ctk.CTk):
             if asset.id in self._thumb_cache:
                 label.configure(image=self._thumb_cache[asset.id], text="")
                 return
-            if asset.is_image:
-                thumb = asset.thumbnail(96)
-                if thumb is not None:
-                    img = ctk.CTkImage(light_image=thumb, dark_image=thumb, size=thumb.size)
-                    self._thumb_cache[asset.id] = img
-                    label.configure(image=img, text="")
-                    return
-            # Non-image icons as text badges
-            badge = {
-                AssetKind.AUDIO: "♪ WAV/OGG",
-                AssetKind.MUSIC: "♫ MUSIC",
-                AssetKind.FONT: "Aa FONT",
-                AssetKind.OTHER: "FILE",
-            }.get(asset.kind, asset.extension.upper() or "FILE")
-            label.configure(text=badge, text_color=COLORS["accent"], font=ctk.CTkFont(size=14, weight="bold"))
+            thumb = asset.thumbnail(72)
+            if thumb is None:
+                return
+            img = ctk.CTkImage(light_image=thumb, dark_image=thumb, size=thumb.size)
+            self._thumb_cache[asset.id] = img
+            if label.winfo_exists():
+                label.configure(image=img, text="")
         except Exception:
-            label.configure(text="?", text_color=COLORS["muted"])
+            if label.winfo_exists():
+                label.configure(text="?", text_color=COLORS["muted"])
 
     def select_asset(self, asset: GameAsset) -> None:
         self.selected = asset
@@ -1384,7 +1554,7 @@ class UndertaleExtractorApp(ctk.CTk):
             return
         try:
             path = self.selected.export_to(self.download_dir, overwrite=False)
-            self.status_label.configure(text=f"Downloaded → {path}")
+            self._set_status(f"Downloaded → {path}")
             self.preview_meta.configure(
                 text=f"{self.selected.kind.value}\nSaved to:\n{path}"
             )
@@ -1405,7 +1575,7 @@ class UndertaleExtractorApp(ctk.CTk):
             return
         try:
             Path(path).write_bytes(self.selected.get_data())
-            self.status_label.configure(text=f"Saved → {path}")
+            self._set_status(f"Saved → {path}")
         except Exception as exc:
             messagebox.showerror("Save failed", str(exc))
 
@@ -1418,18 +1588,26 @@ class UndertaleExtractorApp(ctk.CTk):
         dest_path = Path(dest)
         ok = 0
         errors = 0
-        for asset in self.filtered:
+        total = len(self.filtered)
+        for i, asset in enumerate(self.filtered, start=1):
             try:
                 sub = dest_path / asset.kind.value.lower()
                 asset.export_to(sub, overwrite=False)
                 ok += 1
             except Exception:
                 errors += 1
-        self.status_label.configure(text=f"Exported {ok} files" + (f" ({errors} failed)" if errors else ""))
+            if i % 25 == 0:
+                self._set_status(f"Exporting… {i}/{total}")
+                self.update_idletasks()
+        self._set_status(
+            f"Exported {ok} files" + (f" ({errors} failed)" if errors else "")
+        )
         messagebox.showinfo("Export complete", f"Saved {ok} files to:\n{dest_path}")
 
     def choose_download_dir(self) -> None:
-        path = filedialog.askdirectory(title="Choose download folder", initialdir=str(self.download_dir))
+        path = filedialog.askdirectory(
+            title="Choose download folder", initialdir=str(self.download_dir)
+        )
         if path:
             self.download_dir = Path(path)
             self.dl_path_label.configure(text=f"Saves to:\n{self.download_dir}")
@@ -1444,7 +1622,6 @@ def _fmt_size(n: int) -> str:
 
 
 def run_app() -> None:
-    # Prefer a sharper font stack when available
     app = UndertaleExtractorApp()
     app.mainloop()
 
@@ -1495,5 +1672,8 @@ if __name__ == "__main__":
     try:
         raise SystemExit(main())
     except Exception as exc:
-        messagebox.showerror("Undertale Extractor crashed", str(exc))
+        try:
+            messagebox.showerror("Undertale Extractor crashed", str(exc))
+        except Exception:
+            print("Undertale Extractor crashed:", exc)
         raise
