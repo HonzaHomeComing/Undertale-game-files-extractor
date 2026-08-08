@@ -38,14 +38,12 @@ python UndertaleExtractor.py
 5. Click other files (sprites/audio/…) to download them
 
 ### Enter rooms in-game (live)
-1. Open Undertale and load your save (leave it running)
-2. In the extractor, open **Rooms**
-3. **Click a room** — you should jump there immediately
+1. Open your game folder in the extractor once (this enables debug warp in `data.win`)
+2. **Restart Undertale once**, then load your save and leave it running
+3. Click a room in **Rooms** — the app updates your save and presses debug **L** (Load) so you jump straight there
 
-First time only: the app enables Undertale’s debug warp flag in `data.win`.  
-If a click does nothing, **restart Undertale once**, then try again.
+If nothing happens, click the Undertale window and press **L**, or restart Undertale so debug mode is active.
 
-If live jump can’t find your room in memory, save once at a save point and retry.  
 Save-file fallback (title screen → Continue) still works if the game is closed.
 
 
