@@ -43,7 +43,10 @@ python UndertaleExtractor.py
 3. Start Undertale, load your save, leave it running
 4. Click a room in **Rooms** — you jump straight there
 
-Rooms marked **⚠ dog** are blocked by vanilla dogcheck. After **Enable live patches**, those should work too (safe stub keeps `dogcheck = 1`, then exits — not a bare Exit).
+Rooms marked **⚠ dog** are blocked by vanilla dogcheck. After **Enable live patches**, check the dialog:
+
+- **Dogcheck (Annoying Dog): OFF** → secret rooms should work  
+- **Dogcheck (Annoying Dog): STILL ON** → teleport still works, but the dog can appear; use UndertaleModTool → DisableDogcheck or Restore + retry
 
 If Undertale shows a **Code Error** about `dogcheck` when loading (L key), click **Restore data.win**, then **Enable live patches** again.
 

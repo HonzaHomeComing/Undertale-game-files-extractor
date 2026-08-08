@@ -7,32 +7,33 @@ from pathlib import Path
 
 from .binary import BinaryReader
 
-# Classic HxD patches (Marxvee) — only applied when the offset falls inside
-# scr_dogcheck bytecode (so we know we are not patching random data).
+# Classic HxD patches (Marxvee) — applied when offset is inside scr_dogcheck.
 MARXVEE_PATCHES: tuple[tuple[int, bytes], ...] = (
     (0x7213E4, bytes.fromhex("000100B7")),  # Undertale 1.00
     (0x7216D4, bytes.fromhex("000100B7")),  # Undertale 1.001
 )
 
-# Steam / newer builds (UndertaleModTool maintainers).
+# Steam / newer builds — only trusted together with a CODE stub, not alone.
 STEAM_BYTE_PATCHES: tuple[tuple[int, int, int], ...] = (
     (0x76DF44, 0x01, 0x00),
     (0x76E058, 0x00, 0x01),
     (0x77473C, 0x01, 0x00),
 )
 
-# Bytecode opcodes (high byte of each instruction word).
-# v15 / v14 (see UndertaleModTool bytecode wiki).
 OP_PUSHI_V15 = 0x84
 OP_PUSH = 0xC0
 OP_POP_V15 = 0x45
 OP_POP_V14 = 0x41
 OP_EXIT_V15 = 0x9D
 OP_EXIT_V14 = 0x9E
+OP_CALL_V15 = 0xD9
+OP_CALL_V14 = 0xDA
+OP_B_V15 = 0xB6
+OP_BT_V15 = 0xB7
+OP_BF_V15 = 0xB8
 
 EXIT_WORD_V15 = struct.pack("<I", 0x9D000000)
 EXIT_WORD_V14 = struct.pack("<I", 0x9E000000)
-# Back-compat alias used by tests / heal detection (v15 Exit).
 EXIT_WORD = EXIT_WORD_V15
 
 DOGCHECK_NAMES = frozenset(
@@ -42,9 +43,13 @@ DOGCHECK_NAMES = frozenset(
         "gml_Script_dogcheck",
     }
 )
+LOAD_NAMES = frozenset(
+    {
+        "gml_Script_scr_load",
+        "scr_load",
+    }
+)
 
-# Rooms that vanilla dogcheck rejects (Undertale wiki / community lists).
-# Teleporting here shows the Annoying Dog unless dogcheck is disabled.
 DOGCHECK_ROOM_RANGES: tuple[tuple[int, int], ...] = (
     (0, 3),
     (78, 80),
@@ -54,9 +59,30 @@ DOGCHECK_ROOM_RANGES: tuple[tuple[int, int], ...] = (
 
 BACKUP_SUFFIXES = (".dogcheckbak", ".debugbak", ".bak")
 
+# Opcodes that look like real GML bytecode starts (not metadata).
+_CODE_START_OPS = frozenset(
+    {
+        OP_PUSHI_V15,
+        OP_PUSH,
+        OP_POP_V15,
+        OP_POP_V14,
+        OP_CALL_V15,
+        OP_CALL_V14,
+        OP_B_V15,
+        OP_BT_V15,
+        OP_BF_V15,
+        0xC1,
+        0xC2,
+        0xC3,
+        0x07,
+        0x15,
+        0x03,
+        0x41,
+    }
+)
+
 
 def is_dogcheck_room(room_id: int) -> bool:
-    """True if vanilla Undertale sends this room id to the Annoying Dog."""
     for lo, hi in DOGCHECK_ROOM_RANGES:
         if lo <= room_id <= hi:
             return True
@@ -80,7 +106,6 @@ def find_data_win_backup(data_win: str | Path) -> Path | None:
 
 
 def restore_data_win_backup(data_win: str | Path) -> tuple[bool, str]:
-    """Restore data.win from the newest extractor backup. Close Undertale first."""
     path = Path(data_win)
     bak = find_data_win_backup(path)
     if bak is None:
@@ -96,8 +121,25 @@ def _opcode(word: int) -> int:
     return (word >> 24) & 0xFF
 
 
+def _score_bytecode_start(data: bytes, abs_off: int) -> int:
+    if abs_off < 0 or abs_off + 4 > len(data):
+        return -1000
+    op = _opcode(struct.unpack_from("<I", data, abs_off)[0])
+    if op in _CODE_START_OPS:
+        return 10
+    if op in (OP_EXIT_V15, OP_EXIT_V14):
+        return 0
+    return -5
+
+
 def _find_code_entries(reader: BinaryReader) -> list[tuple[str, int, int]]:
-    """Return list of (name, bytecode_abs_offset, length) for CODE entries."""
+    """
+    Return (name, bytecode_abs_offset, length).
+
+    Picks bytecode-15 vs bytecode-14 layout per entry by scoring which start
+    looks like real instructions (avoids patching the locals/args header).
+    """
+    data = bytes(reader._data)  # noqa: SLF001
     reader.seek(0)
     if reader.read_tag() != "FORM":
         return []
@@ -138,6 +180,9 @@ def _find_code_entries(reader: BinaryReader) -> list[tuple[str, int, int]]:
             if length == 0 or length > 200_000:
                 continue
 
+            candidates: list[tuple[int, int, int]] = []  # score, abs, length
+
+            # Bytecode 15+: locals, args, relative pointer to bytecode blob
             locals_count = reader.read_u16()
             args = reader.read_u16()
             rel = reader.read_i32()
@@ -150,117 +195,118 @@ def _find_code_entries(reader: BinaryReader) -> list[tuple[str, int, int]]:
                 and 0 < bytecode_abs < reader.size
                 and bytecode_abs + length <= reader.size
             ):
-                entries.append((name, bytecode_abs, length))
-                continue
+                score = _score_bytecode_start(data, bytecode_abs) + 2
+                candidates.append((score, bytecode_abs, length))
 
+            # Bytecode 14: instructions start right after name ptr + length
             bc14_start = off + 8
             if bc14_start + length <= reader.size:
-                entries.append((name, bc14_start, length))
+                score = _score_bytecode_start(data, bc14_start)
+                candidates.append((score, bc14_start, length))
+
+            if not candidates:
+                continue
+            candidates.sort(key=lambda c: c[0], reverse=True)
+            _score, abs_off, ln = candidates[0]
+            entries.append((name, abs_off, ln))
         except Exception:
             continue
     return entries
 
 
-def _dogcheck_entries(data: bytes) -> list[tuple[str, int, int]]:
+def _named_entries(data: bytes, names: frozenset[str], *, suffix: str | None = None) -> list[tuple[str, int, int]]:
     reader = BinaryReader(data)
-    return [
-        e
-        for e in _find_code_entries(reader)
-        if e[0] in DOGCHECK_NAMES or e[0].lower().endswith("dogcheck")
-    ]
+    out = []
+    for e in _find_code_entries(reader):
+        n = e[0]
+        if n in names or (suffix and n.lower().endswith(suffix)):
+            out.append(e)
+    return out
 
 
-def _keep_bytes_for_dogcheck_assign(data: bytes, bc_off: int, length: int) -> tuple[int, bytes] | None:
-    """
-    Return (keep_len, exit_word) for a safe stub:
-      dogcheck = 1;  // keep these instructions
-      exit;          // then never room_goto(room_of_dog)
-    """
-    if length < 16:
-        return None
-    w0 = struct.unpack_from("<I", data, bc_off)[0]
-    op0 = _opcode(w0)
+def _dogcheck_entries(data: bytes) -> list[tuple[str, int, int]]:
+    return _named_entries(data, DOGCHECK_NAMES, suffix="dogcheck")
 
-    # Bytecode 15: pushi.e 1 ; pop.v.v self.dogcheck
-    if op0 == OP_PUSHI_V15:
-        # Int16 value sits in the low 16 bits for PushI
-        if (w0 & 0xFFFF) != 1 and ((w0 >> 8) & 0xFFFF) != 1:
-            # Still accept PushI as the start of dogcheck=1 on odd encodings
-            pass
-        w1 = struct.unpack_from("<I", data, bc_off + 4)[0]
-        if _opcode(w1) != OP_POP_V15:
-            return None
-        return 4 + 8, EXIT_WORD_V15  # PushI (1 word) + Pop (2 words)
 
-    # Bytecode 14: push.e 1 ; pop.v.v self.dogcheck
-    if op0 == OP_PUSH:
-        # Int16 push is often 1 word; variable push is 2 — dogcheck=1 uses int16.
-        w1 = struct.unpack_from("<I", data, bc_off + 4)[0]
-        if _opcode(w1) == OP_POP_V14:
-            return 4 + 8, EXIT_WORD_V14
-        # Rare: push takes 2 words then pop
-        if length >= 20:
-            w2 = struct.unpack_from("<I", data, bc_off + 8)[0]
-            if _opcode(w2) == OP_POP_V14:
-                return 8 + 8, EXIT_WORD_V14
-        return None
-
+def _find_first_pop(data: bytes, bc_off: int, length: int) -> tuple[int, int, bytes] | None:
+    """Return (rel_offset, pop_opcode, pop_8_bytes) for the first Pop in the script."""
+    pos = 0
+    while pos + 8 <= min(length, 128):
+        word = struct.unpack_from("<I", data, bc_off + pos)[0]
+        op = _opcode(word)
+        if op in (OP_POP_V15, OP_POP_V14):
+            return pos, op, bytes(data[bc_off + pos : bc_off + pos + 8])
+        pos += 4
     return None
 
 
-def _apply_safe_code_stub(data: bytearray) -> list[str]:
+def _rebuild_dogcheck_always_pass(data: bytearray, bc_off: int, length: int, name: str) -> str | None:
     """
-    Rewrite scr_dogcheck to: dogcheck = 1; exit;
+    Replace scr_dogcheck body with:
+        dogcheck = 1;
+        exit;
+    using the original Pop's variable operand (so the name/id stays correct).
+    """
+    found = _find_first_pop(bytes(data), bc_off, length)
+    if found is None:
+        return None
+    _rel, pop_op, pop_bytes = found
+    use_v15 = pop_op == OP_POP_V15
+    exit_word = EXIT_WORD_V15 if use_v15 else EXIT_WORD_V14
 
-    Unlike a bare Exit at offset 0, this keeps the variable assignment so
-    scr_load / debug L does not crash.
-    """
+    if use_v15:
+        push = struct.pack("<I", (OP_PUSHI_V15 << 24) | 1)
+    else:
+        # Bytecode 14 Push Int16 value 1 (type Int16 in low nibble area varies;
+        # 0xC0000001 is widely seen for push.e 1).
+        push = struct.pack("<I", (OP_PUSH << 24) | 1)
+
+    body = bytearray(push + pop_bytes)
+    already = (
+        bytes(data[bc_off : bc_off + len(body)]) == bytes(body)
+        and length > len(body)
+        and bytes(data[bc_off + len(body) : bc_off + len(body) + 4]) == exit_word
+    )
+    if already:
+        return f"rebuild:{name}=already"
+
+    while len(body) + 4 <= length:
+        body.extend(exit_word)
+    if len(body) < length:
+        body.extend(b"\x00" * (length - len(body)))
+    data[bc_off : bc_off + length] = body[:length]
+    return f"rebuild:{name}"
+
+
+def _apply_rebuild_stubs(data: bytearray) -> list[str]:
     applied = []
-    for name, bc_off, length in _dogcheck_entries(bytes(data)):
-        info = _keep_bytes_for_dogcheck_assign(bytes(data), bc_off, length)
-        if info is None:
-            continue
-        keep, exit_word = info
-        if keep >= length:
-            continue
-        # Already safely stubbed?
-        rest = bytes(data[bc_off + keep : bc_off + length])
-        if rest == exit_word * (len(rest) // 4) + rest[len(rest) // 4 * 4 :]:
-            if length - keep >= 4 and data[bc_off + keep : bc_off + keep + 4] == exit_word:
-                applied.append(f"code-safe:{name}=already")
-                continue
-        # Write Exit from keep onward
-        pos = bc_off + keep
-        end = bc_off + length
-        while pos + 4 <= end:
-            data[pos : pos + 4] = exit_word
-            pos += 4
-        while pos < end:
-            data[pos] = 0
-            pos += 1
-        applied.append(f"code-safe:{name}")
+    entries = _dogcheck_entries(bytes(data))
+    if not entries:
+        applied.append("rebuild:scr_dogcheck-not-found")
+        return applied
+    for name, bc_off, length in entries:
+        note = _rebuild_dogcheck_always_pass(data, bc_off, length, name)
+        if note:
+            applied.append(note)
+        else:
+            applied.append(f"rebuild:{name}-no-pop")
     return applied
 
 
 def _apply_marxvee_in_dogcheck(data: bytearray) -> list[str]:
-    """Apply Marxvee bytes only when the offset lies inside scr_dogcheck."""
     applied = []
     ranges = [(off, off + length) for _n, off, length in _dogcheck_entries(bytes(data))]
-    if not ranges:
-        # Fall back: still try known offsets if they look like Bt/B instructions
-        ranges = []
     for offset, patch in MARXVEE_PATCHES:
         if offset + len(patch) > len(data):
             continue
-        in_script = any(start <= offset < end for start, end in ranges) if ranges else False
+        in_script = any(start <= offset < end for start, end in ranges)
         current = bytes(data[offset : offset + len(patch)])
         if current == patch:
             applied.append(f"marxvee@0x{offset:X}=already")
             continue
         if not in_script:
-            # Without a CODE match, only patch if high byte looks like a branch opcode
             op = current[3] if len(current) == 4 else 0
-            if op not in (0xB6, 0xB7, 0xB8, 0xB9):  # B / Bt / Bf family
+            if op not in (0xB6, 0xB7, 0xB8, 0xB9):
                 continue
         data[offset : offset + len(patch)] = patch
         applied.append(f"marxvee@0x{offset:X}")
@@ -309,12 +355,53 @@ def dogcheck_exit_stubbed(data_win: str | Path | bytes | bytearray) -> bool:
     return False
 
 
+def _has_rebuild_stub(data: bytes) -> bool:
+    for name, bc_off, length in _dogcheck_entries(data):
+        found = _find_first_pop(data, bc_off, length)
+        if found is None:
+            continue
+        rel, pop_op, pop_bytes = found
+        # After rebuild, pop should be at offset 4 (right after push)
+        if rel != 4:
+            # Could still be valid if we kept original push size 4
+            pass
+        use_v15 = pop_op == OP_POP_V15
+        exit_word = EXIT_WORD_V15 if use_v15 else EXIT_WORD_V14
+        push_len = 4
+        if (
+            length > push_len + 8
+            and data[bc_off + push_len : bc_off + push_len + 8] == pop_bytes
+            and data[bc_off + push_len + 8 : bc_off + push_len + 12] == exit_word
+        ):
+            # Verify push opcode
+            op0 = _opcode(struct.unpack_from("<I", data, bc_off)[0])
+            if op0 in (OP_PUSHI_V15, OP_PUSH):
+                return True
+    return False
+
+
+def dogcheck_likely_disabled(data_win: str | Path) -> bool:
+    """True only when a real disable method is present — not steam-bytes alone."""
+    path = Path(data_win)
+    data = path.read_bytes()
+    if dogcheck_exit_stubbed(data):
+        return False
+    if _has_rebuild_stub(data):
+        return True
+    for offset, patch in MARXVEE_PATCHES:
+        if offset + len(patch) <= len(data) and data[offset : offset + len(patch)] == patch:
+            # Only count Marxvee if it sits inside scr_dogcheck
+            if any(off <= offset < off + ln for _n, off, ln in _dogcheck_entries(data)):
+                return True
+    return False
+
+
 def disable_dogcheck(data_win: str | Path, *, backup: bool = True) -> tuple[bool, str]:
     """
     Patch data.win so dogcheck no longer sends you to the Annoying Dog room.
 
-    Safe strategy (matches intent of UndertaleModTool DisableDogcheck):
-      keep `dogcheck = 1`, then exit — never skip the assignment.
+    Rewrites scr_dogcheck to `dogcheck = 1; exit;` (same idea as UMT DisableDogcheck
+    for load purposes: never goto room_of_dog, always leave dogcheck set).
     """
     path = Path(data_win)
 
@@ -326,7 +413,7 @@ def disable_dogcheck(data_win: str | Path, *, backup: bool = True) -> tuple[bool
             return (
                 False,
                 "data.win has a broken dogcheck Exit stub (causes the L-key crash). "
-                "No backup found — use Steam → Properties → Verify integrity, "
+                "No backup found — use Steam → Verify integrity of game files, "
                 "then click Enable live patches again.",
             )
 
@@ -335,46 +422,27 @@ def disable_dogcheck(data_win: str | Path, *, backup: bool = True) -> tuple[bool
 
     notes: list[str] = []
     try:
-        notes.extend(_apply_safe_code_stub(raw))
+        notes.extend(_apply_rebuild_stubs(raw))
     except Exception as exc:
-        notes.append(f"code-safe-error:{exc}")
+        notes.append(f"rebuild-error:{exc}")
     notes.extend(_apply_marxvee_in_dogcheck(raw))
     notes.extend(_apply_steam_bytes(raw))
 
-    if bytes(raw) == before:
-        if any("already" in n for n in notes):
-            return True, "Dogcheck already disabled (safe patches)."
-        return (
-            False,
-            "Could not auto-disable dogcheck for this data.win version. "
-            "Use UndertaleModTool → Scripts → DisableDogcheck, then Enable live patches "
-            "(debug) here. Secret/dogcheck rooms will still show the Annoying Dog.",
-        )
+    changed = bytes(raw) != before
+    if changed:
+        if backup:
+            _backup(path)
+        path.write_bytes(raw)
 
-    if backup:
-        _backup(path)
-    path.write_bytes(raw)
-    return True, "Dogcheck disabled (" + ", ".join(notes) + "). Restart Undertale once."
+    if dogcheck_likely_disabled(path):
+        return True, "Dogcheck disabled (" + ", ".join(notes) + "). Restart Undertale once."
 
-
-def dogcheck_likely_disabled(data_win: str | Path) -> bool:
-    """True for safe disable methods — never for the broken Exit-at-start stub."""
-    path = Path(data_win)
-    data = path.read_bytes()
-    if dogcheck_exit_stubbed(data):
-        return False
-    # Safe code stub: push/pop kept, then Exit
-    for _name, bc_off, length in _dogcheck_entries(data):
-        info = _keep_bytes_for_dogcheck_assign(data, bc_off, length)
-        if info is None:
-            continue
-        keep, exit_word = info
-        if length > keep and data[bc_off + keep : bc_off + keep + 4] == exit_word:
-            return True
-    for offset, patch in MARXVEE_PATCHES:
-        if offset + len(patch) <= len(data) and data[offset : offset + len(patch)] == patch:
-            return True
-    steam_ok = sum(
-        1 for offset, _old, new in STEAM_BYTE_PATCHES if offset < len(data) and data[offset] == new
+    return (
+        False,
+        "Could not disable dogcheck on this data.win.\n"
+        f"Details: {', '.join(notes) if notes else 'no strategies matched'}\n\n"
+        "Teleport (debug L) may still work for normal rooms, but the Annoying Dog "
+        "will appear on secret/blocked rooms.\n\n"
+        "Fix: UndertaleModTool → Scripts → DisableDogcheck, save data.win, "
+        "then use this app for room jumps.",
     )
-    return steam_ok >= 2

@@ -14,6 +14,7 @@ from .assets import AssetKind, GameAsset
 from .dogcheck import (
     disable_dogcheck,
     dogcheck_exit_stubbed,
+    dogcheck_likely_disabled,
     is_dogcheck_room,
     restore_data_win_backup,
 )
@@ -596,10 +597,16 @@ class UndertaleExtractorApp(ctk.CTk):
                 "Close the game, click Enable live patches, then start Undertale again.",
             )
             return
-        notes = []
+
+        debug_ok = False
+        dog_ok = False
+        notes: list[str] = []
+
         try:
-            if enable_debug_mode(self.data_win_path, backup=True):
-                notes.append("debug load (L) enabled")
+            debug_ok = bool(enable_debug_mode(self.data_win_path, backup=True))
+            notes.append(
+                "Debug Load (L): ON" if debug_ok else "Debug Load (L): could not enable"
+            )
         except OSError as exc:
             messagebox.showerror(
                 "Could not patch",
@@ -608,29 +615,45 @@ class UndertaleExtractorApp(ctk.CTk):
             )
             return
         except Exception as exc:
-            notes.append(f"debug failed: {exc}")
+            notes.append(f"Debug Load (L): failed ({exc})")
+
         try:
-            ok, msg = disable_dogcheck(self.data_win_path, backup=True)
-            if ok:
-                notes.append("dogcheck disabled")
+            dog_ok, dog_msg = disable_dogcheck(self.data_win_path, backup=True)
+            # Re-verify on disk so we never claim success incorrectly.
+            dog_ok = dog_ok and dogcheck_likely_disabled(self.data_win_path)
+            if dog_ok:
+                notes.append("Dogcheck (Annoying Dog): OFF")
             else:
-                notes.append(msg)
+                notes.append("Dogcheck (Annoying Dog): STILL ON")
+                notes.append(dog_msg)
         except OSError as exc:
             messagebox.showerror("Could not patch", str(exc))
             return
         except Exception as exc:
-            notes.append(f"dogcheck failed: {exc}")
+            notes.append(f"Dogcheck: failed ({exc})")
 
-        messagebox.showinfo(
-            "Live patches ready",
-            "Patched data.win for live room teleport:\n• "
-            + "\n• ".join(notes)
-            + "\n\nNow start Undertale, load your save, then click a room.\n"
-            "Backup: data.win.dogcheckbak / data.win.debugbak\n\n"
-            "If you get a Code Error about dogcheck when pressing L, "
-            "click Restore data.win, then Enable live patches again.",
+        body = "\n".join(f"• {n}" for n in notes)
+        body += (
+            "\n\nClose this dialog, start Undertale, load your save, then click a room."
+            "\nBackup: data.win.dogcheckbak / data.win.debugbak"
         )
-        self._set_status("Live patches applied — start Undertale, then click a room.")
+
+        if debug_ok and dog_ok:
+            messagebox.showinfo("Live patches ready", body)
+            self._set_status("Live patches OK — debug ON, dogcheck OFF. Restart Undertale.")
+        elif debug_ok and not dog_ok:
+            messagebox.showwarning(
+                "Dogcheck still ON",
+                body
+                + "\n\nTeleport works, but the Annoying Dog will still appear on "
+                "blocked/secret rooms.\n\n"
+                "Try: Restore data.win → Enable live patches again.\n"
+                "Or use UndertaleModTool → Scripts → DisableDogcheck.",
+            )
+            self._set_status("Debug ON, but dogcheck still ON — dog may still appear.")
+        else:
+            messagebox.showerror("Patch incomplete", body)
+            self._set_status("Live patches incomplete — see the error dialog.")
 
     def _on_load_error(self, exc: Exception) -> None:
         self._loading = False
