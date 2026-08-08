@@ -11,6 +11,11 @@ import customtkinter as ctk
 from PIL import Image
 
 from .assets import AssetKind, GameAsset
+from .live_teleport import (
+    enable_debug_mode,
+    live_teleport_to_room,
+    undertale_is_running,
+)
 from .parser import load_undertale_assets
 from .teleport import (
     default_save_dir,
@@ -76,6 +81,9 @@ class UndertaleExtractorApp(ctk.CTk):
         self.page = 0
         self.download_dir = _default_download_dir()
         self.save_dir = default_save_dir()
+        self.data_win_path: Path | None = None
+        self._live_room_addrs: list = []
+        self._live_current_room: int | None = None
         self._thumb_cache: dict[str, ctk.CTkImage] = {}
         self._preview_image: ctk.CTkImage | None = None
         self._loading = False
@@ -396,7 +404,7 @@ class UndertaleExtractorApp(ctk.CTk):
                 "1. Click “Open Undertale Folder”\n"
                 "2. Choose the folder that contains data.win\n"
                 "3. Open the Rooms category\n"
-                "4. Click a room to enter it in-game (edits your save)\n"
+                "4. Keep Undertale running, then click a room to enter it live\n"
                 "5. Or browse sprites/audio and click to download"
             ),
             font=ctk.CTkFont(family="Georgia", size=16),
@@ -469,17 +477,36 @@ class UndertaleExtractorApp(ctk.CTk):
             self._loading = False
             self.open_btn.configure(state="normal")
             self.assets = result.assets
+            self.data_win_path = Path(result.path)
             self.game_name = result.game_name or "Undertale"
             self.title(f"Undertale File Extractor — {self.game_name}")
             self._thumb_cache.clear()
+            self._live_room_addrs = []
             self.export_all_btn.configure(state="normal")
             self.page = 0
             self._update_counts()
+            # Prepare debug mode for live Insert/Del room warps (needs one game restart).
+            try:
+                if enable_debug_mode(self.data_win_path, backup=True):
+                    self._set_status(
+                        "Debug warp ready in data.win. If Undertale was already open, "
+                        "restart it once so live room click works."
+                    )
+            except Exception:
+                pass
+            try:
+                if self.save_dir:
+                    info = read_save_info(self.save_dir)
+                    self._live_current_room = info.current_room
+            except Exception:
+                pass
             # Default to Rooms so teleporting is one click away.
             self.set_kind(AssetKind.ROOM)
+            running = "Undertale is open — click a room to jump live." if undertale_is_running() else (
+                "Start Undertale, load your save, then click a room."
+            )
             self._set_status(
-                f"Loaded {len(self.assets)} files from {result.path.name} "
-                f"(showing {PAGE_SIZE} per page). Click a room to enter it in-game."
+                f"Loaded {len(self.assets)} files from {result.path.name}. {running}"
             )
         except Exception as exc:
             self._on_load_error(exc)
@@ -710,8 +737,7 @@ class UndertaleExtractorApp(ctk.CTk):
                 text=(
                     f"Room ID {room_id}\n"
                     f"Size {asset.meta.get('width', '?')}×{asset.meta.get('height', '?')}\n"
-                    "Click to enter in-game\n"
-                    "(close Undertale first, then Continue)"
+                    "Click to enter while Undertale is open"
                 )
             )
             self.download_btn.configure(state="disabled")
@@ -757,6 +783,73 @@ class UndertaleExtractorApp(ctk.CTk):
             messagebox.showerror("Teleport failed", "This room has no valid id.")
             return
 
+        label = friendly_room_label(self.selected.name, room_id)
+        max_room = max(
+            (int(a.meta.get("room_id", 0)) for a in self.assets if a.is_room),
+            default=400,
+        )
+
+        # Prefer live teleport while Undertale is running.
+        if undertale_is_running():
+            current = self._live_current_room
+            if current is None and self.save_dir:
+                try:
+                    current = read_save_info(self.save_dir).current_room
+                except Exception:
+                    current = None
+
+            self._set_status(f"Jumping to {label} in the open game…")
+            self.update_idletasks()
+            try:
+                result, self._live_room_addrs = live_teleport_to_room(
+                    room_id,
+                    current_room=current,
+                    data_win=self.data_win_path,
+                    cached_addresses=self._live_room_addrs,
+                    max_room_id=max_room + 5,
+                )
+            except Exception as exc:
+                messagebox.showerror("Live teleport failed", str(exc))
+                return
+
+            if result.ok:
+                self._live_current_room = room_id
+                # Keep save in sync for next boot
+                try:
+                    if self.save_dir:
+                        teleport_to_room(room_id, self.save_dir, backup=True)
+                except Exception:
+                    pass
+                self._set_status(result.detail)
+                self.preview_meta.configure(
+                    text=f"Entered room {room_id}\n{self.selected.name}\n(live)"
+                )
+                return
+
+            # Live failed — ask about save fallback
+            fallback = messagebox.askyesno(
+                "Could not jump live",
+                f"{result.detail}\n\n"
+                "Update your save file instead?\n"
+                "(Then use Undertale title screen → Continue)\n\n"
+                f"Target: {label}",
+            )
+            if not fallback:
+                self._set_status(result.detail)
+                return
+        else:
+            ok = messagebox.askokcancel(
+                "Enter room?",
+                (
+                    f"Undertale is not running.\n\n"
+                    f"Set save to:\n{label}\n\n"
+                    "Then open Undertale → Continue.\n\n"
+                    "Tip: leave Undertale open next time to jump live."
+                ),
+            )
+            if not ok:
+                return
+
         if self.save_dir is None:
             picked = filedialog.askdirectory(
                 title="Select Undertale save folder (contains file0)"
@@ -766,39 +859,24 @@ class UndertaleExtractorApp(ctk.CTk):
             self.save_dir = Path(picked)
             self.save_path_label.configure(text=f"Game save:\n{self.save_dir}")
 
-        label = friendly_room_label(self.selected.name, room_id)
-        ok = messagebox.askokcancel(
-            "Enter room in Undertale?",
-            (
-                f"Teleport to:\n{label}\n\n"
-                "This edits your Undertale save (file0).\n"
-                "A backup (.bak) is created.\n\n"
-                "1. Close Undertale completely\n"
-                "2. Click OK here\n"
-                "3. Open Undertale → Continue\n\n"
-                "Some rooms show the Annoying Dog (dogcheck)."
-            ),
-        )
-        if not ok:
-            return
         try:
             info = teleport_to_room(room_id, self.save_dir)
+            self._live_current_room = room_id
             self._set_status(
-                f"Save updated → room {room_id} ({self.selected.name}). "
-                "Open Undertale and press Continue."
+                f"Save updated → room {room_id}. Open Undertale and press Continue."
             )
             self.preview_meta.configure(
                 text=(
-                    f"Ready to enter room {room_id}\n"
-                    f"Save: {info.folder}\n"
-                    f"Player: {info.player_name or '?'}\n"
-                    "Open Undertale → Continue"
+                    f"Save set to room {room_id}\n"
+                    f"{info.folder}\n"
+                    "Title screen → Continue"
                 )
             )
             messagebox.showinfo(
-                "Room set",
-                f"Your save now points to room {room_id}.\n\n"
-                "Open Undertale and press Continue to enter it.",
+                "Room set in save",
+                f"Save now points to room {room_id}.\n\n"
+                "Open Undertale → Continue.\n\n"
+                "For live jumps, start Undertale first, then click rooms here.",
             )
         except Exception as exc:
             messagebox.showerror("Teleport failed", str(exc))
