@@ -71,3 +71,19 @@ python png_to_blender.py my_sprite.png
 Then in Blender: **File → Import → Wavefront (.obj)**
 
 Or double-click `png_to_blender.py` for a small window. Modes: `voxels` (pixel cubes), `plane`, `height`.
+
+## Optional: wipe Undertale data
+
+`UndertaleDataWiper.py` finds and deletes Undertale saves, config, and Steam cloud data (`391540`) on this PC.
+
+```bat
+python UndertaleDataWiper.py
+```
+
+Review the listed paths, then type **WIPE** to confirm. Game install wipe is off by default.  
+Turn off Steam Cloud for Undertale first, or Steam may restore saves.
+
+Scan without deleting:
+```bat
+python UndertaleDataWiper.py --scan-only
+```
