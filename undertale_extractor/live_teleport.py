@@ -3,42 +3,24 @@
 from __future__ import annotations
 
 import ctypes
-import struct
 import sys
 import time
 from ctypes import wintypes
 from dataclasses import dataclass
 from pathlib import Path
 
-
-PROCESS_QUERY_INFORMATION = 0x0400
-PROCESS_VM_READ = 0x0010
-PROCESS_VM_WRITE = 0x0020
-PROCESS_VM_OPERATION = 0x0008
-PROCESS_ACCESS = (
-    PROCESS_QUERY_INFORMATION | PROCESS_VM_READ | PROCESS_VM_WRITE | PROCESS_VM_OPERATION
-)
-
-MEM_COMMIT = 0x1000
-PAGE_READABLE = {
-    0x02,  # PAGE_READONLY
-    0x04,  # PAGE_READWRITE
-    0x08,  # PAGE_WRITECOPY
-    0x20,  # PAGE_EXECUTE_READ
-    0x40,  # PAGE_EXECUTE_READWRITE
-    0x80,  # PAGE_EXECUTE_WRITECOPY
-}
+from .teleport import teleport_to_room
 
 # Known data.win offsets where debug flag is a single byte (0 → 1).
 DEBUG_OFFSETS = (
     0x725B24,  # 1.00
     0x725D8C,  # 1.001
     0x7748C4,  # 1.08
-    0x725DDC,  # 1.001 linux-ish / variants
+    0x725DDC,  # variants
 )
 
-VK_INSERT = 0x2D
-VK_DELETE = 0x2E
+VK_L = 0x4C
+VK_S = 0x53
 KEYEVENTF_KEYUP = 0x0002
 
 
@@ -49,10 +31,6 @@ class LiveTeleportResult:
     detail: str
     addresses_written: int = 0
     debug_enabled: bool = False
-
-
-# Cache entries: (address, "i32"|"f64")
-RoomAddr = tuple[int, str]
 
 
 def is_windows() -> bool:
@@ -68,8 +46,7 @@ def find_undertale_hwnd() -> int:
         hwnd = user32.FindWindowW(None, title)
         if hwnd:
             return int(hwnd)
-    # Partial title match fallback
-    found = []
+    found: list[int] = []
 
     @ctypes.WINFUNCTYPE(ctypes.c_bool, wintypes.HWND, wintypes.LPARAM)
     def enum_proc(hwnd, _lparam):
@@ -90,16 +67,15 @@ def find_undertale_pid() -> int | None:
     if not is_windows():
         return None
     hwnd = find_undertale_hwnd()
-    if not hwnd:
-        # Fallback: snapshot processes by name
-        return _pid_by_name(("UNDERTALE.exe", "undertale.exe", "Undertale.exe"))
-    pid = wintypes.DWORD()
-    ctypes.windll.user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
-    return int(pid.value) or None
+    if hwnd:
+        pid = wintypes.DWORD()
+        ctypes.windll.user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+        if pid.value:
+            return int(pid.value)
+    return _pid_by_name(("UNDERTALE.exe", "undertale.exe", "Undertale.exe"))
 
 
 def _pid_by_name(names: tuple[str, ...]) -> int | None:
-    # Minimal Toolhelp snapshot
     TH32CS_SNAPPROCESS = 0x00000002
     INVALID = ctypes.c_void_p(-1).value
 
@@ -144,8 +120,8 @@ def undertale_is_running() -> bool:
 
 def enable_debug_mode(data_win: str | Path, *, backup: bool = True) -> bool:
     """
-    Flip Undertale's debug flag in data.win so Insert/Del room-warp works.
-    Returns True if debug is (now) enabled.
+    Flip Undertale's debug flag in data.win so S/L save-load warps work.
+    Returns True if debug is (now) enabled at a known offset.
     """
     path = Path(data_win)
     data = bytearray(path.read_bytes())
@@ -159,7 +135,6 @@ def enable_debug_mode(data_win: str | Path, *, backup: bool = True) -> bool:
                 data[offset] = 1
                 changed = True
     if not changed and not already:
-        # Heuristic: search for rare pattern near known debug init (best-effort)
         return False
     if changed:
         if backup:
@@ -170,267 +145,123 @@ def enable_debug_mode(data_win: str | Path, *, backup: bool = True) -> bool:
     return True
 
 
-def _send_key_to_undertale(vk_code: int) -> bool:
+def debug_flag_enabled(data_win: str | Path) -> bool:
+    path = Path(data_win)
+    data = path.read_bytes()
+    return any(offset < len(data) and data[offset] == 1 for offset in DEBUG_OFFSETS)
+
+
+def _send_key_to_undertale(vk_code: int, *, presses: int = 1) -> bool:
     hwnd = find_undertale_hwnd()
     user32 = ctypes.windll.user32
-    if hwnd:
-        user32.SetForegroundWindow(hwnd)
-        time.sleep(0.05)
-    # keybd_event works even if focus is a bit flaky
-    user32.keybd_event(vk_code, 0, 0, 0)
-    time.sleep(0.03)
-    user32.keybd_event(vk_code, 0, KEYEVENTF_KEYUP, 0)
+    if not hwnd:
+        return False
+    user32.SetForegroundWindow(hwnd)
+    time.sleep(0.08)
+    for _ in range(presses):
+        user32.keybd_event(vk_code, 0, 0, 0)
+        time.sleep(0.04)
+        user32.keybd_event(vk_code, 0, KEYEVENTF_KEYUP, 0)
+        time.sleep(0.06)
     return True
-
-
-class _MEMORY_BASIC_INFORMATION(ctypes.Structure):
-    _fields_ = [
-        ("BaseAddress", ctypes.c_void_p),
-        ("AllocationBase", ctypes.c_void_p),
-        ("AllocationProtect", wintypes.DWORD),
-        ("RegionSize", ctypes.c_size_t),
-        ("State", wintypes.DWORD),
-        ("Protect", wintypes.DWORD),
-        ("Type", wintypes.DWORD),
-    ]
-
-
-def _scan_for_pattern(handle, needle: bytes, *, align: int, max_hits: int = 64) -> list[int]:
-    kernel32 = ctypes.windll.kernel32
-    hits: list[int] = []
-    address = 0
-    mbi = _MEMORY_BASIC_INFORMATION()
-    limit = 0x7FFFFFFF0000 if ctypes.sizeof(ctypes.c_void_p) == 8 else 0x7FFF0000
-    while address < limit:
-        res = kernel32.VirtualQueryEx(
-            handle,
-            ctypes.c_void_p(address),
-            ctypes.byref(mbi),
-            ctypes.sizeof(mbi),
-        )
-        if res == 0:
-            break
-        base = mbi.BaseAddress or 0
-        size = int(mbi.RegionSize)
-        prot = int(mbi.Protect)
-        state = int(mbi.State)
-        next_addr = base + size
-        if next_addr <= address:
-            break
-        address = next_addr
-
-        if state != MEM_COMMIT or (prot & 0xFF) not in PAGE_READABLE:
-            continue
-        if size > 64 * 1024 * 1024:
-            continue
-
-        buf = (ctypes.c_char * size)()
-        read = ctypes.c_size_t(0)
-        ok = kernel32.ReadProcessMemory(
-            handle, ctypes.c_void_p(base), buf, size, ctypes.byref(read)
-        )
-        if not ok or read.value == 0:
-            continue
-        data = bytes(buf[: read.value])
-        start = 0
-        while True:
-            idx = data.find(needle, start)
-            if idx < 0:
-                break
-            if align <= 1 or idx % align == 0:
-                hits.append(base + idx)
-                if len(hits) >= max_hits:
-                    return hits
-            start = idx + align
-    return hits
-
-
-def _scan_for_int32(handle, value: int, *, max_hits: int = 64) -> list[int]:
-    return _scan_for_pattern(handle, struct.pack("<i", int(value)), align=4, max_hits=max_hits)
-
-
-def _scan_for_f64(handle, value: float, *, max_hits: int = 64) -> list[int]:
-    return _scan_for_pattern(handle, struct.pack("<d", float(value)), align=4, max_hits=max_hits)
-
-
-def _write_bytes(handle, address: int, raw: bytes) -> bool:
-    kernel32 = ctypes.windll.kernel32
-    written = ctypes.c_size_t(0)
-    ok = kernel32.WriteProcessMemory(
-        handle,
-        ctypes.c_void_p(address),
-        raw,
-        len(raw),
-        ctypes.byref(written),
-    )
-    return bool(ok and written.value == len(raw))
-
-
-def _write_int32(handle, address: int, value: int) -> bool:
-    return _write_bytes(handle, address, struct.pack("<i", int(value)))
-
-
-def _write_f64(handle, address: int, value: float) -> bool:
-    return _write_bytes(handle, address, struct.pack("<d", float(value)))
 
 
 def live_teleport_to_room(
     room_id: int,
     *,
-    current_room: int | None = None,
+    save_folder: str | Path | None = None,
     data_win: str | Path | None = None,
-    cached_addresses: list[RoomAddr] | None = None,
+    current_room: int | None = None,  # kept for API compatibility; unused
+    cached_addresses: list | None = None,  # kept for API compatibility; unused
     max_room_id: int = 400,
-) -> tuple[LiveTeleportResult, list[RoomAddr]]:
+) -> tuple[LiveTeleportResult, list]:
     """
-    Teleport while Undertale is running.
+    Teleport to an exact room while Undertale is running.
 
-    Strategy (with debug mode):
-      1. Write (target-1) into the live `room` value in memory
-      2. Send Insert → game does room_goto(room+1) == target
-
-    Returns (result, address_cache_for_next_time).
+    Method (reliable with debug mode):
+      1. Write the target room into file0 / undertale.ini
+      2. Focus Undertale and press L (debug Load)
+      → game reloads the save in that room immediately
     """
+    _ = (current_room, cached_addresses, max_room_id)
+
     if not is_windows():
         return (
             LiveTeleportResult(False, "unsupported", "Live teleport requires Windows."),
-            cached_addresses or [],
+            [],
         )
 
-    pid = find_undertale_pid()
-    if not pid:
+    if not undertale_is_running():
         return (
             LiveTeleportResult(
                 False,
                 "not_running",
                 "Undertale is not running. Start the game, load a save, then click a room.",
             ),
-            cached_addresses or [],
+            [],
         )
 
     debug_on = False
+    needs_restart = False
     if data_win and Path(data_win).is_file():
+        was_on = debug_flag_enabled(data_win)
         debug_on = enable_debug_mode(data_win, backup=True)
+        if debug_on and not was_on:
+            needs_restart = True
 
-    kernel32 = ctypes.windll.kernel32
-    handle = kernel32.OpenProcess(PROCESS_ACCESS, False, pid)
-    if not handle:
+    if needs_restart:
         return (
             LiveTeleportResult(
                 False,
-                "access_denied",
-                "Could not open Undertale process. Try running this app as Administrator.",
+                "restart_required",
+                "Debug warp was just enabled in data.win. "
+                "Restart Undertale once, load your save, then click the room again.",
             ),
-            cached_addresses or [],
+            [],
+        )
+
+    if data_win and Path(data_win).is_file() and not debug_flag_enabled(data_win):
+        return (
+            LiveTeleportResult(
+                False,
+                "no_debug",
+                "Could not enable Undertale debug mode automatically. "
+                "Live teleport needs debug Load (L).",
+            ),
+            [],
         )
 
     try:
-        search_room = current_room
-        addrs: list[RoomAddr] = list(cached_addresses or [])
+        teleport_to_room(room_id, save_folder, backup=True)
+    except Exception as exc:
+        return (
+            LiveTeleportResult(False, "save_failed", f"Could not update save: {exc}"),
+            [],
+        )
 
-        if addrs:
-            buf_i = ctypes.c_int32()
-            buf_d = ctypes.c_double()
-            read = ctypes.c_size_t(0)
-            addr0, kind0 = addrs[0]
-            if kind0 == "f64":
-                if kernel32.ReadProcessMemory(
-                    handle, ctypes.c_void_p(addr0), ctypes.byref(buf_d), 8, ctypes.byref(read)
-                ):
-                    search_room = int(buf_d.value)
-            else:
-                if kernel32.ReadProcessMemory(
-                    handle, ctypes.c_void_p(addr0), ctypes.byref(buf_i), 4, ctypes.byref(read)
-                ):
-                    search_room = int(buf_i.value)
+    # Give the OS a moment to finish writing the save before the game reads it.
+    time.sleep(0.12)
 
-        if search_room is None:
-            return (
-                LiveTeleportResult(
-                    False,
-                    "need_current_room",
-                    "Save once in Undertale (at a save point), then try again "
-                    "so we can find your current room in memory.",
-                ),
-                addrs,
-            )
-
-        if not addrs:
-            int_hits = _scan_for_int32(handle, int(search_room), max_hits=16)
-            f64_hits = _scan_for_f64(handle, float(search_room), max_hits=16)
-            addrs = [(a, "i32") for a in int_hits] + [(a, "f64") for a in f64_hits]
-            if not addrs:
-                return (
-                    LiveTeleportResult(
-                        False,
-                        "not_found",
-                        f"Could not find room {search_room} in memory. "
-                        "Save your game once, stay on the overworld (not a menu/battle), "
-                        "then try again.",
-                    ),
-                    [],
-                )
-            if len(addrs) > 16:
-                addrs = addrs[:16]
-
-        target = int(room_id)
-        if target < 0 or target > max_room_id:
-            return (
-                LiveTeleportResult(False, "bad_room", f"Room id {target} looks invalid."),
-                addrs,
-            )
-
-        if target == 0:
-            write_value = 1
-            vk = VK_DELETE
-        else:
-            write_value = target - 1
-            vk = VK_INSERT
-
-        written = 0
-        for addr, kind in addrs:
-            if kind == "f64":
-                if _write_f64(handle, addr, float(write_value)):
-                    written += 1
-            else:
-                if _write_int32(handle, addr, write_value):
-                    written += 1
-
-        if written == 0:
-            return (
-                LiveTeleportResult(
-                    False,
-                    "write_failed",
-                    "Found room memory but could not write. Try as Administrator.",
-                ),
-                addrs,
-            )
-
-        _send_key_to_undertale(vk)
-        time.sleep(0.15)
-        for addr, kind in addrs:
-            if kind == "f64":
-                _write_f64(handle, addr, float(target))
-            else:
-                _write_int32(handle, addr, target)
-
-        hint = ""
-        if data_win:
-            hint = (
-                " If nothing happened, restart Undertale once "
-                "(debug warp keys need a restart after first setup)."
-            )
-
+    if not _send_key_to_undertale(VK_L, presses=1):
         return (
             LiveTeleportResult(
-                True,
-                "live",
-                f"Teleported to room {target} while Undertale is open "
-                f"(updated {written} memory slot(s)).{hint}",
-                addresses_written=written,
-                debug_enabled=debug_on,
+                False,
+                "no_window",
+                "Updated your save, but could not focus the UNDERTALE window. "
+                "Click the Undertale window and press L (debug load), "
+                "or restart Undertale once if debug was just enabled.",
             ),
-            addrs,
+            [],
         )
-    finally:
-        kernel32.CloseHandle(handle)
+
+    return (
+        LiveTeleportResult(
+            True,
+            "live_load",
+            f"Loaded room {room_id} live (save updated + debug Load). "
+            "If nothing changed, click Undertale once and press L, "
+            "or restart Undertale once so debug mode is active.",
+            debug_enabled=debug_on,
+        ),
+        [],
+    )

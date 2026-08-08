@@ -784,29 +784,16 @@ class UndertaleExtractorApp(ctk.CTk):
             return
 
         label = friendly_room_label(self.selected.name, room_id)
-        max_room = max(
-            (int(a.meta.get("room_id", 0)) for a in self.assets if a.is_room),
-            default=400,
-        )
 
         # Prefer live teleport while Undertale is running.
         if undertale_is_running():
-            current = self._live_current_room
-            if current is None and self.save_dir:
-                try:
-                    current = read_save_info(self.save_dir).current_room
-                except Exception:
-                    current = None
-
             self._set_status(f"Jumping to {label} in the open game…")
             self.update_idletasks()
             try:
                 result, self._live_room_addrs = live_teleport_to_room(
                     room_id,
-                    current_room=current,
+                    save_folder=self.save_dir,
                     data_win=self.data_win_path,
-                    cached_addresses=self._live_room_addrs,
-                    max_room_id=max_room + 5,
                 )
             except Exception as exc:
                 messagebox.showerror("Live teleport failed", str(exc))
@@ -814,16 +801,15 @@ class UndertaleExtractorApp(ctk.CTk):
 
             if result.ok:
                 self._live_current_room = room_id
-                # Keep save in sync for next boot
-                try:
-                    if self.save_dir:
-                        teleport_to_room(room_id, self.save_dir, backup=True)
-                except Exception:
-                    pass
                 self._set_status(result.detail)
                 self.preview_meta.configure(
-                    text=f"Entered room {room_id}\n{self.selected.name}\n(live)"
+                    text=f"Entered room {room_id}\n{self.selected.name}\n(live load)"
                 )
+                return
+
+            if result.method == "restart_required":
+                messagebox.showinfo("Restart Undertale once", result.detail)
+                self._set_status(result.detail)
                 return
 
             # Live failed — ask about save fallback
