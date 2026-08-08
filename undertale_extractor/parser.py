@@ -52,9 +52,25 @@ class ParsedArchive:
     chunks: dict[str, tuple[int, int]] = field(default_factory=dict)
     assets: list[GameAsset] = field(default_factory=list)
     textures: list[bytes] = field(default_factory=list)
-    texture_images: list[Image.Image] = field(default_factory=list)
+    # Decoded on demand — decoding every atlas up-front freezes / OOMs on real Undertale.
+    _texture_image_cache: dict[int, Image.Image] = field(default_factory=dict, repr=False)
     tpag: list[TexturePageItem] = field(default_factory=list)
     sounds: list[SoundInfo] = field(default_factory=list)
+
+    def get_texture_image(self, index: int) -> Image.Image:
+        if index in self._texture_image_cache:
+            return self._texture_image_cache[index]
+        if index < 0 or index >= len(self.textures):
+            img = Image.new("RGBA", (1, 1), (0, 0, 0, 0))
+            self._texture_image_cache[index] = img
+            return img
+        blob = self.textures[index]
+        try:
+            img = Image.open(io.BytesIO(blob)).convert("RGBA")
+        except Exception:
+            img = Image.new("RGBA", (1, 1), (0, 0, 0, 0))
+        self._texture_image_cache[index] = img
+        return img
 
 
 def find_data_file(folder: str | Path) -> Path | None:
@@ -150,13 +166,19 @@ def _guess_audio_ext(blob: bytes) -> str:
 class DataWinParser:
     """Extract browsable assets from a GameMaker data file."""
 
-    def __init__(self, path: str | Path):
+    def __init__(self, path: str | Path, progress: Callable[[str], None] | None = None):
         self.path = Path(path)
+        self.progress = progress
         self.reader = BinaryReader.from_path(self.path)
         self.result = ParsedArchive(path=self.path)
 
+    def _say(self, message: str) -> None:
+        if self.progress:
+            self.progress(message)
+
     def parse(self) -> ParsedArchive:
         r = self.reader
+        self._say(f"Opening {self.path.name} ({self.path.stat().st_size // (1024 * 1024)} MB)…")
         if r.read_tag() != "FORM":
             raise ValueError(f"{self.path.name} is not a GameMaker FORM archive")
         form_size = r.read_u32()
@@ -169,13 +191,21 @@ class DataWinParser:
             self.result.chunks[tag] = (start, size)
             r.seek(start + size)
 
+        self._say("Reading game info…")
         self._parse_gen8()
+        self._say("Indexing textures…")
         self._parse_textures()
+        self._say("Reading sprite sheets…")
         self._parse_tpag()
+        self._say("Reading sound list…")
         self._parse_sounds()
+        self._say("Extracting audio…")
         self._parse_audio()
+        self._say("Indexing sprites…")
         self._parse_sprites()
+        self._say("Indexing backgrounds…")
         self._parse_backgrounds()
+        self._say("Indexing fonts…")
         self._parse_fonts()
         return self.result
 
@@ -259,17 +289,12 @@ class DataWinParser:
 
         self.result.textures = raw_textures
         for i, blob in enumerate(raw_textures):
-            try:
-                img = Image.open(io.BytesIO(blob)).convert("RGBA")
-            except Exception:
-                img = Image.new("RGBA", (1, 1), (0, 0, 0, 0))
-            self.result.texture_images.append(img)
 
             def make_data(b: bytes = blob) -> bytes:
                 return b
 
-            def make_image(im: Image.Image = img) -> Image.Image:
-                return im.copy()
+            def make_image(idx: int = i) -> Image.Image:
+                return self.result.get_texture_image(idx).copy()
 
             self.result.assets.append(
                 GameAsset(
@@ -397,14 +422,13 @@ class DataWinParser:
             )
 
     def _crop_sprite_frame(self, tpag: TexturePageItem) -> Image.Image:
-        if tpag.texture_id < 0 or tpag.texture_id >= len(self.result.texture_images):
-            return Image.new("RGBA", (max(1, tpag.width), max(1, tpag.height)), (0, 0, 0, 0))
-        sheet = self.result.texture_images[tpag.texture_id]
-        w, h = tpag.width, tpag.height
-        if w <= 0 or h <= 0:
+        w, h = max(1, tpag.width), max(1, tpag.height)
+        if tpag.texture_id < 0 or tpag.texture_id >= len(self.result.textures):
+            return Image.new("RGBA", (w, h), (0, 0, 0, 0))
+        sheet = self.result.get_texture_image(tpag.texture_id)
+        if tpag.width <= 0 or tpag.height <= 0:
             return Image.new("RGBA", (1, 1), (0, 0, 0, 0))
-        box = (tpag.x, tpag.y, tpag.x + w, tpag.y + h)
-        # Clamp to sheet
+        box = (tpag.x, tpag.y, tpag.x + tpag.width, tpag.y + tpag.height)
         sw, sh = sheet.size
         box = (
             max(0, min(box[0], sw)),
@@ -455,6 +479,9 @@ class DataWinParser:
 
             if not frames:
                 continue
+
+            if index % 200 == 0:
+                self._say(f"Indexing sprites… {index}/{count}")
 
             for fi, frame in enumerate(frames):
                 frame_name = name if len(frames) == 1 else f"{name}_{fi}"
@@ -577,9 +604,7 @@ def load_undertale_assets(
             "Could not find data.win (or game.unx). "
             "Select your Undertale install folder or the data file itself."
         )
-    if progress:
-        progress(f"Reading {data_file.name}…")
-    parser = DataWinParser(data_file)
+    parser = DataWinParser(data_file, progress=progress)
     result = parser.parse()
     if include_loose:
         if progress:
@@ -592,5 +617,5 @@ def load_undertale_assets(
             if key not in existing:
                 result.assets.append(asset)
     if progress:
-        progress(f"Loaded {len(result.assets)} files")
+        progress(f"Loaded {len(result.assets)} files — building browser…")
     return result

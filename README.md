@@ -31,7 +31,8 @@ python UndertaleExtractor.py
    ```
    C:\Program Files (x86)\Steam\steamapps\common\Undertale
    ```
-3. Scroll through sprites, textures, audio, music, etc.
+3. Scroll through sprites, textures, audio, music, etc.  
+   Use **Prev / Next** — the app shows 36 files per page so it won’t freeze.
 4. **Click any file** to download it to your Downloads folder
 
 ### Extra buttons
