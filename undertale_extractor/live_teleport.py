@@ -9,6 +9,7 @@ from ctypes import wintypes
 from dataclasses import dataclass
 from pathlib import Path
 
+from .dogcheck import disable_dogcheck, dogcheck_likely_disabled
 from .teleport import teleport_to_room
 
 # Known data.win offsets where debug flag is a single byte (0 → 1).
@@ -202,23 +203,25 @@ def live_teleport_to_room(
         )
 
     debug_on = False
-    needs_restart = False
     if data_win and Path(data_win).is_file():
-        was_on = debug_flag_enabled(data_win)
-        debug_on = enable_debug_mode(data_win, backup=True)
-        if debug_on and not was_on:
-            needs_restart = True
-
-    if needs_restart:
-        return (
-            LiveTeleportResult(
-                False,
-                "restart_required",
-                "Debug warp was just enabled in data.win. "
-                "Restart Undertale once, load your save, then click the room again.",
-            ),
-            [],
-        )
+        debug_on = debug_flag_enabled(data_win)
+        dog_ok = dogcheck_likely_disabled(data_win)
+        # Never rewrite data.win while Undertale is running — that can block
+        # launch / cause sharing errors. User must use "Enable live patches" first.
+        if not debug_on or not dog_ok:
+            return (
+                LiveTeleportResult(
+                    False,
+                    "patches_required",
+                    "Live teleport needs a one-time data.win patch.\n\n"
+                    "1. Close Undertale completely\n"
+                    "2. Click Enable live patches in this app\n"
+                    "3. Start Undertale, load your save\n"
+                    "4. Click the room again\n\n"
+                    "If Undertale will not start, click Restore data.win.",
+                ),
+                [],
+            )
 
     if data_win and Path(data_win).is_file() and not debug_flag_enabled(data_win):
         return (

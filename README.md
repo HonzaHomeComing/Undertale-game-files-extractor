@@ -38,15 +38,14 @@ python UndertaleExtractor.py
 5. Click other files (sprites/audio/…) to download them
 
 ### Enter rooms in-game (live)
-1. Open your game folder in the extractor once  
-   (this enables debug mode **and disables dogcheck** in `data.win`)
-2. **Restart Undertale once**, then load your save and leave it running
-3. Click a room in **Rooms** — you jump straight there
+1. Open your Undertale folder in the extractor (**browsing does not lock the game**)
+2. **Close Undertale** if it is running, then click **Enable live patches**
+3. Start Undertale, load your save, leave it running
+4. Click a room in **Rooms** — you jump straight there
 
-The dancing Annoying Dog is “dogcheck” (blocks invalid/secret rooms). The app patches it out automatically.  
-A backup is saved as `data.win.dogcheckbak`.
+If Undertale will not start after patching, click **Restore data.win** (uses `data.win.dogcheckbak`).
 
-If nothing happens, click the Undertale window and press **L**, or restart Undertale so the patches are active.
+The dancing Annoying Dog is “dogcheck”. Live patches disable it and turn on debug Load (**L**).
 
 
 ### Extra buttons

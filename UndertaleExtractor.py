@@ -2,7 +2,10 @@
 Undertale File Extractor
 ========================
 Browse files and click Rooms to enter them while Undertale is open.
-Automatically disables dogcheck (Annoying Dog blocker) and enables debug load.
+
+Open the folder to browse (does not lock or patch data.win).
+Use Enable live patches (Undertale closed) for live room jumps.
+Use Restore data.win if the game will not start after patching.
 
 Windows: pip install Pillow customtkinter
          python UndertaleExtractor.py
@@ -18,6 +21,7 @@ import re
 import shutil
 import struct
 import sys
+import tempfile
 import threading
 import time
 from collections.abc import Callable
@@ -36,7 +40,144 @@ except ImportError:
     input("Press Enter to exit...")
     raise SystemExit(1)
 
-__version__ = "1.4.0"
+__version__ = "1.5.0"
+
+
+# --- assets.py ---
+
+from typing import Callable
+
+
+
+class AssetKind(str, Enum):
+    SPRITE = "Sprites"
+    TEXTURE = "Textures"
+    BACKGROUND = "Backgrounds"
+    AUDIO = "Audio"
+    MUSIC = "Music"
+    FONT = "Fonts"
+    ROOM = "Rooms"
+    OTHER = "Other"
+
+
+SAFE_NAME = re.compile(r"[^\w.\-]+", re.UNICODE)
+
+
+def safe_filename(name: str, fallback: str = "file") -> str:
+    cleaned = SAFE_NAME.sub("_", name.strip()).strip("._")
+    return cleaned or fallback
+
+
+@dataclass
+class GameAsset:
+    """A single browsable / downloadable game file."""
+
+    id: str
+    name: str
+    kind: AssetKind
+    extension: str
+    size: int
+    # Lazy payload providers keep memory reasonable for large archives.
+    _data_fn: Callable[[], bytes] | None = field(default=None, repr=False)
+    _image_fn: Callable[[], Image.Image] | None = field(default=None, repr=False)
+    _cached_data: bytes | None = field(default=None, repr=False)
+    _cached_image: Image.Image | None = field(default=None, repr=False)
+    source_path: str | None = None
+    meta: dict = field(default_factory=dict)
+
+    @property
+    def display_name(self) -> str:
+        if self.name.lower().endswith(self.extension.lower()):
+            return self.name
+        return f"{self.name}{self.extension}"
+
+    @property
+    def is_image(self) -> bool:
+        if self._image_fn is not None:
+            return True
+        return self.extension.lower() in {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"}
+
+    @property
+    def is_room(self) -> bool:
+        return self.kind == AssetKind.ROOM or bool(self.meta.get("teleport"))
+
+    @property
+    def is_audio(self) -> bool:
+        return self.extension.lower() in {".wav", ".ogg", ".mp3"}
+
+    def get_data(self) -> bytes:
+        if self._cached_data is not None:
+            return self._cached_data
+        if self._data_fn is not None:
+            self._cached_data = self._data_fn()
+            return self._cached_data
+        if self._image_fn is not None:
+            img = self.get_image()
+            buf = io.BytesIO()
+            img.save(buf, format="PNG")
+            self._cached_data = buf.getvalue()
+            return self._cached_data
+        raise RuntimeError(f"No data available for {self.id}")
+
+    def get_image(self) -> Image.Image | None:
+        if not self.is_image and self._image_fn is None:
+            return None
+        if self._cached_image is not None:
+            return self._cached_image
+        if self._image_fn is not None:
+            self._cached_image = self._image_fn()
+            return self._cached_image
+        data = self.get_data()
+        self._cached_image = Image.open(io.BytesIO(data)).convert("RGBA")
+        return self._cached_image
+
+    def export_to(self, directory: str | Path, overwrite: bool = True) -> Path:
+        directory = Path(directory)
+        directory.mkdir(parents=True, exist_ok=True)
+        target = directory / safe_filename(self.display_name)
+        if target.exists() and not overwrite:
+            stem, ext = target.stem, target.suffix
+            n = 1
+            while True:
+                candidate = directory / f"{stem}_{n}{ext}"
+                if not candidate.exists():
+                    target = candidate
+                    break
+                n += 1
+        target.write_bytes(self.get_data())
+        return target
+
+    def thumbnail(self, max_size: int = 96) -> Image.Image | None:
+        img = self.get_image()
+        if img is None:
+            return None
+        thumb = img.copy()
+        thumb.thumbnail((max_size, max_size), Image.Resampling.NEAREST)
+        return thumb
+
+
+# --- binary.py ---
+
+def read_game_file_bytes(path: str | Path) -> bytes:
+    """
+    Read a game file without holding a long-lived lock on the install copy.
+
+    Copies to a temp file first so Steam / Undertale can open data.win while
+    this app is browsing (Windows exclusive opens used to block launch).
+    """
+    path = Path(path)
+    tmp_dir = Path(tempfile.gettempdir()) / "undertale_extractor_read"
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+    tmp_path = tmp_dir / f"{os.getpid()}_{path.name}"
+    try:
+        shutil.copy2(path, tmp_path)
+        return tmp_path.read_bytes()
+    finally:
+        try:
+            tmp_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+
 
 class BinaryReader:
     """Random-access little-endian reader over a bytes buffer."""
@@ -47,7 +188,7 @@ class BinaryReader:
 
     @classmethod
     def from_path(cls, path: str | Path) -> "BinaryReader":
-        return cls(Path(path).read_bytes())
+        return cls(read_game_file_bytes(path))
 
     @property
     def position(self) -> int:
@@ -162,112 +303,10 @@ def write_u16(buf: bytearray, value: int) -> None:
 def write_i32(buf: bytearray, value: int) -> None:
     buf.extend(struct.pack("<i", value))
 
-class AssetKind(str, Enum):
-    SPRITE = "Sprites"
-    TEXTURE = "Textures"
-    BACKGROUND = "Backgrounds"
-    AUDIO = "Audio"
-    MUSIC = "Music"
-    FONT = "Fonts"
-    ROOM = "Rooms"
-    OTHER = "Other"
 
+# --- teleport.py ---
 
-SAFE_NAME = re.compile(r"[^\w.\-]+", re.UNICODE)
-
-
-def safe_filename(name: str, fallback: str = "file") -> str:
-    cleaned = SAFE_NAME.sub("_", name.strip()).strip("._")
-    return cleaned or fallback
-
-
-@dataclass
-class GameAsset:
-    """A single browsable / downloadable game file."""
-
-    id: str
-    name: str
-    kind: AssetKind
-    extension: str
-    size: int
-    # Lazy payload providers keep memory reasonable for large archives.
-    _data_fn: Callable[[], bytes] | None = field(default=None, repr=False)
-    _image_fn: Callable[[], Image.Image] | None = field(default=None, repr=False)
-    _cached_data: bytes | None = field(default=None, repr=False)
-    _cached_image: Image.Image | None = field(default=None, repr=False)
-    source_path: str | None = None
-    meta: dict = field(default_factory=dict)
-
-    @property
-    def display_name(self) -> str:
-        if self.name.lower().endswith(self.extension.lower()):
-            return self.name
-        return f"{self.name}{self.extension}"
-
-    @property
-    def is_image(self) -> bool:
-        if self._image_fn is not None:
-            return True
-        return self.extension.lower() in {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"}
-
-    @property
-    def is_room(self) -> bool:
-        return self.kind == AssetKind.ROOM or bool(self.meta.get("teleport"))
-
-    @property
-    def is_audio(self) -> bool:
-        return self.extension.lower() in {".wav", ".ogg", ".mp3"}
-
-    def get_data(self) -> bytes:
-        if self._cached_data is not None:
-            return self._cached_data
-        if self._data_fn is not None:
-            self._cached_data = self._data_fn()
-            return self._cached_data
-        if self._image_fn is not None:
-            img = self.get_image()
-            buf = io.BytesIO()
-            img.save(buf, format="PNG")
-            self._cached_data = buf.getvalue()
-            return self._cached_data
-        raise RuntimeError(f"No data available for {self.id}")
-
-    def get_image(self) -> Image.Image | None:
-        if not self.is_image and self._image_fn is None:
-            return None
-        if self._cached_image is not None:
-            return self._cached_image
-        if self._image_fn is not None:
-            self._cached_image = self._image_fn()
-            return self._cached_image
-        data = self.get_data()
-        self._cached_image = Image.open(io.BytesIO(data)).convert("RGBA")
-        return self._cached_image
-
-    def export_to(self, directory: str | Path, overwrite: bool = True) -> Path:
-        directory = Path(directory)
-        directory.mkdir(parents=True, exist_ok=True)
-        target = directory / safe_filename(self.display_name)
-        if target.exists() and not overwrite:
-            stem, ext = target.stem, target.suffix
-            n = 1
-            while True:
-                candidate = directory / f"{stem}_{n}{ext}"
-                if not candidate.exists():
-                    target = candidate
-                    break
-                n += 1
-        target.write_bytes(self.get_data())
-        return target
-
-    def thumbnail(self, max_size: int = 96) -> Image.Image | None:
-        img = self.get_image()
-        if img is None:
-            return None
-        thumb = img.copy()
-        thumb.thumbnail((max_size, max_size), Image.Resampling.NEAREST)
-        return thumb
-
+# file0 uses 1-based line numbers in community docs; room is line 548.
 ROOM_LINE_INDEX = 547  # 0-based
 
 
@@ -437,12 +476,27 @@ def friendly_room_label(name: str, room_id: int) -> str:
     pretty = pretty.replace("_", " ")
     return f"{room_id:03d}  {pretty}"
 
-MARXVEE_PATCHES: tuple[tuple[int, bytes], ...] = (
-    (0x7213E4, bytes.fromhex("000100B7")),  # Undertale 1.00
-    (0x7216D4, bytes.fromhex("000100B7")),  # Undertale 1.001
+
+# --- dogcheck.py ---
+
+# Classic HxD patches (Marxvee). Only applied when the bytes at the offset
+# still match a known pre-patch pattern — never blindly overwrite.
+MARXVEE_PATCHES: tuple[tuple[int, bytes, tuple[bytes, ...]], ...] = (
+    # offset, new_bytes, allowed_originals
+    (0x7213E4, bytes.fromhex("000100B7"), (bytes.fromhex("000100B7"),)),  # already / unknown → skip unless we add originals
+    (0x7216D4, bytes.fromhex("000100B7"), (bytes.fromhex("000100B7"),)),
 )
 
-# Reported Steam / newer mac-port-adjacent offsets (byte replace old→new).
+# Known originals for Marxvee (when present, allow patch). Keep empty-safe:
+# If only "already patched" is known, Marxvee won't fire on virgin files —
+# CODE stub handles modern builds instead.
+_MARXVEE_ORIGINALS: dict[int, tuple[bytes, ...]] = {
+    # Populated with observed pre-patch sequences when known.
+    # Without a match, we refuse to write (avoids bricking data.win).
+}
+
+# Reported Steam / newer offsets (byte replace old→new).
+# Applied only when EVERY listed old-byte matches (set must be coherent).
 STEAM_BYTE_PATCHES: tuple[tuple[int, int, int], ...] = (
     (0x76DF44, 0x01, 0x00),
     (0x76E058, 0x00, 0x01),
@@ -452,6 +506,16 @@ STEAM_BYTE_PATCHES: tuple[tuple[int, int, int], ...] = (
 # Bytecode 15+ Exit instruction (return;), little-endian word.
 EXIT_WORD = struct.pack("<I", 0x9D000000)
 
+DOGCHECK_NAMES = frozenset(
+    {
+        "gml_Script_scr_dogcheck",
+        "scr_dogcheck",
+        "gml_Script_dogcheck",
+    }
+)
+
+BACKUP_SUFFIXES = (".dogcheckbak", ".debugbak", ".bak")
+
 
 def _backup(path: Path) -> Path:
     bak = path.with_suffix(path.suffix + ".dogcheckbak")
@@ -460,17 +524,40 @@ def _backup(path: Path) -> Path:
     return bak
 
 
+def find_data_win_backup(data_win: str | Path) -> Path | None:
+    path = Path(data_win)
+    for suffix in BACKUP_SUFFIXES:
+        bak = path.with_suffix(path.suffix + suffix)
+        if bak.is_file():
+            return bak
+    return None
+
+
+def restore_data_win_backup(data_win: str | Path) -> tuple[bool, str]:
+    """Restore data.win from the newest extractor backup. Close Undertale first."""
+    path = Path(data_win)
+    bak = find_data_win_backup(path)
+    if bak is None:
+        return False, f"No backup found next to {path.name} (looked for {', '.join(BACKUP_SUFFIXES)})."
+    try:
+        path.write_bytes(bak.read_bytes())
+    except OSError as exc:
+        return False, f"Could not restore: {exc}"
+    return True, f"Restored {path.name} from {bak.name}. You can start Undertale now."
+
+
 def _apply_marxvee(data: bytearray) -> list[str]:
     applied = []
-    for offset, patch in MARXVEE_PATCHES:
+    for offset, patch, _legacy in MARXVEE_PATCHES:
         if offset + len(patch) > len(data):
             continue
         current = bytes(data[offset : offset + len(patch)])
         if current == patch:
             applied.append(f"marxvee@0x{offset:X}=already")
             continue
-        # Only patch if it looks like real code (not empty/padding)
-        if current == b"\x00" * len(patch):
+        originals = _MARXVEE_ORIGINALS.get(offset, ())
+        if current not in originals:
+            # Refuse unknown bytes — wrong game version would brick launch.
             continue
         data[offset : offset + len(patch)] = patch
         applied.append(f"marxvee@0x{offset:X}")
@@ -478,21 +565,31 @@ def _apply_marxvee(data: bytearray) -> list[str]:
 
 
 def _apply_steam_bytes(data: bytearray) -> list[str]:
+    """Apply Steam dogcheck byte flips only if the whole set matches."""
     applied = []
-    hits = 0
+    # Require every offset either already-new or still-old (no mixed junk).
+    ready = True
+    need_write = False
     for offset, old, new in STEAM_BYTE_PATCHES:
         if offset >= len(data):
+            ready = False
+            break
+        val = data[offset]
+        if val == new:
             continue
-        if data[offset] == new:
-            hits += 1
+        if val == old:
+            need_write = True
             continue
+        ready = False
+        break
+    if not ready:
+        return applied
+    if not need_write:
+        return ["steam=already"]
+    for offset, old, new in STEAM_BYTE_PATCHES:
         if data[offset] == old:
             data[offset] = new
             applied.append(f"steam@0x{offset:X}")
-            hits += 1
-    # Only count as success if we matched most of the set
-    if len(applied) == 0 and hits >= len(STEAM_BYTE_PATCHES):
-        applied.append("steam=already")
     return applied
 
 
@@ -501,8 +598,6 @@ def _find_code_entries(reader: BinaryReader) -> list[tuple[str, int, int]]:
     Return list of (name, bytecode_abs_offset, length) for CODE entries.
     Supports bytecode 14 (inline) and 15+ (blob pointer).
     """
-    info = None
-    # Re-scan FORM for CODE
     reader.seek(0)
     if reader.read_tag() != "FORM":
         return []
@@ -513,10 +608,15 @@ def _find_code_entries(reader: BinaryReader) -> list[tuple[str, int, int]]:
         tag = reader.read_tag()
         size = reader.read_u32()
         start = reader.position
+        if start + size > reader.size or size < 0:
+            break
         if tag == "CODE":
             code_start, code_size = start, size
-        reader.seek(start + size)
-    if code_start is None:
+        try:
+            reader.seek(start + size)
+        except ValueError:
+            break
+    if code_start is None or code_size is None:
         return []
 
     reader.seek(code_start)
@@ -525,30 +625,39 @@ def _find_code_entries(reader: BinaryReader) -> list[tuple[str, int, int]]:
         return []
     offsets = [reader.read_u32() for _ in range(count)]
     entries: list[tuple[str, int, int]] = []
+    code_end = code_start + code_size
 
     for off in offsets:
         try:
+            if off < code_start or off >= code_end:
+                continue
             reader.seek(off)
             name_ptr = reader.read_u32()
             name = reader.read_cstring_at(name_ptr) if name_ptr else ""
             length = reader.read_u32()
-            if length == 0 or length > 5_000_000:
+            # Dogcheck is a small script; reject absurd lengths.
+            if length == 0 or length > 200_000:
                 continue
 
-            # Heuristic: bytecode 15 has locals/args then relative pointer
+            # Try bytecode 15+: locals, args, relative pointer to bytecode blob.
             locals_count = reader.read_u16()
             args = reader.read_u16()
             rel = reader.read_i32()
-            # If locals/args look sane, treat as bytecode 15+
-            if locals_count < 10_000 and (args & 0x7FFF) < 10_000:
-                bytecode_abs = reader.position - 4 + rel
-                if 0 < bytecode_abs < reader.size and bytecode_abs + length <= reader.size:
-                    entries.append((name, bytecode_abs, length))
-                    continue
+            bytecode_abs = reader.position - 4 + rel
+            args_n = args & 0x7FFF
+            # Strict: tiny locals/args and pointer must land inside the file.
+            if (
+                locals_count < 512
+                and args_n < 64
+                and abs(rel) < reader.size
+                and 0 < bytecode_abs < reader.size
+                and bytecode_abs + length <= reader.size
+            ):
+                entries.append((name, bytecode_abs, length))
+                continue
 
-            # Bytecode 14: instructions start right after length field
-            # (we already read locals/args/rel incorrectly — recompute)
-            bc14_start = off + 8  # name ptr + length
+            # Bytecode 14: instructions start right after name ptr + length.
+            bc14_start = off + 8
             if bc14_start + length <= reader.size:
                 entries.append((name, bc14_start, length))
         except Exception:
@@ -556,33 +665,28 @@ def _find_code_entries(reader: BinaryReader) -> list[tuple[str, int, int]]:
     return entries
 
 
-def _patch_dogcheck_code(data: bytearray, path: Path) -> list[str]:
+def _patch_dogcheck_code(data: bytearray) -> list[str]:
+    """
+    Disable scr_dogcheck by writing a single Exit at the start of its bytecode.
+
+    Only touches the first instruction — never fills the whole length (a wrong
+    length used to be able to corrupt neighboring code and stop Undertale launching).
+    """
     applied = []
     reader = BinaryReader(bytes(data))
     entries = _find_code_entries(reader)
-    targets = [
-        e
-        for e in entries
-        if "scr_dogcheck" in e[0].lower() or e[0].lower().endswith("dogcheck")
-    ]
+    targets = [e for e in entries if e[0] in DOGCHECK_NAMES or e[0].lower().endswith("dogcheck")]
     if not targets:
-        # Fallback: some builds name it gml_Script_scr_dogcheck only — already covered
         return applied
 
     for name, bc_off, length in targets:
-        if bc_off + length > len(data):
+        if length < 4 or bc_off + 4 > len(data):
             continue
-        original = bytes(data[bc_off : bc_off + length])
-        # Build stub: fill with Exit words (safe no-op return)
-        stub = bytearray()
-        while len(stub) + 4 <= length:
-            stub.extend(EXIT_WORD)
-        while len(stub) < length:
-            stub.append(0)
-        if bytes(stub) == original:
+        original_head = bytes(data[bc_off : bc_off + 4])
+        if original_head == EXIT_WORD:
             applied.append(f"code:{name}=already")
             continue
-        data[bc_off : bc_off + length] = stub
+        data[bc_off : bc_off + 4] = EXIT_WORD
         applied.append(f"code:{name}")
     return applied
 
@@ -602,10 +706,11 @@ def disable_dogcheck(data_win: str | Path, *, backup: bool = True) -> tuple[bool
     notes.extend(_apply_marxvee(raw))
     notes.extend(_apply_steam_bytes(raw))
     try:
-        notes.extend(_patch_dogcheck_code(raw, path))
+        notes.extend(_patch_dogcheck_code(raw))
     except Exception as exc:
         notes.append(f"code-scan-error:{exc}")
 
+    # Ignore "already" noise when deciding if anything changed.
     if bytes(raw) == before:
         if any("already" in n for n in notes):
             return True, "Dogcheck already disabled."
@@ -624,7 +729,7 @@ def disable_dogcheck(data_win: str | Path, *, backup: bool = True) -> tuple[bool
 def dogcheck_likely_disabled(data_win: str | Path) -> bool:
     path = Path(data_win)
     data = path.read_bytes()
-    for offset, patch in MARXVEE_PATCHES:
+    for offset, patch, _origs in MARXVEE_PATCHES:
         if offset + len(patch) <= len(data) and data[offset : offset + len(patch)] == patch:
             return True
     steam_ok = 0
@@ -633,9 +738,20 @@ def dogcheck_likely_disabled(data_win: str | Path) -> bool:
             steam_ok += 1
     if steam_ok >= 2:
         return True
-    # Code stub check: look for Exit-filled dogcheck via quick string presence only
-    return b"scr_dogcheck" in data and False  # unknown without full scan
+    try:
+        reader = BinaryReader(data)
+        for name, bc_off, length in _find_code_entries(reader):
+            if name in DOGCHECK_NAMES or name.lower().endswith("dogcheck"):
+                if length >= 4 and data[bc_off : bc_off + 4] == EXIT_WORD:
+                    return True
+    except Exception:
+        pass
+    return False
 
+
+# --- live_teleport.py ---
+
+# Known data.win offsets where debug flag is a single byte (0 → 1).
 DEBUG_OFFSETS = (
     0x725B24,  # 1.00
     0x725D8C,  # 1.001
@@ -826,23 +942,25 @@ def live_teleport_to_room(
         )
 
     debug_on = False
-    needs_restart = False
     if data_win and Path(data_win).is_file():
-        was_on = debug_flag_enabled(data_win)
-        debug_on = enable_debug_mode(data_win, backup=True)
-        if debug_on and not was_on:
-            needs_restart = True
-
-    if needs_restart:
-        return (
-            LiveTeleportResult(
-                False,
-                "restart_required",
-                "Debug warp was just enabled in data.win. "
-                "Restart Undertale once, load your save, then click the room again.",
-            ),
-            [],
-        )
+        debug_on = debug_flag_enabled(data_win)
+        dog_ok = dogcheck_likely_disabled(data_win)
+        # Never rewrite data.win while Undertale is running — that can block
+        # launch / cause sharing errors. User must use "Enable live patches" first.
+        if not debug_on or not dog_ok:
+            return (
+                LiveTeleportResult(
+                    False,
+                    "patches_required",
+                    "Live teleport needs a one-time data.win patch.\n\n"
+                    "1. Close Undertale completely\n"
+                    "2. Click Enable live patches in this app\n"
+                    "3. Start Undertale, load your save\n"
+                    "4. Click the room again\n\n"
+                    "If Undertale will not start, click Restore data.win.",
+                ),
+                [],
+            )
 
     if data_win and Path(data_win).is_file() and not debug_flag_enabled(data_win):
         return (
@@ -889,6 +1007,9 @@ def live_teleport_to_room(
         ),
         [],
     )
+
+
+# --- parser.py ---
 
 PNG_SIG = b"\x89PNG\r\n\x1a\n"
 OGG_SIG = b"OggS"
@@ -1500,7 +1621,6 @@ class DataWinParser:
             ) -> Image.Image:
                 img = Image.new("RGBA", (160, 96), (28, 24, 20, 255))
                 try:
-                    from PIL import ImageDraw
 
                     draw = ImageDraw.Draw(img)
                     draw.rectangle((4, 4, 156, 92), outline=(196, 92, 38, 255), width=2)
@@ -1559,6 +1679,9 @@ def load_undertale_assets(
     if progress:
         progress(f"Loaded {len(result.assets)} files — building browser…")
     return result
+
+
+# --- gui.py ---
 
 # Visual direction: ink-and-ember utility (not purple / cream-serif defaults)
 ctk.set_appearance_mode("light")
@@ -1701,6 +1824,30 @@ class UndertaleExtractorApp(ctk.CTk):
             width=110,
         )
         self.save_dir_btn.pack(side="left", padx=4)
+
+        self.restore_btn = ctk.CTkButton(
+            actions,
+            text="Restore data.win",
+            command=self.restore_data_win,
+            fg_color=COLORS["border"],
+            hover_color="#c4baa8",
+            text_color=COLORS["ink"],
+            width=130,
+            state="disabled",
+        )
+        self.restore_btn.pack(side="left", padx=4)
+
+        self.patch_btn = ctk.CTkButton(
+            actions,
+            text="Enable live patches",
+            command=self.enable_live_patches,
+            fg_color=COLORS["border"],
+            hover_color="#c4baa8",
+            text_color=COLORS["ink"],
+            width=140,
+            state="disabled",
+        )
+        self.patch_btn.pack(side="left", padx=4)
 
         # Sidebar categories
         sidebar = ctk.CTkFrame(self, fg_color=COLORS["panel"], corner_radius=0, width=200)
@@ -2018,28 +2165,13 @@ class UndertaleExtractorApp(ctk.CTk):
             self._thumb_cache.clear()
             self._live_room_addrs = []
             self.export_all_btn.configure(state="normal")
+            self.restore_btn.configure(state="normal")
+            self.patch_btn.configure(state="normal")
             self.page = 0
             self._update_counts()
-            # Prepare debug mode + disable dogcheck for live room jumping.
-            setup_notes = []
-            try:
-                if enable_debug_mode(self.data_win_path, backup=True):
-                    setup_notes.append("debug on")
-            except Exception:
-                pass
-            try:
-                ok, msg = disable_dogcheck(self.data_win_path, backup=True)
-                if ok:
-                    setup_notes.append("dogcheck off")
-                    if "Restart" in msg:
-                        messagebox.showinfo(
-                            "Dogcheck disabled",
-                            "Undertale’s Annoying Dog blocker is now disabled in data.win.\n\n"
-                            "Restart Undertale once, load your save, then click rooms again.\n\n"
-                            "(A backup was saved as data.win.dogcheckbak)",
-                        )
-            except Exception as exc:
-                setup_notes.append(f"dogcheck failed: {exc}")
+            # Do NOT patch data.win on open — that rewrote the install file and could
+            # stop Undertale launching while / after this app loaded the folder.
+            # Live teleport applies debug + dogcheck patches only when you click a room.
             try:
                 if self.save_dir:
                     info = read_save_info(self.save_dir)
@@ -2051,14 +2183,86 @@ class UndertaleExtractorApp(ctk.CTk):
             running = (
                 "Undertale is open — click a room to jump live."
                 if undertale_is_running()
-                else "Start Undertale, load your save, then click a room."
+                else "Start Undertale anytime — browsing does not lock or patch data.win."
             )
-            extra = f" Setup: {', '.join(setup_notes)}." if setup_notes else ""
             self._set_status(
-                f"Loaded {len(self.assets)} files from {result.path.name}. {running}{extra}"
+                f"Loaded {len(self.assets)} files from {result.path.name}. {running} "
+                "Room jump patches only when you click a room."
             )
         except Exception as exc:
             self._on_load_error(exc)
+
+    def restore_data_win(self) -> None:
+        if not self.data_win_path:
+            messagebox.showinfo("No game open", "Open your Undertale folder first.")
+            return
+        if undertale_is_running():
+            messagebox.showwarning(
+                "Close Undertale first",
+                "Close Undertale completely, then click Restore data.win again.",
+            )
+            return
+        ok = messagebox.askokcancel(
+            "Restore data.win?",
+            "Replace data.win with the extractor backup "
+            "(data.win.dogcheckbak / data.win.debugbak).\n\n"
+            "Use this if Undertale will not start after a live-teleport patch.",
+        )
+        if not ok:
+            return
+        success, msg = restore_data_win_backup(self.data_win_path)
+        if success:
+            messagebox.showinfo("Restored", msg)
+            self._set_status(msg)
+        else:
+            messagebox.showerror("Restore failed", msg)
+
+    def enable_live_patches(self) -> None:
+        """Patch data.win for live room jumps — only while Undertale is closed."""
+        if not self.data_win_path:
+            messagebox.showinfo("No game open", "Open your Undertale folder first.")
+            return
+        if undertale_is_running():
+            messagebox.showwarning(
+                "Close Undertale first",
+                "Undertale must be fully closed before patching data.win.\n"
+                "Close the game, click Enable live patches, then start Undertale again.",
+            )
+            return
+        notes = []
+        try:
+            if enable_debug_mode(self.data_win_path, backup=True):
+                notes.append("debug load (L) enabled")
+        except OSError as exc:
+            messagebox.showerror(
+                "Could not patch",
+                f"Windows blocked writing data.win:\n{exc}\n\n"
+                "Close Undertale/Steam overlays and try again.",
+            )
+            return
+        except Exception as exc:
+            notes.append(f"debug failed: {exc}")
+        try:
+            ok, msg = disable_dogcheck(self.data_win_path, backup=True)
+            if ok:
+                notes.append("dogcheck disabled")
+            else:
+                notes.append(msg)
+        except OSError as exc:
+            messagebox.showerror("Could not patch", str(exc))
+            return
+        except Exception as exc:
+            notes.append(f"dogcheck failed: {exc}")
+
+        messagebox.showinfo(
+            "Live patches ready",
+            "Patched data.win for live room teleport:\n• "
+            + "\n• ".join(notes)
+            + "\n\nNow start Undertale, load your save, then click a room.\n"
+            "Backup: data.win.dogcheckbak / data.win.debugbak\n"
+            "If the game will not start, click Restore data.win.",
+        )
+        self._set_status("Live patches applied — start Undertale, then click a room.")
 
     def _on_load_error(self, exc: Exception) -> None:
         self._loading = False
@@ -2356,8 +2560,8 @@ class UndertaleExtractorApp(ctk.CTk):
                 )
                 return
 
-            if result.method == "restart_required":
-                messagebox.showinfo("Restart Undertale once", result.detail)
+            if result.method in {"restart_required", "patches_required"}:
+                messagebox.showinfo("Enable live patches first", result.detail)
                 self._set_status(result.detail)
                 return
 
@@ -2525,6 +2729,9 @@ def run_app() -> None:
     app = UndertaleExtractorApp()
     app.mainloop()
 
+
+if __name__ == "__main__":
+    run_app()
 
 
 
