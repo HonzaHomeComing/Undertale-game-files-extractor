@@ -43,9 +43,9 @@ python UndertaleExtractor.py
 3. Start Undertale, load your save, leave it running
 4. Click a room in **Rooms** — you jump straight there
 
-If Undertale will not start after patching, click **Restore data.win** (uses `data.win.dogcheckbak`).
+If Undertale shows a **Code Error** about `dogcheck` when loading (L key), click **Restore data.win**, then **Enable live patches** again.
 
-The dancing Annoying Dog is “dogcheck”. Live patches disable it and turn on debug Load (**L**).
+Live patches turn on debug Load (**L**). Dogcheck disable uses safe Steam-style byte flips only (never a bare Exit stub — that caused the crash).
 
 
 ### Extra buttons

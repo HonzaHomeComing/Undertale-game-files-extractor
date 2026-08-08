@@ -11,7 +11,11 @@ import customtkinter as ctk
 from PIL import Image
 
 from .assets import AssetKind, GameAsset
-from .dogcheck import disable_dogcheck, dogcheck_likely_disabled, restore_data_win_backup
+from .dogcheck import (
+    disable_dogcheck,
+    dogcheck_exit_stubbed,
+    restore_data_win_backup,
+)
 from .live_teleport import (
     debug_flag_enabled,
     enable_debug_mode,
@@ -529,9 +533,26 @@ class UndertaleExtractorApp(ctk.CTk):
                 if undertale_is_running()
                 else "Start Undertale anytime — browsing does not lock or patch data.win."
             )
+            warn = ""
+            try:
+                if dogcheck_exit_stubbed(self.data_win_path):
+                    warn = (
+                        " WARNING: broken dogcheck patch detected — click Restore data.win "
+                        "or Enable live patches (auto-heals) before using live Load (L)."
+                    )
+                    messagebox.showwarning(
+                        "Broken dogcheck patch",
+                        "Your data.win has an old dogcheck Exit stub that crashes Undertale "
+                        "when pressing L (debug load):\n\n"
+                        "Variable obj_mainchara.dogcheck not set…\n\n"
+                        "Close Undertale, then click Restore data.win "
+                        "(or Enable live patches to auto-heal from backup).",
+                    )
+            except Exception:
+                pass
             self._set_status(
                 f"Loaded {len(self.assets)} files from {result.path.name}. {running} "
-                "Room jump patches only when you click a room."
+                f"Use Enable live patches (game closed) for room jumps.{warn}"
             )
         except Exception as exc:
             self._on_load_error(exc)
@@ -550,7 +571,8 @@ class UndertaleExtractorApp(ctk.CTk):
             "Restore data.win?",
             "Replace data.win with the extractor backup "
             "(data.win.dogcheckbak / data.win.debugbak).\n\n"
-            "Use this if Undertale will not start after a live-teleport patch.",
+            "Use this if Undertale crashes on L with a dogcheck error, "
+            "or will not start after patching.",
         )
         if not ok:
             return
@@ -603,8 +625,9 @@ class UndertaleExtractorApp(ctk.CTk):
             "Patched data.win for live room teleport:\n• "
             + "\n• ".join(notes)
             + "\n\nNow start Undertale, load your save, then click a room.\n"
-            "Backup: data.win.dogcheckbak / data.win.debugbak\n"
-            "If the game will not start, click Restore data.win.",
+            "Backup: data.win.dogcheckbak / data.win.debugbak\n\n"
+            "If you get a Code Error about dogcheck when pressing L, "
+            "click Restore data.win, then Enable live patches again.",
         )
         self._set_status("Live patches applied — start Undertale, then click a room.")
 
@@ -904,8 +927,13 @@ class UndertaleExtractorApp(ctk.CTk):
                 )
                 return
 
-            if result.method in {"restart_required", "patches_required"}:
-                messagebox.showinfo("Enable live patches first", result.detail)
+            if result.method in {"restart_required", "patches_required", "broken_dogcheck"}:
+                title = (
+                    "Broken dogcheck patch"
+                    if result.method == "broken_dogcheck"
+                    else "Enable live patches first"
+                )
+                messagebox.showinfo(title, result.detail)
                 self._set_status(result.detail)
                 return
 
