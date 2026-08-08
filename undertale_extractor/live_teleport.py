@@ -267,7 +267,7 @@ def live_teleport_to_room(
             )
         debug_on = debug_flag_enabled(data_win)
         # Only debug mode is required for live Load (L).
-        # Dogcheck disable is optional (secret rooms); a bare Exit stub is harmful.
+        # Dogcheck disable is optional but recommended for secret rooms.
         if not debug_on:
             return (
                 LiveTeleportResult(
@@ -278,6 +278,8 @@ def live_teleport_to_room(
                     "2. Click Enable live patches in this app\n"
                     "3. Start Undertale, load your save\n"
                     "4. Click the room again\n\n"
+                    "If you see the Annoying Dog, run Enable live patches again "
+                    "(it now uses a safer dogcheck disable).\n"
                     "If you see a Code Error about dogcheck, click Restore data.win first.",
                 ),
                 [],
