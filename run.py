@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Launch the Undertale File Extractor windowed app."""
+"""Launcher — prefer UndertaleExtractor.py on Windows."""
 
-from undertale_extractor.__main__ import main
+from UndertaleExtractor import main
 
 if __name__ == "__main__":
     raise SystemExit(main())
