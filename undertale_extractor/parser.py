@@ -207,6 +207,8 @@ class DataWinParser:
         self._parse_backgrounds()
         self._say("Indexing fonts…")
         self._parse_fonts()
+        self._say("Indexing rooms…")
+        self._parse_rooms()
         return self.result
 
     def _chunk(self, tag: str) -> BinaryReader | None:
@@ -589,6 +591,67 @@ class DataWinParser:
                     )
             except Exception:
                 continue
+
+    def _parse_rooms(self) -> None:
+        """Index ROOM chunk entries (name + id) for in-game teleport."""
+        info = self.result.chunks.get("ROOM")
+        if not info:
+            return
+        start, _ = info
+        r = self.reader
+        r.seek(start)
+        count = r.read_u32()
+        if count < 0 or count > 50_000:
+            return
+        offsets = [r.read_u32() for _ in range(count)]
+
+        for index, off in enumerate(offsets):
+            try:
+                r.seek(off)
+                name = r.read_offset_string() or f"room_{index}"
+                width = r.read_i32()
+                height = r.read_i32()
+            except Exception:
+                name = f"room_{index}"
+                width = 0
+                height = 0
+
+            # Small label card used as a thumbnail in the browser.
+            def make_image(
+                label: str = name,
+                rid: int = index,
+            ) -> Image.Image:
+                img = Image.new("RGBA", (160, 96), (28, 24, 20, 255))
+                try:
+                    from PIL import ImageDraw
+
+                    draw = ImageDraw.Draw(img)
+                    draw.rectangle((4, 4, 156, 92), outline=(196, 92, 38, 255), width=2)
+                    pretty = label[5:] if label.lower().startswith("room_") else label
+                    pretty = pretty.replace("_", " ")
+                    draw.text((10, 14), f"ROOM {rid}", fill=(255, 250, 242, 255))
+                    draw.text((10, 40), pretty[:22], fill=(232, 226, 214, 255))
+                    draw.text((10, 68), "click to enter", fill=(196, 92, 38, 255))
+                except Exception:
+                    pass
+                return img
+
+            self.result.assets.append(
+                GameAsset(
+                    id=f"room:{index}",
+                    name=name,
+                    kind=AssetKind.ROOM,
+                    extension="",
+                    size=max(0, width) * max(0, height),
+                    _image_fn=make_image,
+                    meta={
+                        "room_id": index,
+                        "width": width,
+                        "height": height,
+                        "teleport": True,
+                    },
+                )
+            )
 
 
 def load_undertale_assets(

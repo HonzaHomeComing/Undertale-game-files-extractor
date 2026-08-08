@@ -12,6 +12,13 @@ from PIL import Image
 
 from .assets import AssetKind, GameAsset
 from .parser import load_undertale_assets
+from .teleport import (
+    default_save_dir,
+    find_undertale_save_dirs,
+    friendly_room_label,
+    read_save_info,
+    teleport_to_room,
+)
 
 # Visual direction: ink-and-ember utility (not purple / cream-serif defaults)
 ctk.set_appearance_mode("light")
@@ -31,6 +38,7 @@ COLORS = {
 }
 
 KIND_ORDER = [
+    AssetKind.ROOM,
     AssetKind.SPRITE,
     AssetKind.TEXTURE,
     AssetKind.BACKGROUND,
@@ -64,9 +72,10 @@ class UndertaleExtractorApp(ctk.CTk):
         self.assets: list[GameAsset] = []
         self.filtered: list[GameAsset] = []
         self.selected: GameAsset | None = None
-        self.current_kind: AssetKind | None = AssetKind.SPRITE
+        self.current_kind: AssetKind | None = AssetKind.ROOM
         self.page = 0
         self.download_dir = _default_download_dir()
+        self.save_dir = default_save_dir()
         self._thumb_cache: dict[str, ctk.CTkImage] = {}
         self._preview_image: ctk.CTkImage | None = None
         self._loading = False
@@ -138,6 +147,17 @@ class UndertaleExtractorApp(ctk.CTk):
             width=130,
         )
         self.dl_dir_btn.pack(side="left", padx=4)
+
+        self.save_dir_btn = ctk.CTkButton(
+            actions,
+            text="Save Folder…",
+            command=self.choose_save_dir,
+            fg_color=COLORS["border"],
+            hover_color="#c4baa8",
+            text_color=COLORS["ink"],
+            width=110,
+        )
+        self.save_dir_btn.pack(side="left", padx=4)
 
         # Sidebar categories
         sidebar = ctk.CTkFrame(self, fg_color=COLORS["panel"], corner_radius=0, width=200)
@@ -297,6 +317,19 @@ class UndertaleExtractorApp(ctk.CTk):
         )
         self.download_btn.pack(fill="x", padx=16, pady=4)
 
+        self.teleport_btn = ctk.CTkButton(
+            preview,
+            text="Enter Room In-Game",
+            command=self.teleport_selected,
+            fg_color=COLORS["success"],
+            hover_color="#24553f",
+            text_color="#fffaf2",
+            state="disabled",
+            height=40,
+            font=ctk.CTkFont(size=14, weight="bold"),
+        )
+        self.teleport_btn.pack(fill="x", padx=16, pady=4)
+
         self.save_as_btn = ctk.CTkButton(
             preview,
             text="Save As…",
@@ -309,9 +342,22 @@ class UndertaleExtractorApp(ctk.CTk):
         )
         self.save_as_btn.pack(fill="x", padx=16, pady=4)
 
+        save_hint = "No Undertale save found yet"
+        if self.save_dir:
+            save_hint = f"Game save:\n{self.save_dir}"
+        self.save_path_label = ctk.CTkLabel(
+            preview,
+            text=save_hint,
+            font=ctk.CTkFont(size=11),
+            text_color=COLORS["muted"],
+            wraplength=240,
+            justify="left",
+        )
+        self.save_path_label.pack(anchor="w", padx=16, pady=(8, 0))
+
         self.dl_path_label = ctk.CTkLabel(
             preview,
-            text=f"Saves to:\n{self.download_dir}",
+            text=f"Downloads to:\n{self.download_dir}",
             font=ctk.CTkFont(size=11),
             text_color=COLORS["muted"],
             wraplength=240,
@@ -319,7 +365,7 @@ class UndertaleExtractorApp(ctk.CTk):
         )
         self.dl_path_label.pack(anchor="w", padx=16, pady=16)
 
-        self._highlight_kind(AssetKind.SPRITE)
+        self._highlight_kind(AssetKind.ROOM)
         self._show_empty_state()
 
     def _make_kind_button(self, parent, label: str, kind: AssetKind | None) -> ctk.CTkButton:
@@ -349,8 +395,9 @@ class UndertaleExtractorApp(ctk.CTk):
             text=(
                 "1. Click “Open Undertale Folder”\n"
                 "2. Choose the folder that contains data.win\n"
-                "3. Scroll the extracted files\n"
-                "4. Click any image or file to download it"
+                "3. Open the Rooms category\n"
+                "4. Click a room to enter it in-game (edits your save)\n"
+                "5. Or browse sprites/audio and click to download"
             ),
             font=ctk.CTkFont(family="Georgia", size=16),
             text_color=COLORS["muted"],
@@ -428,11 +475,11 @@ class UndertaleExtractorApp(ctk.CTk):
             self.export_all_btn.configure(state="normal")
             self.page = 0
             self._update_counts()
-            # Default to Sprites (paginated) instead of dumping every file into the UI.
-            self.set_kind(AssetKind.SPRITE)
+            # Default to Rooms so teleporting is one click away.
+            self.set_kind(AssetKind.ROOM)
             self._set_status(
                 f"Loaded {len(self.assets)} files from {result.path.name} "
-                f"(showing {PAGE_SIZE} per page)"
+                f"(showing {PAGE_SIZE} per page). Click a room to enter it in-game."
             )
         except Exception as exc:
             self._on_load_error(exc)
@@ -583,9 +630,14 @@ class UndertaleExtractorApp(ctk.CTk):
         )
         thumb_label.pack(pady=(10, 4))
 
+        display = (
+            friendly_room_label(asset.name, int(asset.meta.get("room_id", 0)))
+            if asset.is_room
+            else asset.display_name
+        )
         name_label = ctk.CTkLabel(
             frame,
-            text=asset.display_name[:28] + ("…" if len(asset.display_name) > 28 else ""),
+            text=display[:28] + ("…" if len(display) > 28 else ""),
             font=ctk.CTkFont(size=12, weight="bold"),
             text_color=COLORS["ink"],
         )
@@ -593,7 +645,11 @@ class UndertaleExtractorApp(ctk.CTk):
 
         meta = ctk.CTkLabel(
             frame,
-            text=f"{asset.kind.value} · {_fmt_size(asset.size)}",
+            text=(
+                f"Room ID {asset.meta.get('room_id')} · click to enter"
+                if asset.is_room
+                else f"{asset.kind.value} · {_fmt_size(asset.size)}"
+            ),
             font=ctk.CTkFont(size=11),
             text_color=COLORS["muted"],
         )
@@ -601,7 +657,10 @@ class UndertaleExtractorApp(ctk.CTk):
 
         def on_click(_event=None, a: GameAsset = asset) -> None:
             self.select_asset(a)
-            self.download_selected()
+            if a.is_room:
+                self.teleport_selected()
+            else:
+                self.download_selected()
 
         def on_select(_event=None, a: GameAsset = asset) -> None:
             self.select_asset(a)
@@ -618,6 +677,7 @@ class UndertaleExtractorApp(ctk.CTk):
                 AssetKind.AUDIO: "♪ AUDIO",
                 AssetKind.MUSIC: "♫ MUSIC",
                 AssetKind.FONT: "Aa FONT",
+                AssetKind.ROOM: "DOOR",
                 AssetKind.OTHER: "FILE",
             }.get(asset.kind, asset.extension.upper() or "FILE")
             thumb_label.configure(text=badge)
@@ -643,12 +703,28 @@ class UndertaleExtractorApp(ctk.CTk):
 
     def select_asset(self, asset: GameAsset) -> None:
         self.selected = asset
-        self.preview_name.configure(text=asset.display_name)
-        self.preview_meta.configure(
-            text=f"{asset.kind.value}\n{_fmt_size(asset.size)}\nClick Download to save"
-        )
-        self.download_btn.configure(state="normal")
-        self.save_as_btn.configure(state="normal")
+        if asset.is_room:
+            room_id = int(asset.meta.get("room_id", -1))
+            self.preview_name.configure(text=friendly_room_label(asset.name, room_id))
+            self.preview_meta.configure(
+                text=(
+                    f"Room ID {room_id}\n"
+                    f"Size {asset.meta.get('width', '?')}×{asset.meta.get('height', '?')}\n"
+                    "Click to enter in-game\n"
+                    "(close Undertale first, then Continue)"
+                )
+            )
+            self.download_btn.configure(state="disabled")
+            self.save_as_btn.configure(state="disabled")
+            self.teleport_btn.configure(state="normal")
+        else:
+            self.preview_name.configure(text=asset.display_name)
+            self.preview_meta.configure(
+                text=f"{asset.kind.value}\n{_fmt_size(asset.size)}\nClick Download to save"
+            )
+            self.download_btn.configure(state="normal")
+            self.save_as_btn.configure(state="normal")
+            self.teleport_btn.configure(state="disabled")
 
         try:
             if asset.is_image:
@@ -673,8 +749,65 @@ class UndertaleExtractorApp(ctk.CTk):
         except Exception as exc:
             self.preview_canvas.configure(image=None, text=f"Preview failed\n{exc}")
 
+    def teleport_selected(self) -> None:
+        if not self.selected or not self.selected.is_room:
+            return
+        room_id = int(self.selected.meta.get("room_id", -1))
+        if room_id < 0:
+            messagebox.showerror("Teleport failed", "This room has no valid id.")
+            return
+
+        if self.save_dir is None:
+            picked = filedialog.askdirectory(
+                title="Select Undertale save folder (contains file0)"
+            )
+            if not picked:
+                return
+            self.save_dir = Path(picked)
+            self.save_path_label.configure(text=f"Game save:\n{self.save_dir}")
+
+        label = friendly_room_label(self.selected.name, room_id)
+        ok = messagebox.askokcancel(
+            "Enter room in Undertale?",
+            (
+                f"Teleport to:\n{label}\n\n"
+                "This edits your Undertale save (file0).\n"
+                "A backup (.bak) is created.\n\n"
+                "1. Close Undertale completely\n"
+                "2. Click OK here\n"
+                "3. Open Undertale → Continue\n\n"
+                "Some rooms show the Annoying Dog (dogcheck)."
+            ),
+        )
+        if not ok:
+            return
+        try:
+            info = teleport_to_room(room_id, self.save_dir)
+            self._set_status(
+                f"Save updated → room {room_id} ({self.selected.name}). "
+                "Open Undertale and press Continue."
+            )
+            self.preview_meta.configure(
+                text=(
+                    f"Ready to enter room {room_id}\n"
+                    f"Save: {info.folder}\n"
+                    f"Player: {info.player_name or '?'}\n"
+                    "Open Undertale → Continue"
+                )
+            )
+            messagebox.showinfo(
+                "Room set",
+                f"Your save now points to room {room_id}.\n\n"
+                "Open Undertale and press Continue to enter it.",
+            )
+        except Exception as exc:
+            messagebox.showerror("Teleport failed", str(exc))
+
     def download_selected(self) -> None:
         if not self.selected:
+            return
+        if self.selected.is_room:
+            self.teleport_selected()
             return
         try:
             path = self.selected.export_to(self.download_dir, overwrite=False)
@@ -734,7 +867,37 @@ class UndertaleExtractorApp(ctk.CTk):
         )
         if path:
             self.download_dir = Path(path)
-            self.dl_path_label.configure(text=f"Saves to:\n{self.download_dir}")
+            self.dl_path_label.configure(text=f"Downloads to:\n{self.download_dir}")
+
+    def choose_save_dir(self) -> None:
+        initial = str(self.save_dir) if self.save_dir else str(Path.home())
+        path = filedialog.askdirectory(
+            title="Select Undertale save folder (contains file0)",
+            initialdir=initial,
+        )
+        if not path:
+            # Offer known saves if any
+            known = find_undertale_save_dirs()
+            if known:
+                self.save_dir = known[0]
+                self.save_path_label.configure(text=f"Game save:\n{self.save_dir}")
+                self._set_status(f"Using save folder {self.save_dir}")
+            return
+        folder = Path(path)
+        if not (folder / "file0").is_file():
+            messagebox.showwarning(
+                "No file0 here",
+                "That folder has no file0.\n"
+                r"Typical path: %LOCALAPPDATA%\UNDERTALE",
+            )
+        self.save_dir = folder
+        self.save_path_label.configure(text=f"Game save:\n{self.save_dir}")
+        try:
+            info = read_save_info(folder)
+            extra = f" (currently room {info.current_room})" if info.current_room is not None else ""
+            self._set_status(f"Save folder set{extra}")
+        except Exception:
+            self._set_status("Save folder set")
 
 
 def _fmt_size(n: int) -> str:

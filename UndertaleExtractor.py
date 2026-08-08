@@ -1,29 +1,19 @@
 """
 Undertale File Extractor
 ========================
-Windows app: extract Undertale game files, scroll through them, click to download.
+Browse Undertale files and click Rooms to enter them in-game.
 
-How to run on Windows
----------------------
-1. Install Python 3.10+ from https://www.python.org/downloads/
-   (check "Add Python to PATH" during setup)
-2. Open Command Prompt and run:
-      pip install Pillow customtkinter
-3. Double-click UndertaleExtractor.py
-   OR run:  python UndertaleExtractor.py
-4. Click "Open Undertale Folder" and select:
-      C:\\Program Files (x86)\\Steam\\steamapps\\common\\Undertale
-   (or wherever your data.win is)
-5. Click any file to download it to your Downloads folder.
-
-Tip: the browser shows 36 files per page so Undertale does not freeze.
+Windows: pip install Pillow customtkinter
+         python UndertaleExtractor.py
 """
 
 from __future__ import annotations
 
 import argparse
 import io
+import os
 import re
+import shutil
 import struct
 import sys
 import threading
@@ -36,19 +26,16 @@ from tkinter import filedialog, messagebox
 
 try:
     import customtkinter as ctk
-    from PIL import Image
+    from PIL import Image, ImageDraw
 except ImportError:
     print("Missing packages. Open Command Prompt and run:")
     print("  pip install Pillow customtkinter")
     input("Press Enter to exit...")
     raise SystemExit(1)
 
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 
-
-# ----- binary helpers -----
-
-
+# ----- binary -----
 class BinaryReader:
     """Random-access little-endian reader over a bytes buffer."""
 
@@ -173,10 +160,7 @@ def write_u16(buf: bytearray, value: int) -> None:
 def write_i32(buf: bytearray, value: int) -> None:
     buf.extend(struct.pack("<i", value))
 
-
 # ----- assets -----
-
-
 class AssetKind(str, Enum):
     SPRITE = "Sprites"
     TEXTURE = "Textures"
@@ -184,6 +168,7 @@ class AssetKind(str, Enum):
     AUDIO = "Audio"
     MUSIC = "Music"
     FONT = "Fonts"
+    ROOM = "Rooms"
     OTHER = "Other"
 
 
@@ -220,7 +205,13 @@ class GameAsset:
 
     @property
     def is_image(self) -> bool:
+        if self._image_fn is not None:
+            return True
         return self.extension.lower() in {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"}
+
+    @property
+    def is_room(self) -> bool:
+        return self.kind == AssetKind.ROOM or bool(self.meta.get("teleport"))
 
     @property
     def is_audio(self) -> bool:
@@ -276,9 +267,177 @@ class GameAsset:
         thumb.thumbnail((max_size, max_size), Image.Resampling.NEAREST)
         return thumb
 
+# ----- teleport -----
+ROOM_LINE_INDEX = 547  # 0-based
 
-# ----- data.win parser -----
 
+@dataclass
+class SaveInfo:
+    folder: Path
+    file0: Path
+    ini_path: Path | None
+    current_room: int | None = None
+    player_name: str | None = None
+
+
+def find_undertale_save_dirs() -> list[Path]:
+    """Locate Undertale save folders on this machine (Windows-first)."""
+    candidates: list[Path] = []
+    local = os.environ.get("LOCALAPPDATA") or os.environ.get("XDG_DATA_HOME")
+    home = Path.home()
+
+    guesses = []
+    if local:
+        guesses.append(Path(local) / "UNDERTALE")
+    guesses.extend(
+        [
+            home / "AppData" / "Local" / "UNDERTALE",
+            home / ".config" / "UNDERTALE",
+            home / "Library" / "Application Support" / "com.tobyfox.undertale",
+        ]
+    )
+    seen: set[Path] = set()
+    for path in guesses:
+        try:
+            resolved = path.resolve()
+        except OSError:
+            continue
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        if path.is_dir() and (path / "file0").is_file():
+            candidates.append(path)
+    return candidates
+
+
+def default_save_dir() -> Path | None:
+    dirs = find_undertale_save_dirs()
+    return dirs[0] if dirs else None
+
+
+def read_save_info(folder: str | Path | None = None) -> SaveInfo:
+    folder_path = Path(folder) if folder else default_save_dir()
+    if folder_path is None:
+        raise FileNotFoundError(
+            "Could not find Undertale saves. Expected something like:\n"
+            r"%LOCALAPPDATA%\UNDERTALE\file0"
+        )
+    file0 = folder_path / "file0"
+    if not file0.is_file():
+        raise FileNotFoundError(f"No file0 save in {folder_path}")
+
+    lines = file0.read_text(encoding="utf-8", errors="replace").splitlines()
+    current = None
+    if len(lines) > ROOM_LINE_INDEX:
+        try:
+            current = int(float(lines[ROOM_LINE_INDEX].strip()))
+        except ValueError:
+            current = None
+    name = lines[0].strip() if lines else None
+    ini = folder_path / "undertale.ini"
+    return SaveInfo(
+        folder=folder_path,
+        file0=file0,
+        ini_path=ini if ini.is_file() else None,
+        current_room=current,
+        player_name=name,
+    )
+
+
+def _format_room_value(existing: str, room_id: int) -> str:
+    """Keep float style if the save already used floats (e.g. 220.000000)."""
+    existing = existing.strip()
+    if "." in existing:
+        return f"{float(room_id):.6f}"
+    return str(int(room_id))
+
+
+def _update_ini_room(ini_path: Path, room_id: int) -> None:
+    text = ini_path.read_text(encoding="utf-8", errors="replace")
+    # Undertale ini often looks like: Room="220"  or Room=220
+    pattern = re.compile(r'(?im)^(\s*Room\s*=\s*)("?)(\d+(?:\.\d+)?)("?)(\s*)$')
+    if pattern.search(text):
+        def repl(match: re.Match[str]) -> str:
+            quote = match.group(2) or match.group(4) or ""
+            # Prefer keeping quotes if either side had them
+            left_q = match.group(2)
+            right_q = match.group(4)
+            if left_q or right_q:
+                return f'{match.group(1)}"{int(room_id)}"'
+            return f"{match.group(1)}{int(room_id)}"
+
+        new_text = pattern.sub(repl, text, count=1)
+    else:
+        # Insert under [General] if possible
+        general = re.search(r"(?im)^\[General\]\s*$", text)
+        if general:
+            insert_at = general.end()
+            new_text = text[:insert_at] + f"\nRoom=\"{int(room_id)}\"" + text[insert_at:]
+        else:
+            new_text = text.rstrip() + f"\n[General]\nRoom=\"{int(room_id)}\"\n"
+    ini_path.write_text(new_text, encoding="utf-8")
+
+
+def teleport_to_room(
+    room_id: int,
+    save_folder: str | Path | None = None,
+    *,
+    also_file9: bool = True,
+    backup: bool = True,
+) -> SaveInfo:
+    """
+    Set the current room in Undertale's save so Continue loads that room.
+
+    Close Undertale before calling this. Then open the game and press Continue.
+    """
+    if room_id < 0:
+        raise ValueError("Room id must be >= 0")
+
+    info = read_save_info(save_folder)
+    lines = info.file0.read_text(encoding="utf-8", errors="replace").splitlines()
+    if len(lines) <= ROOM_LINE_INDEX:
+        raise ValueError(
+            f"Save file looks incomplete ({len(lines)} lines). "
+            "Load Undertale once and save in-game, then try again."
+        )
+
+    if backup:
+        bak = info.file0.with_suffix(info.file0.suffix + ".bak")
+        shutil.copy2(info.file0, bak)
+
+    lines[ROOM_LINE_INDEX] = _format_room_value(lines[ROOM_LINE_INDEX], room_id)
+    # Preserve final newline style
+    payload = "\n".join(lines)
+    if info.file0.read_bytes().endswith(b"\n"):
+        payload += "\n"
+    info.file0.write_text(payload, encoding="utf-8")
+
+    if also_file9:
+        file9 = info.folder / "file9"
+        if file9.is_file():
+            if backup:
+                shutil.copy2(file9, file9.with_suffix(file9.suffix + ".bak"))
+            lines9 = file9.read_text(encoding="utf-8", errors="replace").splitlines()
+            if len(lines9) > ROOM_LINE_INDEX:
+                lines9[ROOM_LINE_INDEX] = _format_room_value(lines9[ROOM_LINE_INDEX], room_id)
+                file9.write_text("\n".join(lines9) + "\n", encoding="utf-8")
+
+    if info.ini_path and info.ini_path.is_file():
+        if backup:
+            shutil.copy2(info.ini_path, info.ini_path.with_suffix(info.ini_path.suffix + ".bak"))
+        _update_ini_room(info.ini_path, room_id)
+
+    return read_save_info(info.folder)
+
+
+def friendly_room_label(name: str, room_id: int) -> str:
+    pretty = name
+    if pretty.lower().startswith("room_"):
+        pretty = pretty[5:]
+    pretty = pretty.replace("_", " ")
+    return f"{room_id:03d}  {pretty}"
+
+# ----- parser -----
 PNG_SIG = b"\x89PNG\r\n\x1a\n"
 OGG_SIG = b"OggS"
 RIFF_SIG = b"RIFF"
@@ -473,6 +632,8 @@ class DataWinParser:
         self._parse_backgrounds()
         self._say("Indexing fonts…")
         self._parse_fonts()
+        self._say("Indexing rooms…")
+        self._parse_rooms()
         return self.result
 
     def _chunk(self, tag: str) -> BinaryReader | None:
@@ -856,6 +1017,67 @@ class DataWinParser:
             except Exception:
                 continue
 
+    def _parse_rooms(self) -> None:
+        """Index ROOM chunk entries (name + id) for in-game teleport."""
+        info = self.result.chunks.get("ROOM")
+        if not info:
+            return
+        start, _ = info
+        r = self.reader
+        r.seek(start)
+        count = r.read_u32()
+        if count < 0 or count > 50_000:
+            return
+        offsets = [r.read_u32() for _ in range(count)]
+
+        for index, off in enumerate(offsets):
+            try:
+                r.seek(off)
+                name = r.read_offset_string() or f"room_{index}"
+                width = r.read_i32()
+                height = r.read_i32()
+            except Exception:
+                name = f"room_{index}"
+                width = 0
+                height = 0
+
+            # Small label card used as a thumbnail in the browser.
+            def make_image(
+                label: str = name,
+                rid: int = index,
+            ) -> Image.Image:
+                img = Image.new("RGBA", (160, 96), (28, 24, 20, 255))
+                try:
+                    from PIL import ImageDraw
+
+                    draw = ImageDraw.Draw(img)
+                    draw.rectangle((4, 4, 156, 92), outline=(196, 92, 38, 255), width=2)
+                    pretty = label[5:] if label.lower().startswith("room_") else label
+                    pretty = pretty.replace("_", " ")
+                    draw.text((10, 14), f"ROOM {rid}", fill=(255, 250, 242, 255))
+                    draw.text((10, 40), pretty[:22], fill=(232, 226, 214, 255))
+                    draw.text((10, 68), "click to enter", fill=(196, 92, 38, 255))
+                except Exception:
+                    pass
+                return img
+
+            self.result.assets.append(
+                GameAsset(
+                    id=f"room:{index}",
+                    name=name,
+                    kind=AssetKind.ROOM,
+                    extension="",
+                    size=max(0, width) * max(0, height),
+                    _image_fn=make_image,
+                    meta={
+                        "room_id": index,
+                        "width": width,
+                        "height": height,
+                        "teleport": True,
+                    },
+                )
+            )
+
 
 def load_undertale_assets(
     path: str | Path,
@@ -886,9 +1108,7 @@ def load_undertale_assets(
         progress(f"Loaded {len(result.assets)} files — building browser…")
     return result
 
-
-# ----- windowed app -----
-
+# ----- gui -----
 # Visual direction: ink-and-ember utility (not purple / cream-serif defaults)
 ctk.set_appearance_mode("light")
 ctk.set_default_color_theme("dark-blue")
@@ -907,6 +1127,7 @@ COLORS = {
 }
 
 KIND_ORDER = [
+    AssetKind.ROOM,
     AssetKind.SPRITE,
     AssetKind.TEXTURE,
     AssetKind.BACKGROUND,
@@ -940,9 +1161,10 @@ class UndertaleExtractorApp(ctk.CTk):
         self.assets: list[GameAsset] = []
         self.filtered: list[GameAsset] = []
         self.selected: GameAsset | None = None
-        self.current_kind: AssetKind | None = AssetKind.SPRITE
+        self.current_kind: AssetKind | None = AssetKind.ROOM
         self.page = 0
         self.download_dir = _default_download_dir()
+        self.save_dir = default_save_dir()
         self._thumb_cache: dict[str, ctk.CTkImage] = {}
         self._preview_image: ctk.CTkImage | None = None
         self._loading = False
@@ -1014,6 +1236,17 @@ class UndertaleExtractorApp(ctk.CTk):
             width=130,
         )
         self.dl_dir_btn.pack(side="left", padx=4)
+
+        self.save_dir_btn = ctk.CTkButton(
+            actions,
+            text="Save Folder…",
+            command=self.choose_save_dir,
+            fg_color=COLORS["border"],
+            hover_color="#c4baa8",
+            text_color=COLORS["ink"],
+            width=110,
+        )
+        self.save_dir_btn.pack(side="left", padx=4)
 
         # Sidebar categories
         sidebar = ctk.CTkFrame(self, fg_color=COLORS["panel"], corner_radius=0, width=200)
@@ -1173,6 +1406,19 @@ class UndertaleExtractorApp(ctk.CTk):
         )
         self.download_btn.pack(fill="x", padx=16, pady=4)
 
+        self.teleport_btn = ctk.CTkButton(
+            preview,
+            text="Enter Room In-Game",
+            command=self.teleport_selected,
+            fg_color=COLORS["success"],
+            hover_color="#24553f",
+            text_color="#fffaf2",
+            state="disabled",
+            height=40,
+            font=ctk.CTkFont(size=14, weight="bold"),
+        )
+        self.teleport_btn.pack(fill="x", padx=16, pady=4)
+
         self.save_as_btn = ctk.CTkButton(
             preview,
             text="Save As…",
@@ -1185,9 +1431,22 @@ class UndertaleExtractorApp(ctk.CTk):
         )
         self.save_as_btn.pack(fill="x", padx=16, pady=4)
 
+        save_hint = "No Undertale save found yet"
+        if self.save_dir:
+            save_hint = f"Game save:\n{self.save_dir}"
+        self.save_path_label = ctk.CTkLabel(
+            preview,
+            text=save_hint,
+            font=ctk.CTkFont(size=11),
+            text_color=COLORS["muted"],
+            wraplength=240,
+            justify="left",
+        )
+        self.save_path_label.pack(anchor="w", padx=16, pady=(8, 0))
+
         self.dl_path_label = ctk.CTkLabel(
             preview,
-            text=f"Saves to:\n{self.download_dir}",
+            text=f"Downloads to:\n{self.download_dir}",
             font=ctk.CTkFont(size=11),
             text_color=COLORS["muted"],
             wraplength=240,
@@ -1195,7 +1454,7 @@ class UndertaleExtractorApp(ctk.CTk):
         )
         self.dl_path_label.pack(anchor="w", padx=16, pady=16)
 
-        self._highlight_kind(AssetKind.SPRITE)
+        self._highlight_kind(AssetKind.ROOM)
         self._show_empty_state()
 
     def _make_kind_button(self, parent, label: str, kind: AssetKind | None) -> ctk.CTkButton:
@@ -1225,8 +1484,9 @@ class UndertaleExtractorApp(ctk.CTk):
             text=(
                 "1. Click “Open Undertale Folder”\n"
                 "2. Choose the folder that contains data.win\n"
-                "3. Scroll the extracted files\n"
-                "4. Click any image or file to download it"
+                "3. Open the Rooms category\n"
+                "4. Click a room to enter it in-game (edits your save)\n"
+                "5. Or browse sprites/audio and click to download"
             ),
             font=ctk.CTkFont(family="Georgia", size=16),
             text_color=COLORS["muted"],
@@ -1304,11 +1564,11 @@ class UndertaleExtractorApp(ctk.CTk):
             self.export_all_btn.configure(state="normal")
             self.page = 0
             self._update_counts()
-            # Default to Sprites (paginated) instead of dumping every file into the UI.
-            self.set_kind(AssetKind.SPRITE)
+            # Default to Rooms so teleporting is one click away.
+            self.set_kind(AssetKind.ROOM)
             self._set_status(
                 f"Loaded {len(self.assets)} files from {result.path.name} "
-                f"(showing {PAGE_SIZE} per page)"
+                f"(showing {PAGE_SIZE} per page). Click a room to enter it in-game."
             )
         except Exception as exc:
             self._on_load_error(exc)
@@ -1459,9 +1719,14 @@ class UndertaleExtractorApp(ctk.CTk):
         )
         thumb_label.pack(pady=(10, 4))
 
+        display = (
+            friendly_room_label(asset.name, int(asset.meta.get("room_id", 0)))
+            if asset.is_room
+            else asset.display_name
+        )
         name_label = ctk.CTkLabel(
             frame,
-            text=asset.display_name[:28] + ("…" if len(asset.display_name) > 28 else ""),
+            text=display[:28] + ("…" if len(display) > 28 else ""),
             font=ctk.CTkFont(size=12, weight="bold"),
             text_color=COLORS["ink"],
         )
@@ -1469,7 +1734,11 @@ class UndertaleExtractorApp(ctk.CTk):
 
         meta = ctk.CTkLabel(
             frame,
-            text=f"{asset.kind.value} · {_fmt_size(asset.size)}",
+            text=(
+                f"Room ID {asset.meta.get('room_id')} · click to enter"
+                if asset.is_room
+                else f"{asset.kind.value} · {_fmt_size(asset.size)}"
+            ),
             font=ctk.CTkFont(size=11),
             text_color=COLORS["muted"],
         )
@@ -1477,7 +1746,10 @@ class UndertaleExtractorApp(ctk.CTk):
 
         def on_click(_event=None, a: GameAsset = asset) -> None:
             self.select_asset(a)
-            self.download_selected()
+            if a.is_room:
+                self.teleport_selected()
+            else:
+                self.download_selected()
 
         def on_select(_event=None, a: GameAsset = asset) -> None:
             self.select_asset(a)
@@ -1494,6 +1766,7 @@ class UndertaleExtractorApp(ctk.CTk):
                 AssetKind.AUDIO: "♪ AUDIO",
                 AssetKind.MUSIC: "♫ MUSIC",
                 AssetKind.FONT: "Aa FONT",
+                AssetKind.ROOM: "DOOR",
                 AssetKind.OTHER: "FILE",
             }.get(asset.kind, asset.extension.upper() or "FILE")
             thumb_label.configure(text=badge)
@@ -1519,12 +1792,28 @@ class UndertaleExtractorApp(ctk.CTk):
 
     def select_asset(self, asset: GameAsset) -> None:
         self.selected = asset
-        self.preview_name.configure(text=asset.display_name)
-        self.preview_meta.configure(
-            text=f"{asset.kind.value}\n{_fmt_size(asset.size)}\nClick Download to save"
-        )
-        self.download_btn.configure(state="normal")
-        self.save_as_btn.configure(state="normal")
+        if asset.is_room:
+            room_id = int(asset.meta.get("room_id", -1))
+            self.preview_name.configure(text=friendly_room_label(asset.name, room_id))
+            self.preview_meta.configure(
+                text=(
+                    f"Room ID {room_id}\n"
+                    f"Size {asset.meta.get('width', '?')}×{asset.meta.get('height', '?')}\n"
+                    "Click to enter in-game\n"
+                    "(close Undertale first, then Continue)"
+                )
+            )
+            self.download_btn.configure(state="disabled")
+            self.save_as_btn.configure(state="disabled")
+            self.teleport_btn.configure(state="normal")
+        else:
+            self.preview_name.configure(text=asset.display_name)
+            self.preview_meta.configure(
+                text=f"{asset.kind.value}\n{_fmt_size(asset.size)}\nClick Download to save"
+            )
+            self.download_btn.configure(state="normal")
+            self.save_as_btn.configure(state="normal")
+            self.teleport_btn.configure(state="disabled")
 
         try:
             if asset.is_image:
@@ -1549,8 +1838,65 @@ class UndertaleExtractorApp(ctk.CTk):
         except Exception as exc:
             self.preview_canvas.configure(image=None, text=f"Preview failed\n{exc}")
 
+    def teleport_selected(self) -> None:
+        if not self.selected or not self.selected.is_room:
+            return
+        room_id = int(self.selected.meta.get("room_id", -1))
+        if room_id < 0:
+            messagebox.showerror("Teleport failed", "This room has no valid id.")
+            return
+
+        if self.save_dir is None:
+            picked = filedialog.askdirectory(
+                title="Select Undertale save folder (contains file0)"
+            )
+            if not picked:
+                return
+            self.save_dir = Path(picked)
+            self.save_path_label.configure(text=f"Game save:\n{self.save_dir}")
+
+        label = friendly_room_label(self.selected.name, room_id)
+        ok = messagebox.askokcancel(
+            "Enter room in Undertale?",
+            (
+                f"Teleport to:\n{label}\n\n"
+                "This edits your Undertale save (file0).\n"
+                "A backup (.bak) is created.\n\n"
+                "1. Close Undertale completely\n"
+                "2. Click OK here\n"
+                "3. Open Undertale → Continue\n\n"
+                "Some rooms show the Annoying Dog (dogcheck)."
+            ),
+        )
+        if not ok:
+            return
+        try:
+            info = teleport_to_room(room_id, self.save_dir)
+            self._set_status(
+                f"Save updated → room {room_id} ({self.selected.name}). "
+                "Open Undertale and press Continue."
+            )
+            self.preview_meta.configure(
+                text=(
+                    f"Ready to enter room {room_id}\n"
+                    f"Save: {info.folder}\n"
+                    f"Player: {info.player_name or '?'}\n"
+                    "Open Undertale → Continue"
+                )
+            )
+            messagebox.showinfo(
+                "Room set",
+                f"Your save now points to room {room_id}.\n\n"
+                "Open Undertale and press Continue to enter it.",
+            )
+        except Exception as exc:
+            messagebox.showerror("Teleport failed", str(exc))
+
     def download_selected(self) -> None:
         if not self.selected:
+            return
+        if self.selected.is_room:
+            self.teleport_selected()
             return
         try:
             path = self.selected.export_to(self.download_dir, overwrite=False)
@@ -1610,7 +1956,37 @@ class UndertaleExtractorApp(ctk.CTk):
         )
         if path:
             self.download_dir = Path(path)
-            self.dl_path_label.configure(text=f"Saves to:\n{self.download_dir}")
+            self.dl_path_label.configure(text=f"Downloads to:\n{self.download_dir}")
+
+    def choose_save_dir(self) -> None:
+        initial = str(self.save_dir) if self.save_dir else str(Path.home())
+        path = filedialog.askdirectory(
+            title="Select Undertale save folder (contains file0)",
+            initialdir=initial,
+        )
+        if not path:
+            # Offer known saves if any
+            known = find_undertale_save_dirs()
+            if known:
+                self.save_dir = known[0]
+                self.save_path_label.configure(text=f"Game save:\n{self.save_dir}")
+                self._set_status(f"Using save folder {self.save_dir}")
+            return
+        folder = Path(path)
+        if not (folder / "file0").is_file():
+            messagebox.showwarning(
+                "No file0 here",
+                "That folder has no file0.\n"
+                r"Typical path: %LOCALAPPDATA%\UNDERTALE",
+            )
+        self.save_dir = folder
+        self.save_path_label.configure(text=f"Game save:\n{self.save_dir}")
+        try:
+            info = read_save_info(folder)
+            extra = f" (currently room {info.current_room})" if info.current_room is not None else ""
+            self._set_status(f"Save folder set{extra}")
+        except Exception:
+            self._set_status("Save folder set")
 
 
 def _fmt_size(n: int) -> str:
@@ -1628,37 +2004,24 @@ def run_app() -> None:
 
 
 
-# ----- entry point -----
-
-
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(
-        description="Undertale File Extractor — browse and download game assets (Windows)"
-    )
-    parser.add_argument(
-        "path",
-        nargs="?",
-        help="Optional Undertale folder or data.win to open immediately",
-    )
-    parser.add_argument(
-        "--extract-all",
-        metavar="OUT_DIR",
-        help="Extract all assets to OUT_DIR without opening the window",
-    )
-    parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
-    args = parser.parse_args(argv)
+    argp = argparse.ArgumentParser(description="Undertale File Extractor")
+    argp.add_argument("path", nargs="?", help="Undertale folder or data.win")
+    argp.add_argument("--extract-all", metavar="OUT_DIR")
+    argp.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
+    args = argp.parse_args(argv)
 
     if args.extract_all:
         if not args.path:
-            print("error: path to Undertale / data.win is required with --extract-all", file=sys.stderr)
+            print("error: path required with --extract-all", file=sys.stderr)
             return 2
         result = load_undertale_assets(args.path)
         out = Path(args.extract_all)
         for asset in result.assets:
-            dest = out / asset.kind.value.lower()
-            path = asset.export_to(dest, overwrite=False)
+            if asset.is_room:
+                continue
+            path = asset.export_to(out / asset.kind.value.lower(), overwrite=False)
             print(path)
-        print(f"Extracted {len(result.assets)} files to {out}")
         return 0
 
     app = UndertaleExtractorApp()
