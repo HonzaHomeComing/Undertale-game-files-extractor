@@ -45,6 +45,15 @@ def test_undertale_is_running_safe():
     assert lt.undertale_is_running() in (True, False)
 
 
+def test_title_looks_like_game_excludes_extractor():
+    assert lt._title_looks_like_game("UNDERTALE") is True
+    assert lt._title_looks_like_game("Undertale") is True
+    assert lt._title_looks_like_game("Undertale File Extractor — UNDERTALE") is False
+    assert lt._title_looks_like_game("UNDERTALE Game File Extractor") is False
+    assert lt._title_looks_like_game("Undertale Data Wiper") is False
+    assert lt._title_looks_like_game("") is False
+
+
 def test_live_teleport_not_running_message(tmp_path: Path):
     # Minimal save so save-update path isn't the failure mode
     save = tmp_path / "UNDERTALE"
