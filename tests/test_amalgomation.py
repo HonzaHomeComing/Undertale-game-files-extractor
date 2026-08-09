@@ -13,6 +13,13 @@ def test_amalgomation_id():
     assert am.is_amalgomation_id(47) is False
     assert am.AMALGOMATION_ID == 666
     assert am.HOST_BATTLEGROUP == 86
+    assert am.OVERWORLD_SKIP_ROOM == 6
+
+
+def test_autofight_helpers_exist():
+    assert hasattr(am, "run_amalgomation_autofight")
+    assert hasattr(am, "open_amalgomation_ui")
+    assert hasattr(am, "prepare_amalgomation_plan")
 
 
 def test_open_amalgomation_ui_has_no_window_dependency():
@@ -20,12 +27,10 @@ def test_open_amalgomation_ui_has_no_window_dependency():
     assert hasattr(am, "start_amalgomation_fight")
     assert hasattr(am, "AmalgomationDirector")
     assert hasattr(am, "install_amalgomation_into_data_win")
-    # Chaos director should work headlessly
     plan = am.AmalgomationPlan()
     plan.resources.sprite_ids = [1, 2, 3, 4, 5]
     plan.resources.gen_object_ids = [10, 11, 12, 13]
     plan.resources.objects = {"obj_froggitgen": 10, "obj_sansbone": 11}
-    # Fake sprite patch sites (won't write without Windows/process)
     plan.sprite_sites = [
         am.PatchSite(0, pushi_word(100), "sprite"),
         am.PatchSite(4, pushi_word(101), "sprite"),
@@ -69,12 +74,22 @@ def test_restore_backup_helper(tmp_path):
     assert restored is True
     assert data.read_bytes() == b"CLEAN"
     assert "Restored" in msg
-    # Second call: already clean
     restored2, msg2 = am.restore_amalgomation_backup_if_any(data)
     assert restored2 is False
     assert msg2 == ""
 
 
+def test_prepare_continues_after_restore_when_requested(tmp_path):
+    data = tmp_path / "data.win"
+    bak = tmp_path / "data.win.amalgobak"
+    # Minimal FORM so prepare does not crash
+    data.write_bytes(b"DIRTYXXXX")
+    bak.write_bytes(b"FORM" + struct.pack("<I", 0))
+    ok, msg, plan = am.prepare_amalgomation_plan(data, abort_after_restore=False)
+    assert data.read_bytes().startswith(b"FORM")
+    assert "Restored" in msg or "Amalgomation ready" in msg
+    assert isinstance(plan, am.AmalgomationPlan)
+
+
 def test_prepare_plan_smoke():
-    empty = am.prepare_amalgomation_plan
-    assert callable(empty)
+    assert callable(am.prepare_amalgomation_plan)

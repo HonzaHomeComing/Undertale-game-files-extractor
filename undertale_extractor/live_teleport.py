@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ctypes
 import os
+import subprocess
 import sys
 import time
 from ctypes import wintypes
@@ -173,6 +174,62 @@ def _pid_by_name(names: tuple[str, ...]) -> int | None:
 
 def undertale_is_running() -> bool:
     return find_undertale_pid() is not None
+
+
+def kill_undertale(*, timeout: float = 10.0) -> tuple[bool, str]:
+    """
+    Force-close every Undertale game process. Returns (was_running_or_now_dead, detail).
+    """
+    if not is_windows():
+        return False, "kill_undertale requires Windows"
+    pid = find_undertale_pid()
+    if not pid:
+        return True, "Undertale was not running"
+    k32 = ctypes.windll.kernel32
+    PROCESS_TERMINATE = 0x0001
+    SYNCHRONIZE = 0x00100000
+    handle = k32.OpenProcess(PROCESS_TERMINATE | SYNCHRONIZE, False, pid)
+    if handle:
+        try:
+            k32.TerminateProcess(handle, 1)
+        finally:
+            k32.CloseHandle(handle)
+    # Fallback: taskkill (covers stubborn / multi-instance cases)
+    try:
+        subprocess.run(
+            ["taskkill", "/F", "/IM", "UNDERTALE.exe", "/T"],
+            capture_output=True,
+            text=True,
+            timeout=8,
+            check=False,
+        )
+        subprocess.run(
+            ["taskkill", "/F", "/IM", "undertale.exe", "/T"],
+            capture_output=True,
+            text=True,
+            timeout=8,
+            check=False,
+        )
+    except Exception:
+        pass
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if find_undertale_pid() is None:
+            return True, f"Closed Undertale (pid {pid})"
+        time.sleep(0.2)
+    return find_undertale_pid() is None, (
+        "Tried to close Undertale; if it is still open, end it in Task Manager."
+    )
+
+
+def wait_for_undertale_window(*, timeout: float = 60.0) -> bool:
+    """Poll until the real UNDERTALE game window exists."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if find_undertale_hwnd():
+            return True
+        time.sleep(0.25)
+    return False
 
 
 def enable_debug_mode(data_win: str | Path, *, backup: bool = True) -> bool:
