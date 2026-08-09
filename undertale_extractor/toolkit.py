@@ -364,8 +364,8 @@ class DebugToolkit(ctk.CTkToplevel):
     def _build_fights_tab(self, tab) -> None:
         ctk.CTkLabel(
             tab,
-            text="Requires debug mode. Patches the Home battlegroup on disk and in live "
-            "memory (fixes always-Mettaton), then sends Home.",
+            text="Requires debug mode. Discovers the Home battlegroup in data.win "
+            "(and live bytecode), patches it, then sends Home — not stuck on Mettaton.",
             text_color=COLORS["muted"],
             wraplength=600,
         ).pack(anchor="w", padx=8, pady=6)

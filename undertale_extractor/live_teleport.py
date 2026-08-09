@@ -24,7 +24,15 @@ DEBUG_OFFSETS = (
 
 VK_L = 0x4C
 VK_S = 0x53
+VK_ESCAPE = 0x1B
+VK_INSERT = 0x2D
+VK_X = 0x58
+VK_C = 0x43
+VK_Z = 0x5A
 KEYEVENTF_KEYUP = 0x0002
+WM_KEYDOWN = 0x0100
+WM_KEYUP = 0x0101
+WM_CHAR = 0x0102
 
 
 @dataclass
@@ -201,18 +209,47 @@ def debug_flag_enabled(data_win: str | Path) -> bool:
 
 
 def _send_key_to_undertale(vk_code: int, *, presses: int = 1) -> bool:
+    """Focus Undertale and send a virtual-key via keybd_event + PostMessage."""
     hwnd = find_undertale_hwnd()
     user32 = ctypes.windll.user32
     if not hwnd:
         return False
     user32.SetForegroundWindow(hwnd)
-    time.sleep(0.08)
+    time.sleep(0.05)
     for _ in range(presses):
+        # PostMessage reaches the game even when some overlays steal focus mid-frame.
+        user32.PostMessageW(hwnd, WM_KEYDOWN, vk_code, 0)
         user32.keybd_event(vk_code, 0, 0, 0)
-        time.sleep(0.04)
+        time.sleep(0.035)
         user32.keybd_event(vk_code, 0, KEYEVENTF_KEYUP, 0)
-        time.sleep(0.06)
+        user32.PostMessageW(hwnd, WM_KEYUP, vk_code, 0)
+        time.sleep(0.05)
     return True
+
+
+def _clear_ini_battle_traps(save_folder: str | Path | None) -> None:
+    """Clear undertale.ini flags that trap you in Flowey/special battles."""
+    from .teleport import read_save_info
+    import re
+
+    try:
+        info = read_save_info(save_folder)
+    except Exception:
+        return
+    if not info.ini_path or not info.ini_path.is_file():
+        return
+    text = info.ini_path.read_text(encoding="utf-8", errors="replace")
+    original = text
+    # [FFFFF] F="1" means trapped in Flowey battle — force clear.
+    text = re.sub(r'(?im)^(\s*F\s*=\s*"?)1("?\s*)$', r"\g<1>0\2", text)
+    if text != original:
+        info.ini_path.write_text(text, encoding="utf-8")
+
+
+def _skip_cutscene_keys() -> None:
+    """Mash skip/cancel so dialogue and menus release input."""
+    for vk in (VK_ESCAPE, VK_X, VK_C, VK_Z):
+        _send_key_to_undertale(vk, presses=2)
 
 
 def live_teleport_to_room(
@@ -223,14 +260,19 @@ def live_teleport_to_room(
     current_room: int | None = None,  # kept for API compatibility; unused
     cached_addresses: list | None = None,  # kept for API compatibility; unused
     max_room_id: int = 400,
+    force: bool = True,
 ) -> tuple[LiveTeleportResult, list]:
     """
     Teleport to an exact room while Undertale is running.
 
     Method (reliable with debug mode):
       1. Write the target room into file0 / undertale.ini
-      2. Focus Undertale and press L (debug Load)
-      → game reloads the save in that room immediately
+      2. Clear ini battle-trap flags
+      3. Skip dialogue (Esc/X), leave battle room via Insert if needed
+      4. Focus Undertale and press L (debug Load) several times
+
+    During battles, L normally loads a battle save-state — force mode first
+    tries Insert (debug next-room) to leave room_battle, then L loads file0.
     """
     _ = (current_room, cached_addresses, max_room_id)
 
@@ -266,8 +308,6 @@ def live_teleport_to_room(
                 [],
             )
         debug_on = debug_flag_enabled(data_win)
-        # Only debug mode is required for live Load (L).
-        # Dogcheck disable is optional but recommended for secret rooms.
         if not debug_on:
             return (
                 LiveTeleportResult(
@@ -287,6 +327,8 @@ def live_teleport_to_room(
 
     try:
         teleport_to_room(room_id, save_folder, backup=True)
+        if force:
+            _clear_ini_battle_traps(save_folder)
     except Exception as exc:
         return (
             LiveTeleportResult(False, "save_failed", f"Could not update save: {exc}"),
@@ -294,7 +336,14 @@ def live_teleport_to_room(
         )
 
     # Give the OS a moment to finish writing the save before the game reads it.
-    time.sleep(0.12)
+    time.sleep(0.15)
+
+    if force:
+        _skip_cutscene_keys()
+        time.sleep(0.08)
+        # Insert = debug "next room" — escapes room_battle so L is not battle-load.
+        _send_key_to_undertale(VK_INSERT, presses=1)
+        time.sleep(0.12)
 
     if not _send_key_to_undertale(VK_L, presses=1):
         return (
@@ -308,13 +357,19 @@ def live_teleport_to_room(
             [],
         )
 
+    if force:
+        # Second load after leaving battle / skipping dialogue
+        time.sleep(0.2)
+        _send_key_to_undertale(VK_L, presses=2)
+        time.sleep(0.1)
+
     return (
         LiveTeleportResult(
             True,
             "live_load",
-            f"Loaded room {room_id} live (save updated + debug Load). "
-            "If nothing changed, click Undertale once and press L, "
-            "or restart Undertale once so debug mode is active.",
+            f"Forced load → room {room_id} (save updated, skip keys, Insert+L). "
+            "Works in cutscenes/battles when debug is on. "
+            "If still stuck, click Undertale and press L once more.",
             debug_enabled=debug_on,
         ),
         [],

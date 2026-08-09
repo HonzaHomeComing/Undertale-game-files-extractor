@@ -68,12 +68,16 @@ def test_live_teleport_not_running_message(tmp_path: Path):
     assert result.method in {"not_running", "unsupported"}
 
 
-def test_live_teleport_patches_gate(tmp_path: Path):
-    if not lt.is_windows():
-        return
-    data = bytearray(0x780000)
-    path = tmp_path / "data.win"
-    path.write_bytes(data)
-    # Without a running game this returns not_running before patch check
-    result, _ = lt.live_teleport_to_room(5, data_win=path)
-    assert result.method in {"not_running", "unsupported", "patches_required", "restart_required"}
+def test_clear_ini_battle_traps(tmp_path: Path):
+    save = tmp_path / "UNDERTALE"
+    save.mkdir()
+    lines = ["CHARA"] + ["0"] * 548
+    lines[ROOM_LINE_INDEX] = "10"
+    (save / "file0").write_text("\n".join(lines) + "\n", encoding="utf-8")
+    (save / "undertale.ini").write_text(
+        "[General]\nName=\"CHARA\"\nRoom=\"10\"\n[FFFFF]\nF=\"1\"\nP=\"2\"\n",
+        encoding="utf-8",
+    )
+    lt._clear_ini_battle_traps(save)
+    text = (save / "undertale.ini").read_text(encoding="utf-8")
+    assert 'F="0"' in text or "F=0" in text

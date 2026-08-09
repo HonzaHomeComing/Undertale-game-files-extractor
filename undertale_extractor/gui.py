@@ -560,7 +560,7 @@ class UndertaleExtractorApp(ctk.CTk):
             # Default to Rooms so teleporting is one click away.
             self.set_kind(AssetKind.ROOM)
             running = (
-                "Undertale is open — click a room to jump live."
+                "Undertale is open — click a room to force-load (works in cutscenes/battles)."
                 if undertale_is_running()
                 else "Start Undertale anytime — browsing does not lock or patch data.win."
             )
