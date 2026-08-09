@@ -85,6 +85,70 @@ def test_set_home_battlegroup(tmp_path: Path):
     assert path.with_suffix(".win.battlebak").exists()
 
 
+def test_set_home_battlegroup_preserves_pushi_opcode(tmp_path: Path):
+    offset = battles.HOME_BATTLEGROUP_OFFSETS[0]
+    data = bytearray(offset + 16)
+    data[0:4] = b"FORM"
+    # PushI 80 (Mettaton) — must keep opcode when rewriting
+    pushi_80 = (0x84 << 24) | 80
+    struct.pack_into("<I", data, offset, pushi_80)
+    path = tmp_path / "data.win"
+    path.write_bytes(data)
+    ok, msg = battles.set_home_battlegroup(path, 4, backup=True)
+    assert ok is True, msg
+    word = struct.unpack_from("<I", path.read_bytes(), offset)[0]
+    assert (word >> 24) == 0x84
+    assert (word & 0xFFFF) == 4
+
+
+def test_discover_home_near_vk_home(tmp_path: Path):
+    """PushI vk_home then PushI 80 in an obj_time-like CODE entry is discovered."""
+    OP_PUSHI = 0x84
+    OP_CALL = 0xD9
+    bytecode = b""
+    bytecode += struct.pack("<I", (OP_PUSHI << 24) | 0x24)  # vk_home
+    bytecode += struct.pack("<I", (OP_CALL << 24)) + struct.pack("<I", 0)
+    bytecode += struct.pack("<I", (OP_PUSHI << 24) | 80)  # battlegroup
+    bytecode += struct.pack("<I", (OP_CALL << 24)) + struct.pack("<I", 0)
+
+    name = b"gml_Object_obj_time_Step_1"
+    code = bytearray()
+    code += struct.pack("<I", 1)
+    entry_ptr_pos = len(code)
+    code += struct.pack("<I", 0)
+    entry_body_pos = len(code)
+    name_ptr_pos = len(code)
+    code += struct.pack("<I", 0)
+    code += struct.pack("<I", len(bytecode))
+    code += bytecode
+    str_blob = struct.pack("<I", len(name)) + name + b"\x00"
+
+    buf = bytearray(b"FORM" + struct.pack("<I", 0))
+    buf += b"CODE" + struct.pack("<I", len(code))
+    code_at = len(buf)
+    buf += code
+    str_at = len(buf)
+    buf += str_blob
+    buf[4:8] = struct.pack("<I", len(buf) - 8)
+    entry_abs = code_at + entry_body_pos
+    buf[code_at + entry_ptr_pos : code_at + entry_ptr_pos + 4] = struct.pack("<I", entry_abs)
+    buf[code_at + name_ptr_pos : code_at + name_ptr_pos + 4] = struct.pack("<I", str_at + 4)
+
+    sites = battles.discover_home_battlegroup_sites(bytes(buf))
+    assert any(s.kind == "pushi" and s.value == 80 for s in sites)
+    path = tmp_path / "data.win"
+    path.write_bytes(buf)
+    ok, msg = battles.set_home_battlegroup(path, 4, backup=False)
+    assert ok is True, msg
+    data = path.read_bytes()
+    # The battlegroup PushI (second PushI in bytecode) should now be 4
+    bc = entry_abs + 8
+    # layout: pushi home (4), call (8), pushi bg (4) → bg at bc+12
+    word = struct.unpack_from("<I", data, bc + 12)[0]
+    assert (word >> 24) == OP_PUSHI
+    assert (word & 0xFFFF) == 4
+
+
 def test_dogcheck_stub_does_not_wipe_trailing_bytes(tmp_path: Path):
     """Safer stub only overwrites push+pop+exit, not the whole CODE length."""
     pushi = struct.pack("<I", (OP_PUSHI_V15 << 24) | 1)
