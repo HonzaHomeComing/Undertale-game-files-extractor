@@ -12,6 +12,7 @@ from .chaos import (
     live_ruins_reset,
     rare_mode_enabled,
     randomize_room_gotos,
+    restore_room_chaos,
     set_rare_encounters,
 )
 from .dogcheck import disable_dogcheck, dogcheck_likely_disabled
@@ -473,10 +474,19 @@ class DebugToolkit(ctk.CTkToplevel):
             hover_color="#33302b",
             width=220,
         ).pack(anchor="w", padx=8, pady=8)
+        ctk.CTkButton(
+            tab,
+            text="Undo room chaos",
+            command=self.do_undo_room_chaos,
+            fg_color=COLORS["muted"],
+            hover_color="#4a453c",
+            width=220,
+        ).pack(anchor="w", padx=8, pady=(0, 8))
         ctk.CTkLabel(
             tab,
-            text="Shuffles door destinations among playable rooms (skips text/intro/credit/"
-            "battle/shop rooms). Backs up data.win.roomchaosbak — restart Undertale after.",
+            text="Shuffles door/warp destinations only (safe allowlist — will not touch "
+            "file I/O scripts). Backs up data.win.roomchaosbak. Restart Undertale after. "
+            "If the game shows a Code Error on boot, click Undo room chaos or Restore data.win.",
             text_color=COLORS["muted"],
             wraplength=600,
             justify="left",
@@ -532,7 +542,7 @@ class DebugToolkit(ctk.CTkToplevel):
                 return
         elif not messagebox.askyesno(
             "Randomize rooms",
-            "Rewrite room transitions in data.win (backup created). Continue?",
+            "Rewrite door/warp room transitions in data.win (backup created). Continue?",
             parent=self,
         ):
             return
@@ -542,6 +552,24 @@ class DebugToolkit(ctk.CTkToplevel):
             messagebox.showinfo("Room chaos", msg, parent=self)
         else:
             messagebox.showerror("Room chaos", msg, parent=self)
+
+    def do_undo_room_chaos(self) -> None:
+        if not self.data_win or not self.data_win.is_file():
+            messagebox.showinfo("No game", "Open your Undertale folder first.", parent=self)
+            return
+        if undertale_is_running():
+            messagebox.showwarning(
+                "Close Undertale first",
+                "Close Undertale completely, then Undo room chaos.",
+                parent=self,
+            )
+            return
+        ok, msg = restore_room_chaos(self.data_win)
+        self._say(msg)
+        if ok:
+            messagebox.showinfo("Restored", msg, parent=self)
+        else:
+            messagebox.showerror("Restore failed", msg, parent=self)
 
     def do_toggle_rare(self) -> None:
         enabled = bool(self.var_rare.get())

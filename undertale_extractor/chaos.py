@@ -178,6 +178,86 @@ def _opcode(word: int) -> int:
     return (word >> 24) & 0xFF
 
 
+# Only rewrite room ids inside door/warp-style scripts. Blindly patching every
+# PushI-before-Call bricks file I/O (ossafe_file_text_eof) and boot.
+_ROOM_GOTO_ALLOW = (
+    "door",
+    "doorway",
+    "warp",
+    "portal",
+    "stair",
+    "elevat",
+    "gateway",
+    "ladder",
+    "hole",
+    "bridge",
+    "dock",
+    "transit",
+    "teleport",
+    "roomgoto",
+    "room_goto",
+)
+_ROOM_GOTO_DENY = (
+    "ossafe",
+    "file_text",
+    "file_bin",
+    "file_open",
+    "ini_",
+    "obj_time",
+    "scr_load",
+    "scr_save",
+    "scr_dogcheck",
+    "gamepad",
+    "draw_",
+    "battle",
+    "bullet",
+    "attack",
+    "writer",
+    "dialog",
+    "shop",
+)
+
+
+def _is_room_transition_script(name: str) -> bool:
+    low = (name or "").lower()
+    if any(bad in low for bad in _ROOM_GOTO_DENY):
+        return False
+    return any(ok in low for ok in _ROOM_GOTO_ALLOW)
+
+
+_RARE_SCRIPT_ALLOW = (
+    "encounter",
+    "battlegroup",
+    "scr_steps",
+    "population",
+    "monster",
+    "rare",
+    "glyde",
+    "sorry",
+)
+_RARE_SCRIPT_DENY = _ROOM_GOTO_DENY
+
+
+def _is_rare_encounter_script(name: str) -> bool:
+    low = (name or "").lower()
+    if any(bad in low for bad in _RARE_SCRIPT_DENY):
+        return False
+    return any(ok in low for ok in _RARE_SCRIPT_ALLOW)
+
+
+def restore_room_chaos(data_win: str | Path) -> tuple[bool, str]:
+    """Restore data.win from data.win.roomchaosbak if present."""
+    path = Path(data_win)
+    bak = path.with_suffix(path.suffix + ".roomchaosbak")
+    if not bak.is_file():
+        return False, f"No {bak.name} next to data.win. Use Restore data.win on the main window."
+    try:
+        path.write_bytes(bak.read_bytes())
+    except OSError as exc:
+        return False, f"Could not restore: {exc}"
+    return True, f"Restored {path.name} from {bak.name}. Start Undertale again."
+
+
 def randomize_room_gotos(
     data_win: str | Path,
     *,
@@ -186,7 +266,8 @@ def randomize_room_gotos(
 ) -> tuple[bool, str, dict[int, int]]:
     """
     Shuffle room_goto destinations among playable (non-text) rooms by rewriting
-    PushI immediates that look like room ids and sit just before a Call.
+    PushI immediates that look like room ids and sit just before a Call —
+    only inside door/warp-named scripts (safe allowlist).
     """
     path = Path(data_win)
     playable = playable_room_ids(path)
@@ -207,23 +288,31 @@ def randomize_room_gotos(
             a, b = fixed[i], fixed[i + 1]
             mapping[a], mapping[b] = mapping[b], mapping[a]
 
+    # Backup BEFORE mutating — never overwrite an existing first backup.
+    if backup:
+        bak = path.with_suffix(path.suffix + ".roomchaosbak")
+        if not bak.exists():
+            bak.write_bytes(path.read_bytes())
+
     raw = bytearray(path.read_bytes())
     reader = BinaryReader(bytes(raw))
-    # Walk CODE entries' bytecode and rewrite pushi room ids before calls
     changed = 0
-    for _name, bc_off, length in _find_code_entries(reader):
+    scripts_touched = 0
+    for name, bc_off, length in _find_code_entries(reader):
+        if not _is_room_transition_script(name):
+            continue
+        scripts_touched += 1
         pos = 0
         while pos + 8 <= length:
             word = struct.unpack_from("<I", raw, bc_off + pos)[0]
             op = _opcode(word)
-            # PushI (v15) with room id in low 16 bits
             if op == OP_PUSHI:
                 value = word & 0xFFFF
                 if value in mapping:
-                    # Look ahead for Call within next 3 instructions
+                    # Require Call as the very next instruction (or after one 1-word op)
                     ahead = pos + 4
                     found_call = False
-                    for _ in range(3):
+                    for step in range(2):
                         if ahead + 4 > length:
                             break
                         w2 = struct.unpack_from("<I", raw, bc_off + ahead)[0]
@@ -231,11 +320,10 @@ def randomize_room_gotos(
                         if op2 in (OP_CALL_V15, OP_CALL_V14):
                             found_call = True
                             break
-                        # skip typical 1-word ops; pop/call may be 2 words
-                        if op2 in (0x45, 0x41, OP_CALL_V15, OP_CALL_V14):
-                            ahead += 8
-                        else:
+                        if step == 0 and op2 not in (0x45, 0x41):
                             ahead += 4
+                            continue
+                        break
                     if found_call:
                         new_val = mapping[value]
                         new_word = (word & 0xFFFF0000) | (new_val & 0xFFFF)
@@ -243,7 +331,7 @@ def randomize_room_gotos(
                         changed += 1
                 pos += 4
                 continue
-            if op in (0x45, 0x41):  # Pop 2 words
+            if op in (0x45, 0x41):
                 pos += 8
                 continue
             if op in (OP_CALL_V15, OP_CALL_V14):
@@ -252,20 +340,22 @@ def randomize_room_gotos(
             pos += 4
 
     if changed == 0:
-        return False, "No room_goto-style PushI sites found to rewrite.", mapping
+        return (
+            False,
+            "No door/warp room_goto sites found to rewrite "
+            f"(scanned {scripts_touched} transition scripts).",
+            mapping,
+        )
 
-    if backup:
-        bak = path.with_suffix(path.suffix + ".roomchaosbak")
-        if not bak.exists():
-            bak.write_bytes(path.read_bytes())
     path.write_bytes(raw)
 
     meta = path.with_suffix(path.suffix + ".roomchaos.json")
     meta.write_text(json.dumps({str(k): v for k, v in mapping.items()}, indent=2), encoding="utf-8")
     return (
         True,
-        f"Randomized {changed} room transitions among {len(playable)} playable rooms "
-        f"(excluded text/cutscene rooms). Restart Undertale to load. Backup: data.win.roomchaosbak",
+        f"Randomized {changed} door/warp transitions among {len(playable)} playable rooms "
+        f"({scripts_touched} scripts). Restart Undertale. Undo: Restore data.win "
+        f"or Chaos → Undo room chaos (data.win.roomchaosbak).",
         mapping,
     )
 
@@ -285,7 +375,9 @@ def _force_rare_chance_pushes(data_win: str | Path, *, backup: bool = True) -> t
     reader = BinaryReader(bytes(raw))
 
     changed = 0
-    for _name, bc_off, length in _find_code_entries(reader):
+    for name, bc_off, length in _find_code_entries(reader):
+        if not _is_rare_encounter_script(name):
+            continue
         # Collect PushI sites in this script
         sites: list[tuple[int, int]] = []  # (pos, value)
         pos = 0

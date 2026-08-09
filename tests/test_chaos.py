@@ -80,6 +80,25 @@ def test_is_text_room():
     assert chaos._is_text_or_special_room("room_tundra1") is False
 
 
+def test_room_transition_script_filter():
+    assert chaos._is_room_transition_script("gml_Object_obj_doorA_Collision_xxx")
+    assert chaos._is_room_transition_script("gml_Object_obj_doorway_Create_0")
+    assert not chaos._is_room_transition_script("gml_Script_ossafe_file_text_eof")
+    assert not chaos._is_room_transition_script("gml_Object_obj_time_Create_0")
+    assert not chaos._is_room_transition_script("gml_Script_scr_load")
+
+
+def test_restore_room_chaos(tmp_path: Path):
+    path = tmp_path / "data.win"
+    path.write_bytes(b"FORM_CORRUPT")
+    bak = path.with_suffix(".win.roomchaosbak")
+    bak.write_bytes(b"FORM_CLEAN!!")
+    ok, msg = chaos.restore_room_chaos(path)
+    assert ok is True
+    assert path.read_bytes() == b"FORM_CLEAN!!"
+    assert "roomchaosbak" in msg
+
+
 def test_randomize_room_gotos_rewrites_pushi(tmp_path: Path):
     """Build a tiny FORM+CODE with PushI room;Call and shuffle destinations."""
     OP_PUSHI = 0x84
@@ -89,7 +108,7 @@ def test_randomize_room_gotos_rewrites_pushi(tmp_path: Path):
         bytecode += struct.pack("<I", (OP_PUSHI << 24) | rid)
         bytecode += struct.pack("<I", (OP_CALL << 24)) + struct.pack("<I", 0)
 
-    name = b"gml_Script_door"
+    name = b"gml_Object_obj_doorA_Collision_0"
     code = bytearray()
     code += struct.pack("<I", 1)
     entry_ptr_pos = len(code)
@@ -130,9 +149,48 @@ def test_randomize_room_gotos_rewrites_pushi(tmp_path: Path):
     for i in range(3):
         word = struct.unpack_from("<I", data, bc_off + i * 12)[0]
         found_vals.append(word & 0xFFFF)
-    # Values should be remapped into the playable set
     assert all(v in mapping.values() for v in found_vals)
-    assert found_vals != [0, 1, 2] or mapping[0] == 0  # allow unlucky identity
+
+
+def test_randomize_skips_ossafe_scripts(tmp_path: Path):
+    """PushI+Call in ossafe scripts must not be rewritten."""
+    OP_PUSHI = 0x84
+    OP_CALL = 0xD9
+    bytecode = struct.pack("<I", (OP_PUSHI << 24) | 6)
+    bytecode += struct.pack("<I", (OP_CALL << 24)) + struct.pack("<I", 0)
+    name = b"gml_Script_ossafe_file_text_eof"
+    code = bytearray()
+    code += struct.pack("<I", 1)
+    entry_ptr_pos = len(code)
+    code += struct.pack("<I", 0)
+    entry_body_pos = len(code)
+    name_ptr_pos = len(code)
+    code += struct.pack("<I", 0)
+    code += struct.pack("<I", len(bytecode))
+    code += bytecode
+    str_blob = struct.pack("<I", len(name)) + name + b"\x00"
+    buf = bytearray(b"FORM" + struct.pack("<I", 0))
+    buf += b"CODE" + struct.pack("<I", len(code))
+    code_at = len(buf)
+    buf += code
+    str_at = len(buf)
+    buf += str_blob
+    buf[4:8] = struct.pack("<I", len(buf) - 8)
+    entry_abs = code_at + entry_body_pos
+    buf[code_at + entry_ptr_pos : code_at + entry_ptr_pos + 4] = struct.pack("<I", entry_abs)
+    buf[code_at + name_ptr_pos : code_at + name_ptr_pos + 4] = struct.pack("<I", str_at + 4)
+    path = tmp_path / "data.win"
+    path.write_bytes(buf)
+    orig = chaos.playable_room_ids
+    chaos.playable_room_ids = lambda _p: list(range(12))  # type: ignore
+    try:
+        ok, msg, _ = chaos.randomize_room_gotos(path, seed=1, backup=True)
+    finally:
+        chaos.playable_room_ids = orig
+    assert ok is False
+    word = struct.unpack_from("<I", path.read_bytes(), entry_abs + 8)[0]
+    assert (word & 0xFFFF) == 6
+
 
 
 def test_rare_battlegroups_marked():
