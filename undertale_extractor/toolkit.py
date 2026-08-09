@@ -406,7 +406,7 @@ class DebugToolkit(ctk.CTkToplevel):
             "(or Steam Verify) → Enable live patches → Launch → overworld → Start Fight. "
             "Home fight patches obj_mainchara KeyPress_36 (battlegroup = 57+nnn). "
             "Stay in the overworld. Do not spam the 5 key (that shifts the id).\n"
-            "Secret: type 666 as the id for AMALGOMATION (not on the monster list).",
+            "Secret: type 666 for AMALGOMATION — in-game only (morphing sprite, stacked attacks).",
             text_color=COLORS["muted"],
             wraplength=600,
             justify="left",

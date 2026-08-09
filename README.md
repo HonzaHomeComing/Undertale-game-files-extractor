@@ -43,7 +43,7 @@ python UndertaleExtractor.py
 3. Click **Debug Toolkit** for:
    - **Stats** — LOVE, HP, AT, DF, EXP, gold, kills  
    - **Items** — all 8 inventory slots + weapon/armor  
-   - **Fights** — pick a battlegroup and **Start Fight** (Home battlegroup patch). Secret: type **666** for **AMALGOMATION** (not on the monster list)  
+   - **Fights** — pick a battlegroup and **Start Fight** (Home battlegroup patch). Secret: type **666** for **AMALGOMATION** (in-game only — morphing sprites, stacked random attacks; no extra window)  
    - **Chaos** — **Ruins reset (live)**, **Randomize rooms**, **Guarantee rarest encounters** toggle
 
 Live room clicks **force-load** even during cutscenes/battles (skips dialogue, Insert to leave battle room, then debug L).
