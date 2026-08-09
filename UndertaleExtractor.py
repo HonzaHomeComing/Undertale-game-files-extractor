@@ -1476,14 +1476,10 @@ def replace_u32_pattern_in_process(
     old_word: int,
     new_word: int,
     *,
-    max_replacements: int = 32,
+    max_replacements: int = 8,
     max_addr: int = 0x7FFFFFFF,
 ) -> int:
-    """
-    Replace little-endian uint32 words in committed memory.
-    Used to patch PushI immediates / raw battlegroup constants that GameMaker
-    may have copied out of the data.win mapping into a bytecode buffer.
-    """
+    """Replace little-endian uint32 words in committed memory (use sparingly)."""
     if old_word == new_word:
         return 0
     needle = struct.pack("<I", old_word & 0xFFFFFFFF)
@@ -1491,59 +1487,67 @@ def replace_u32_pattern_in_process(
     handle = _open_process(pid)
     replaced = 0
     try:
-        mbi = MEMORY_BASIC_INFORMATION()
-        address = 0
-        while address < max_addr and replaced < max_replacements:
-            result = kernel32.VirtualQueryEx(
-                handle,
-                ctypes.c_void_p(address),
-                ctypes.byref(mbi),
-                ctypes.sizeof(mbi),
-            )
-            if not result:
+        for base, data in iter_process_memory(handle, max_addr=max_addr):
+            idx = 0
+            while replaced < max_replacements:
+                found = data.find(needle, idx)
+                if found < 0:
+                    break
+                try:
+                    _write(handle, base + found, replacement)
+                    replaced += 1
+                except RuntimeError:
+                    pass
+                idx = found + 1
+            if replaced >= max_replacements:
                 break
-            base = int(mbi.BaseAddress or 0)
-            size = int(mbi.RegionSize or 0)
-            if size <= 0:
-                break
-            protect = int(mbi.Protect)
-            readable = (
-                int(mbi.State) == MEM_COMMIT
-                and not (protect & PAGE_NOACCESS)
-                and not (protect & PAGE_GUARD)
-                and size >= 4
-            )
-            if readable:
-                offset = 0
-                while offset < size and replaced < max_replacements:
-                    piece = min(1 * 1024 * 1024, size - offset)
-                    data = _read(handle, base + offset, piece)
-                    if data:
-                        idx = 0
-                        while True:
-                            found = data.find(needle, idx)
-                            if found < 0:
-                                break
-                            abs_addr = base + offset + found
-                            try:
-                                _write(handle, abs_addr, replacement)
-                                replaced += 1
-                                if replaced >= max_replacements:
-                                    break
-                            except RuntimeError:
-                                pass
-                            idx = found + 1
-                    next_off = offset + piece
-                    if next_off < size:
-                        next_off = max(0, next_off - 3)
-                    offset = next_off if next_off > offset else offset + piece
-            next_addr = base + size
-            if next_addr <= address:
-                break
-            address = next_addr
     finally:
         kernel32.CloseHandle(handle)
     return replaced
+
+
+def iter_process_memory(handle, *, max_addr: int = 0x7FFFFFFF):
+    """Yield (base_address, bytes) for committed readable regions."""
+    mbi = MEMORY_BASIC_INFORMATION()
+    address = 0
+    while address < max_addr:
+        result = kernel32.VirtualQueryEx(
+            handle,
+            ctypes.c_void_p(address),
+            ctypes.byref(mbi),
+            ctypes.sizeof(mbi),
+        )
+        if not result:
+            break
+        base = int(mbi.BaseAddress or 0)
+        size = int(mbi.RegionSize or 0)
+        if size <= 0:
+            break
+        protect = int(mbi.Protect)
+        readable = (
+            int(mbi.State) == MEM_COMMIT
+            and not (protect & PAGE_NOACCESS)
+            and not (protect & PAGE_GUARD)
+            and size >= 4
+        )
+        if readable:
+            # Cap huge regions into chunks
+            offset = 0
+            while offset < size:
+                piece = min(2 * 1024 * 1024, size - offset)
+                data = _read(handle, base + offset, piece)
+                if data:
+                    yield base + offset, data
+                offset += piece
+        next_addr = base + size
+        if next_addr <= address:
+            break
+        address = next_addr
+
+
+def replace_pattern_in_process(*_a, **_k):
+    """Deprecated alias placeholder."""
+    return 0
 
 
 
@@ -1906,19 +1910,19 @@ def default_save_folder() -> Path | None:
 
 # --- battles.py ---
 
-# Seed offsets from TCRF / community (version-specific; discovery finds more).
+# Seed offsets from TCRF (only used when the dword is a known factory default).
 HOME_BATTLEGROUP_OFFSETS = (
-    0x9F553C,  # 1.00 (default So Sorry 140)
-    0x9EB414,  # 1.001 (Mettaton 80)
+    0x9F553C,  # 1.00 — So Sorry 140
+    0x9EB414,  # 1.001 — Mettaton 80
     0x9EB918,  # 1.001 Linux
-    0xBD8200,  # 1.06 (Mettaton 57)
+    0xBD8200,  # 1.06 — Mettaton 57
 )
 
-# Common factory defaults for the Home-key battlegroup.
 HOME_DEFAULTS = frozenset({57, 80, 140, 81})
 
 OP_PUSHI = 0x84
-VK_HOME = 0x24  # also the GML vk_home constant pushed before keyboard_check
+VK_HOME = 0x24
+VK_HOME_KEY = 0x24  # Win32 / GML
 
 
 @dataclass(frozen=True)
@@ -1933,6 +1937,7 @@ class HomeBattlegroupSite:
     offset: int
     value: int
     kind: str  # "raw" | "pushi"
+    source: str = ""
 
     def encode(self, battlegroup_id: int) -> int:
         bg = int(battlegroup_id) & 0xFFFF
@@ -1999,87 +2004,77 @@ BATTLEGROUPS: tuple[Battlegroup, ...] = (
 RARE_BATTLEGROUPS = tuple(b for b in BATTLEGROUPS if b.rare)
 
 
-def _classify_word(word: int) -> tuple[str, int] | None:
-    """Return (kind, battlegroup_id) if word looks like a Home battlegroup slot."""
-    if (word >> 24) == OP_PUSHI:
-        imm = word & 0xFFFF
-        if imm in HOME_DEFAULTS or imm <= 400:
-            return "pushi", imm
-        return None
-    if word in HOME_DEFAULTS:
-        return "raw", word
-    if word <= 400:
-        return "raw", word
-    return None
+def _pushi(value: int) -> bytes:
+    return struct.pack("<I", (OP_PUSHI << 24) | (int(value) & 0xFFFF))
+
+
+def find_home_pushi_sites_in_bytes(data: bytes) -> list[HomeBattlegroupSite]:
+    """
+    Find PushI battlegroup immediates that sit shortly after PushI vk_home (36).
+
+    This is the assignment inside: if (keyboard_check_pressed(vk_home)) battlegroup = N;
+    """
+    needle = _pushi(VK_HOME)
+    sites: list[HomeBattlegroupSite] = []
+    seen: set[int] = set()
+    start = 0
+    while True:
+        idx = data.find(needle, start)
+        if idx < 0:
+            break
+        # Scan the next ~96 bytes for a PushI whose immediate is a battlegroup id
+        window = data[idx : idx + 96]
+        pos = 4
+        while pos + 4 <= len(window):
+            word = struct.unpack_from("<I", window, pos)[0]
+            if (word >> 24) == OP_PUSHI:
+                imm = word & 0xFFFF
+                # Factory defaults OR any already-patched small id (so re-patch works)
+                if imm in HOME_DEFAULTS or 1 <= imm <= 256:
+                    abs_off = idx + pos
+                    if abs_off not in seen:
+                        seen.add(abs_off)
+                        sites.append(
+                            HomeBattlegroupSite(abs_off, imm, "pushi", "vk_home_pattern")
+                        )
+                    break
+            pos += 4
+        start = idx + 4
+    return sites
 
 
 def discover_home_battlegroup_sites(data: bytes | bytearray) -> list[HomeBattlegroupSite]:
-    """
-    Find Home-key battlegroup constants in data.win.
-
-    Prefers PushI immediates near vk_home (36) checks inside obj_time scripts,
-    then known TCRF offsets, then other default PushIs in obj_time.
-    """
+    """Surgical discovery — pattern + TCRF defaults only. No broad PushI sweeps."""
     raw = bytes(data)
     found: dict[int, HomeBattlegroupSite] = {}
 
-    def add(offset: int, value: int, kind: str) -> None:
-        if offset < 0 or offset + 4 > len(raw):
-            return
-        found[offset] = HomeBattlegroupSite(offset, value, kind)
+    for site in find_home_pushi_sites_in_bytes(raw):
+        found[site.offset] = site
 
-    # 1) Known offsets
+    # Prefer obj_time-confirmed sites when CODE parse works (same offsets, better tag)
+    try:
+        reader = BinaryReader(raw)
+        for name, bc_off, length in _find_code_entries(reader):
+            if "obj_time" not in (name or "").lower():
+                continue
+            chunk = raw[bc_off : bc_off + length]
+            for site in find_home_pushi_sites_in_bytes(chunk):
+                abs_off = bc_off + site.offset
+                found[abs_off] = HomeBattlegroupSite(
+                    abs_off, site.value, "pushi", f"obj_time:{name}"
+                )
+    except Exception:
+        pass
+
+    # TCRF raw offsets — only if they still hold a factory default (avoid random dwords)
     for offset in HOME_BATTLEGROUP_OFFSETS:
         if offset + 4 > len(raw):
             continue
         word = struct.unpack_from("<I", raw, offset)[0]
-        classified = _classify_word(word)
-        if classified and classified[1] <= 400:
-            kind, val = classified
-            # Prefer pushi classification when opcode matches
-            if (word >> 24) == OP_PUSHI:
-                add(offset, word & 0xFFFF, "pushi")
-            elif word in HOME_DEFAULTS or word <= 256:
-                add(offset, word, "raw")
-
-    # 2) obj_time scripts: PushI vk_home (36) then a later PushI battlegroup
-    try:
-        reader = BinaryReader(raw)
-        for name, bc_off, length in _find_code_entries(reader):
-            low = (name or "").lower()
-            if "obj_time" not in low:
-                continue
-            words: list[tuple[int, int, int]] = []  # pos, op, imm_or_word
-            pos = 0
-            while pos + 4 <= length:
-                word = struct.unpack_from("<I", raw, bc_off + pos)[0]
-                op = (word >> 24) & 0xFF
-                words.append((pos, op, word))
-                if op in (0x45, 0x41, 0xD9, 0xDA):
-                    pos += 8
-                else:
-                    pos += 4
-            for i, (pos_i, op_i, word_i) in enumerate(words):
-                if op_i != OP_PUSHI or (word_i & 0xFFFF) != VK_HOME:
-                    continue
-                # Look ahead for PushI with a plausible battlegroup id
-                for j in range(i + 1, min(i + 24, len(words))):
-                    pos_j, op_j, word_j = words[j]
-                    if op_j != OP_PUSHI:
-                        continue
-                    imm = word_j & 0xFFFF
-                    if imm in HOME_DEFAULTS or 1 <= imm <= 256:
-                        add(bc_off + pos_j, imm, "pushi")
-                        break
-            # Also collect default PushIs in obj_time as weaker candidates
-            for pos_i, op_i, word_i in words:
-                if op_i != OP_PUSHI:
-                    continue
-                imm = word_i & 0xFFFF
-                if imm in HOME_DEFAULTS:
-                    add(bc_off + pos_i, imm, "pushi")
-    except Exception:
-        pass
+        if (word >> 24) == OP_PUSHI and (word & 0xFFFF) in HOME_DEFAULTS:
+            found[offset] = HomeBattlegroupSite(offset, word & 0xFFFF, "pushi", "tcrf")
+        elif word in HOME_DEFAULTS:
+            found[offset] = HomeBattlegroupSite(offset, word, "raw", "tcrf")
 
     return sorted(found.values(), key=lambda s: s.offset)
 
@@ -2091,16 +2086,11 @@ def set_home_battlegroup(data_win: str | Path, battlegroup_id: int, *, backup: b
     data = bytearray(path.read_bytes())
     sites = discover_home_battlegroup_sites(data)
     if not sites:
-        # Fallback: try known offsets as raw even if discovery failed filters
-        for offset in HOME_BATTLEGROUP_OFFSETS:
-            if offset + 4 <= len(data):
-                word = struct.unpack_from("<I", data, offset)[0]
-                if word <= 400 or (word >> 24) == OP_PUSHI:
-                    kind = "pushi" if (word >> 24) == OP_PUSHI else "raw"
-                    val = (word & 0xFFFF) if kind == "pushi" else word
-                    sites.append(HomeBattlegroupSite(offset, val, kind))
-    if not sites:
-        return False, "Could not find a Home battlegroup slot in this data.win."
+        return (
+            False,
+            "Could not find the Home-key battlegroup (vk_home PushI) in this data.win. "
+            "Enable debug mode, then try again — or use UndertaleModTool → ChangeHomeBattlegroup.",
+        )
 
     if backup:
         bak = path.with_suffix(path.suffix + ".battlebak")
@@ -2109,61 +2099,110 @@ def set_home_battlegroup(data_win: str | Path, battlegroup_id: int, *, backup: b
 
     wrote = []
     for site in sites:
-        new_word = site.encode(battlegroup_id)
-        struct.pack_into("<I", data, site.offset, new_word)
-        wrote.append(f"0x{site.offset:X}/{site.kind}")
+        struct.pack_into("<I", data, site.offset, site.encode(battlegroup_id))
+        wrote.append(f"0x{site.offset:X}/{site.kind}/{site.source or '?'}")
     path.write_bytes(data)
     return True, f"Home battlegroup set to {battlegroup_id} on disk ({', '.join(wrote)})."
 
 
-def set_home_battlegroup_live(data_win: str | Path, battlegroup_id: int) -> tuple[bool, str]:
-    """
-    Patch Home battlegroup in the running game.
+def _patch_live_form_sites(data_win: Path, sites: list[HomeBattlegroupSite], battlegroup_id: int) -> tuple[bool, list[str]]:
+    notes = []
+    any_ok = False
+    for site in sites:
+        new_word = site.encode(battlegroup_id)
+        ok, msg = patch_int32_in_data_win_image(data_win, site.offset, new_word)
+        notes.append(f"FORM+0x{site.offset:X}:{msg}")
+        if ok:
+            any_ok = True
+    return any_ok, notes
 
-    Writes FORM+file_offset AND scans process memory for old PushI/raw words so
-    copied bytecode buffers (not just the data.win mapping) update too.
+
+def _patch_live_vk_home_patterns(battlegroup_id: int) -> tuple[int, str]:
     """
+    In the live process, find PushI vk_home … PushI <id> and rewrite only that
+    battlegroup PushI. Never spray raw integers across RAM.
+    """
+    if not is_windows():
+        return 0, "Windows only"
+    pid = find_undertale_pid()
+    if not pid:
+        return 0, "not running"
+    n = replace_home_battlegroup_near_vk_home(pid, None, battlegroup_id, max_hits=8)
+    return n, f"rewrote {n} Home PushI site(s) → {battlegroup_id}"
+
+
+def replace_home_battlegroup_near_vk_home(
+    pid: int,
+    old_id: int | None,
+    new_id: int,
+    *,
+    max_hits: int = 6,
+) -> int:
+    """Replace PushI battlegroup after PushI vk_home in process memory."""
+
+    home = _pushi(VK_HOME)
+    new_word = _pushi(new_id)
+    handle = _open_process(pid)
+    hits = 0
+    try:
+        for base, data in iter_process_memory(handle):
+            start = 0
+            while hits < max_hits:
+                idx = data.find(home, start)
+                if idx < 0:
+                    break
+                end = min(len(data), idx + 96)
+                pos = idx + 4
+                while pos + 4 <= end:
+                    word = struct.unpack_from("<I", data, pos)[0]
+                    if (word >> 24) == OP_PUSHI:
+                        imm = word & 0xFFFF
+                        match = (old_id is None and 1 <= imm <= 256 and imm != new_id) or (
+                            old_id is not None and imm == old_id
+                        )
+                        if match:
+                            try:
+                                _write(handle, base + pos, new_word)
+                                hits += 1
+                            except RuntimeError:
+                                pass
+                            break
+                    pos += 4
+                start = idx + 4
+            if hits >= max_hits:
+                break
+    finally:
+        if kernel32:
+            kernel32.CloseHandle(handle)
+    return hits
+
+
+def set_home_battlegroup_live(data_win: str | Path, battlegroup_id: int) -> tuple[bool, str]:
+    """Surgical live patch: FORM sites + vk_home pattern only (no raw int sprays)."""
     path = Path(data_win)
     raw = path.read_bytes()
+    # Re-discover from the *current* on-disk bytes (caller should write disk first)
     sites = discover_home_battlegroup_sites(raw)
     notes: list[str] = []
     any_ok = False
-    new_id = int(battlegroup_id) & 0xFFFF
-    new_pushi = (OP_PUSHI << 24) | new_id
 
-    for site in sites:
-        new_word = site.encode(battlegroup_id)
-        ok, msg = patch_int32_in_data_win_image(
-            path, site.offset, new_word, expected_old=site.encode(site.value)
-        )
-        notes.append(f"0x{site.offset:X}:{msg}")
-        if ok:
-            any_ok = True
-        # Also search/replace this site's old encoded word anywhere in RAM
-        old_word = site.encode(site.value)
-        if old_word != new_word:
-            n, detail = patch_u32_everywhere_in_game(old_word, new_word)
-            if n:
-                notes.append(f"site-scan {detail}")
-                any_ok = True
+    form_ok, form_notes = _patch_live_form_sites(path, sites, battlegroup_id)
+    notes.extend(form_notes)
+    if form_ok:
+        any_ok = True
 
-    # Sweep common factory defaults still sitting in bytecode copies
-    for default in sorted(HOME_DEFAULTS):
-        if default == new_id:
-            continue
-        old_pushi = (OP_PUSHI << 24) | default
-        n, detail = patch_u32_everywhere_in_game(old_pushi, new_pushi)
-        if n:
-            notes.append(f"pushi {default}→{new_id}: {detail}")
-            any_ok = True
-        n2, detail2 = patch_u32_everywhere_in_game(default, new_id)
-        if n2:
-            notes.append(f"raw {default}→{new_id}: {detail2}")
-            any_ok = True
+    n, detail = _patch_live_vk_home_patterns(battlegroup_id)
+    notes.append(f"vk_home patterns: {detail}")
+    if n:
+        any_ok = True
 
     if any_ok:
-        return True, "Live memory patched (" + "; ".join(notes) + ")."
-    return False, "Live memory patch failed (" + "; ".join(notes) + ")."
+        return True, "Live patch OK (" + "; ".join(notes) + ")."
+    return (
+        False,
+        "Live patch missed the Home handler. Close Undertale → Launch → Start Fight. "
+        "(" + "; ".join(notes) + ")",
+    )
 
 
 def trigger_home_fight() -> tuple[bool, str]:
@@ -2171,7 +2210,10 @@ def trigger_home_fight() -> tuple[bool, str]:
         return False, "Undertale is not running. Launch it first, load a save, then start the fight."
     if not find_undertale_hwnd():
         return False, "Could not find the UNDERTALE window."
-    if not _send_key_to_undertale(VK_HOME, presses=2):
+    # Escape menus first so Home is handled by obj_time
+    _send_key_to_undertale(VK_ESCAPE, presses=1)
+    time.sleep(0.08)
+    if not _send_key_to_undertale(VK_HOME_KEY, presses=2):
         return False, "Could not send the Home key. Click the Undertale window and press Home."
     time.sleep(0.2)
     return True, "Sent Home — fight should start if debug mode is on."
@@ -2186,9 +2228,7 @@ def start_fight(
     prefer_rare_if_enabled: bool = False,
 ) -> tuple[bool, str]:
     """
-    Set Home battlegroup and trigger the fight.
-    Always writes data.win; if the game is running, also patches memory so the
-    selection applies immediately (fixes always-Mettaton bug).
+    Set Home battlegroup surgically and trigger the fight.
     """
     notes: list[str] = []
     if not data_win or not Path(data_win).is_file():
@@ -2221,10 +2261,6 @@ def start_fight(
         live_ok, live_msg = set_home_battlegroup_live(data_win, battlegroup_id)
         notes.append(live_msg)
         if not live_ok:
-            notes.append(
-                "Could not patch the live game — close Undertale, Launch again, "
-                "then Start Fight (disk patch is ready)."
-            )
             return False, " | ".join(notes)
         time.sleep(0.15)
         ok2, msg2 = trigger_home_fight()
@@ -2243,7 +2279,6 @@ def start_random_rare_fight(
     data_win: str | Path | None = None,
     save_folder: str | Path | None = None,
 ) -> tuple[bool, str]:
-    """Start a fight from the rare battlegroup list."""
 
     if not RARE_BATTLEGROUPS:
         return False, "No rare battlegroups configured."
@@ -3107,8 +3142,9 @@ class DebugToolkit(ctk.CTkToplevel):
         ).pack(side="left")
         ctk.CTkLabel(
             tab,
-            text="If live memory patch fails (permissions), close Undertale → Launch → "
-            "Continue → Start Fight. Rare list includes Glyde, So Sorry, Sans, amalgamates…",
+            text="If the last fight glitched (wrong enemy / broken text): close Undertale → "
+            "Restore data.win (or Steam Verify) → Enable live patches → Launch → Start Fight. "
+            "Patches only the Home-key battlegroup next to vk_home (no memory spray).",
             text_color=COLORS["muted"],
             wraplength=600,
             justify="left",
