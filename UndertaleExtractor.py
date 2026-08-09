@@ -1116,6 +1116,48 @@ def enable_debug_mode(data_win: str | Path, *, backup: bool = True) -> bool:
     return True
 
 
+def enable_debug_mode_live(data_win: str | Path) -> tuple[bool, str]:
+    """
+    Enable debug on disk and in the running process FORM image.
+    Home-key fights need the in-memory flag, not only the file on disk.
+    """
+    path = Path(data_win)
+    if not path.is_file():
+        return False, "data.win missing"
+    disk_ok = enable_debug_mode(path, backup=True)
+    if not is_windows() or not undertale_is_running():
+        return disk_ok, "debug on disk" if disk_ok else "debug offsets not found"
+
+    pid = find_undertale_pid()
+    if not pid:
+        return disk_ok, "debug on disk (process not found)"
+    size = path.stat().st_size
+    data = path.read_bytes()
+    wrote = 0
+    handle = None
+    try:
+        handle = _open_process(pid)
+        form = find_form_base(handle, expected_size=size)
+        if form is None:
+            return disk_ok, "debug on disk (live FORM not found — relaunch after Enable live patches)"
+        for offset in DEBUG_OFFSETS:
+            if offset >= len(data):
+                continue
+            try:
+                _write(handle, form + offset, b"\x01")
+                wrote += 1
+            except RuntimeError:
+                continue
+    except RuntimeError as exc:
+        return disk_ok, f"debug on disk; live failed: {exc}"
+    finally:
+        if handle and kernel32:
+            kernel32.CloseHandle(handle)
+    if wrote:
+        return True, f"debug live ({wrote} flag byte(s))"
+    return disk_ok, "debug on disk (live write missed)"
+
+
 def debug_flag_enabled(data_win: str | Path) -> bool:
     path = Path(data_win)
     data = path.read_bytes()
@@ -2188,12 +2230,18 @@ def trigger_home_fight() -> tuple[bool, str]:
     if not find_undertale_hwnd():
         return False, "Could not find the UNDERTALE window."
     # Must be in the overworld with Frisk (KeyPress_36 is on obj_mainchara).
-    _send_key_to_undertale(VK_ESCAPE, presses=1)
-    time.sleep(0.08)
-    if not _send_key_to_undertale(VK_HOME_KEY, presses=2):
+    # Clear menus/dialog so Home is received by the player object.
+    for _ in range(3):
+        _send_key_to_undertale(VK_ESCAPE, presses=1)
+        time.sleep(0.06)
+    time.sleep(0.1)
+    if not _send_key_to_undertale(VK_HOME_KEY, presses=3):
         return False, "Could not send the Home key. Click the Undertale window and press Home."
+    time.sleep(0.35)
+    # Second burst — first Home is sometimes eaten while focus settles.
+    _send_key_to_undertale(VK_HOME_KEY, presses=2)
     time.sleep(0.2)
-    return True, "Sent Home — be in the overworld (not a menu). Fight starts if debug is on."
+    return True, "Sent Home — fight should start in the overworld (debug must be on)."
 
 
 def start_fight(
@@ -2219,13 +2267,18 @@ def start_fight(
                 battlegroup_id = RARE_BATTLEGROUPS[0].id
                 notes.append(f"rare mode → battlegroup {battlegroup_id}")
 
-    if ensure_debug and not debug_flag_enabled(data_win):
+    if ensure_debug:
         try:
-            if not undertale_is_running():
-                enable_debug_mode(data_win, backup=True)
-                notes.append("enabled debug")
-            else:
-                notes.append("debug flag off on disk — relaunch after Enable live patches")
+            if undertale_is_running():
+                ok_dbg, dbg_msg = enable_debug_mode_live(data_win)
+                notes.append(dbg_msg)
+                if not ok_dbg and not debug_flag_enabled(data_win):
+                    notes.append("debug off — click Enable live patches, relaunch, retry")
+            elif not debug_flag_enabled(data_win):
+                if enable_debug_mode(data_win, backup=True):
+                    notes.append("enabled debug")
+                else:
+                    notes.append("debug offsets not found")
         except Exception as exc:
             notes.append(f"debug failed: {exc}")
 
@@ -2239,7 +2292,7 @@ def start_fight(
         notes.append(live_msg)
         if not live_ok:
             return False, " | ".join(notes)
-        time.sleep(0.15)
+        time.sleep(0.2)
         ok2, msg2 = trigger_home_fight()
         notes.append(msg2)
         return ok2, " | ".join(notes)
@@ -2806,11 +2859,6 @@ _HOST_SPRITE_NAMES = (
     "spr_endogeny_2",
 )
 
-_NAME_STRINGS = (
-    b"Amalgamate",
-    b"Endogeny",
-)
-
 
 @dataclass
 class ResourceIndex:
@@ -3042,102 +3090,62 @@ def build_amalgomation_plan(data: bytes) -> AmalgomationPlan:
     return plan
 
 
-def _write_pushi(data: bytearray, offset: int, template: int, value: int) -> None:
-    new_word = (template & 0xFFFF0000) | (int(value) & 0xFFFF)
-    struct.pack_into("<I", data, offset, new_word)
-
-
-def _patch_disk_and_live(
-    data_win: Path,
-    data: bytearray,
-    sites: list[tuple[int, int]],
-) -> list[str]:
-    """sites: (offset, new_u32_word). Writes disk + live FORM copy."""
-    notes = []
-    for offset, word in sites:
-        if offset < 0 or offset + 4 > len(data):
-            continue
-        struct.pack_into("<I", data, offset, word & 0xFFFFFFFF)
-    try:
-        data_win.write_bytes(data)
-        notes.append("data.win updated")
-    except OSError as exc:
-        notes.append(f"disk write failed: {exc}")
-        return notes
-    if undertale_is_running() and is_windows():
-        pid = find_undertale_pid()
-        size = data_win.stat().st_size
-        for offset, word in sites:
-            try:
-                ok = write_int32_in_running_game(
-                    pid, offset, word & 0xFFFFFFFF, expected_size=size
-                )
-                if ok:
-                    notes.append(f"live@0x{offset:X}")
-            except Exception:
-                continue
-    return notes
-
-
-def _backup(data_win: Path) -> Path:
-    bak = data_win.with_suffix(data_win.suffix + ".amalgobak")
-    if not bak.exists():
-        bak.write_bytes(data_win.read_bytes())
-    return bak
-
-
-def install_amalgomation_into_data_win(data_win: str | Path) -> tuple[bool, str, AmalgomationPlan]:
+def restore_amalgomation_backup_if_any(data_win: str | Path) -> tuple[bool, str]:
     """
-    One-shot structural patches: neutralize mercy shortcuts, open both attack
-    branches, stamp AMALGOMATION name strings. Sprite/attack IDs are left to
-    the live director so they keep changing.
+    Undo prior Amalgomation disk corruption (string overflows / branch hacks).
+    Returns (restored, message).
+    """
+    path = Path(data_win)
+    bak = path.with_suffix(path.suffix + ".amalgobak")
+    if not bak.is_file():
+        return False, ""
+    try:
+        current = path.read_bytes()
+        clean = bak.read_bytes()
+    except OSError as exc:
+        return False, f"Could not read amalgomation backup: {exc}"
+    if current == clean:
+        return False, ""
+    try:
+        path.write_bytes(clean)
+    except OSError as exc:
+        return False, f"Could not restore amalgomation backup: {exc}"
+    return True, (
+        "Restored data.win from .amalgobak (previous Amalgomation install corrupted it). "
+        "Close Undertale completely, click Launch Undertale, load your save, then enter 666 again."
+    )
+
+
+def prepare_amalgomation_plan(data_win: str | Path) -> tuple[bool, str, AmalgomationPlan]:
+    """
+    Index sprites/attack sites only. Does NOT rewrite data.win structure
+    (earlier installs corrupted strings and broke fight start).
     """
     path = Path(data_win)
     if not path.is_file():
         return False, "data.win missing", AmalgomationPlan()
-    _backup(path)
-    raw = bytearray(path.read_bytes())
-    plan = build_amalgomation_plan(bytes(raw))
-    writes: list[tuple[int, int]] = []
-
-    # Soften BF between the two host creates so the false-branch skip is tiny
-    # (both attack patterns can run in one turn). Offset encoded in low 24 bits.
-    for site in plan.branch_sites:
-        if (site.original >> 24) & 0xFF == OP_BF:
-            writes.append((site.offset, (OP_BF << 24) | 0x000002))
-
-    # Break spare thresholds (999999 / 222) so petting never soft-locks to spare
-    for site in plan.mercymod_sites:
-        writes.append((site.offset, (site.original & 0xFFFF0000) | 0x0001))
-
-    # Rename visible "Amalgamate" / "Endogeny" strings when length allows
-    for needle in _NAME_STRINGS:
-        replacement = b"AMALGOMATION"
-        start = 0
-        while True:
-            idx = raw.find(needle, start)
-            if idx < 0:
-                break
-            # Only replace if we have room (same or shorter) or exact field
-            if len(replacement) <= len(needle) + 4:
-                # Write replacement and pad with spaces/nulls into old span
-                span = max(len(needle), len(replacement))
-                chunk = replacement[:span].ljust(span, b"\x00")
-                raw[idx : idx + span] = chunk[:span]
-                # Also try live later via full file write
-            start = idx + 1
-
-    notes = _patch_disk_and_live(path, raw, writes)
-    # Re-read plan from patched file for director
-    plan = build_amalgomation_plan(path.read_bytes())
-    ok = bool(plan.sprite_sites or plan.attack_sites or plan.resources.sprite_ids)
+    restored, restore_msg = restore_amalgomation_backup_if_any(path)
+    if restored:
+        # Caller must relaunch — in-memory FORM is still dirty.
+        return False, restore_msg, AmalgomationPlan()
+    try:
+        raw = path.read_bytes()
+    except OSError as exc:
+        return False, str(exc), AmalgomationPlan()
+    plan = build_amalgomation_plan(raw)
+    ok = bool(plan.resources.sprite_ids) or bool(plan.sprite_sites) or bool(plan.attack_sites)
     msg = (
-        f"Amalgomation installed in-game "
-        f"(sprites={len(plan.sprite_sites)}, attacks={len(plan.attack_sites)}, "
+        f"Amalgomation ready (sprite sites={len(plan.sprite_sites)}, "
+        f"attack sites={len(plan.attack_sites)}, "
         f"gens={len(plan.resources.gen_object_ids)}, "
-        f"spritepool={len(plan.resources.sprite_ids)}). " + "; ".join(notes)
+        f"spritepool={len(plan.resources.sprite_ids)})"
     )
     return ok, msg, plan
+
+
+def install_amalgomation_into_data_win(data_win: str | Path) -> tuple[bool, str, AmalgomationPlan]:
+    """Backward-compatible name — now non-destructive (plan only). """
+    return prepare_amalgomation_plan(data_win)
 
 
 def scramble_u32_candidates(
@@ -3383,7 +3391,7 @@ def start_amalgomation_fight(
     data_win: str | Path | None,
     save_folder: str | Path | None = None,
 ) -> tuple[bool, str]:
-    """Install in-game morph patches, start host fight, run silent director."""
+    """Start host fight first, then morph it live — no extra windows, no disk corruption."""
     if not data_win or not Path(data_win).is_file():
         return False, "Open your Undertale folder (data.win) first."
     if not undertale_is_running():
@@ -3393,13 +3401,12 @@ def start_amalgomation_fight(
         )
 
     stop_amalgomation_director()
-    ok_inst, inst_msg, plan = install_amalgomation_into_data_win(data_win)
-    if not plan.resources.sprite_ids and not plan.sprite_sites:
-        return (
-            False,
-            "Could not index sprites/objects in data.win for Amalgomation. " + inst_msg,
-        )
+    ok_inst, inst_msg, plan = prepare_amalgomation_plan(data_win)
+    if not ok_inst:
+        # Includes "close and relaunch" after restoring a corrupted backup.
+        return False, inst_msg
 
+    # Fight first — director only starts after the battle has time to appear.
     ok, msg = start_fight(
         HOST_BATTLEGROUP,
         data_win=data_win,
@@ -3407,24 +3414,33 @@ def start_amalgomation_fight(
         save_folder=save_folder,
     )
     if not ok:
-        return False, f"Amalgomation fight failed: {msg}"
+        return False, f"Amalgomation fight failed to start: {msg}"
 
     director = AmalgomationDirector(Path(data_win), plan)
     with _DIRECTOR_LOCK:
         global _ACTIVE_DIRECTOR
         _ACTIVE_DIRECTOR = director
-    # Give the battle a moment to spawn, then morph hard
+
     def _boot() -> None:
-        time.sleep(0.8)
-        director.start()
+        # One more Home burst after focus settles, then morph once battle exists.
+        time.sleep(0.9)
+        if not undertale_is_running():
+            return
+
+        if find_undertale_hwnd():
+            _send_key_to_undertale(0x1B, presses=1)  # Esc — leave menus
+            time.sleep(0.08)
+            _send_key_to_undertale(VK_HOME_KEY, presses=3)
+        time.sleep(1.6)
+        if undertale_is_running():
+            director.start()
 
     threading.Thread(target=_boot, daemon=True).start()
 
     return (
         True,
-        "AMALGOMATION is inside the game now (no extra window). "
-        "Appearance morphs across random sprites; attacks stack every 2 rounds. "
-        "It cannot be spared, killed, or fled from. "
+        "AMALGOMATION — focus the Undertale window; the fight should start now. "
+        "If not, press Home once in the overworld. "
         + inst_msg
         + " | "
         + msg,
@@ -3432,25 +3448,11 @@ def start_amalgomation_fight(
 
 
 def open_amalgomation_ui(parent, *, data_win: Path | None, save_folder: Path | None, on_status=None):
-    """Confirm + launch — everything stays in the Undertale window."""
-
-    warn = (
-        "AMALGOMATION (id 666) runs entirely inside Undertale.\n\n"
-        "A creature made of random game files will morph in battle, use random "
-        "stacked attacks that escalate every 2 rounds, scramble HP/armor, and "
-        "glitch damage text. It cannot be spared, killed, or fled from.\n\n"
-        "Stand in the overworld. Continue?"
-    )
-    if not messagebox.askyesno("AMALGOMATION", warn, parent=parent):
-        return
-
+    """Launch with no popup dialogs — status line only."""
     ok, msg = start_amalgomation_fight(data_win=data_win, save_folder=save_folder)
     if on_status:
-        on_status(msg)
-    if ok:
-        messagebox.showinfo("AMALGOMATION", msg, parent=parent)
-    else:
-        messagebox.showwarning("AMALGOMATION", msg, parent=parent)
+        on_status(msg if ok else f"AMALGOMATION: {msg}")
+    # Intentionally no messagebox — user wants only the game window.
 
 
 # --- toolkit.py ---
@@ -3832,7 +3834,7 @@ class DebugToolkit(ctk.CTkToplevel):
             "(or Steam Verify) → Enable live patches → Launch → overworld → Start Fight. "
             "Home fight patches obj_mainchara KeyPress_36 (battlegroup = 57+nnn). "
             "Stay in the overworld. Do not spam the 5 key (that shifts the id).\n"
-            "Secret: type 666 for AMALGOMATION — in-game only (morphing sprite, stacked attacks).",
+            "Secret: type 666 for AMALGOMATION (in-game). If it fails once: Restore data.win → Launch → 666.",
             text_color=COLORS["muted"],
             wraplength=600,
             justify="left",

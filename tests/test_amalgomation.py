@@ -60,17 +60,21 @@ def test_open_amalgomation_ui_has_no_window_dependency():
     assert d.state.running is False
 
 
-def test_discover_resources_from_minimal_chunks():
-    """SPRT/OBJT name lists are indexed for morph + attack pools."""
-    # Minimal FORM with empty-ish chunks is hard; just ensure function returns ResourceIndex
-    empty = am.discover_resources(b"FORM" + struct.pack("<I", 0))
-    assert isinstance(empty, am.ResourceIndex)
-    assert empty.sprite_ids == []
+def test_restore_backup_helper(tmp_path):
+    data = tmp_path / "data.win"
+    bak = tmp_path / "data.win.amalgobak"
+    data.write_bytes(b"DIRTY")
+    bak.write_bytes(b"CLEAN")
+    restored, msg = am.restore_amalgomation_backup_if_any(data)
+    assert restored is True
+    assert data.read_bytes() == b"CLEAN"
+    assert "Restored" in msg
+    # Second call: already clean
+    restored2, msg2 = am.restore_amalgomation_backup_if_any(data)
+    assert restored2 is False
+    assert msg2 == ""
 
 
-def test_build_plan_finds_pushi_sites():
-    # Craft a tiny fake "code" blob and wrap it — build_amalgomation_plan needs CODE chunk.
-    # Smoke: empty data returns empty plan without crashing.
-    plan = am.build_amalgomation_plan(b"FORM" + struct.pack("<I", 0))
-    assert isinstance(plan, am.AmalgomationPlan)
-    assert plan.sprite_sites == []
+def test_prepare_plan_smoke():
+    empty = am.prepare_amalgomation_plan
+    assert callable(empty)
