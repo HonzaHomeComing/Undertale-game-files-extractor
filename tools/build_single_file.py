@@ -22,6 +22,7 @@ MODULES = [
     "save_editor.py",
     "battles.py",
     "chaos.py",
+    "amalgomation.py",
     "toolkit.py",
     "parser.py",
     "gui.py",
@@ -116,7 +117,7 @@ if __name__ == "__main__":
 
 SKIP_LINE = re.compile(
     r"^(from __future__ import .*|"
-    r"from \.(assets|binary|teleport|dogcheck|live_teleport|memory_patch|launcher|save_editor|battles|chaos|toolkit|parser|gui) import [^(].*|"
+    r"from \.(assets|binary|teleport|dogcheck|live_teleport|memory_patch|launcher|save_editor|battles|chaos|amalgomation|toolkit|parser|gui) import [^(].*|"
     r"import (os|re|io|sys|struct|shutil|tempfile|threading|time|ctypes|tkinter|subprocess|json|random)( as .*)?|"
     r"from (pathlib|dataclasses|enum|collections\.abc|ctypes|tkinter|typing) import .*|"
     r"from PIL import .*|"

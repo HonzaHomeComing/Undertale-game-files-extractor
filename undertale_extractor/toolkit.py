@@ -7,6 +7,7 @@ from tkinter import messagebox
 
 import customtkinter as ctk
 
+from .amalgomation import is_amalgomation_id, open_amalgomation_ui
 from .battles import BATTLEGROUPS, RARE_BATTLEGROUPS, start_fight, start_random_rare_fight
 from .chaos import (
     live_ruins_reset,
@@ -404,7 +405,8 @@ class DebugToolkit(ctk.CTkToplevel):
             text="If the last fight was Mettaton/glitched: close Undertale → Restore data.win "
             "(or Steam Verify) → Enable live patches → Launch → overworld → Start Fight. "
             "Home fight patches obj_mainchara KeyPress_36 (battlegroup = 57+nnn). "
-            "Stay in the overworld. Do not spam the 5 key (that shifts the id).",
+            "Stay in the overworld. Do not spam the 5 key (that shifts the id).\n"
+            "Secret: type 666 as the id for AMALGOMATION (not on the monster list).",
             text_color=COLORS["muted"],
             wraplength=600,
             justify="left",
@@ -419,8 +421,14 @@ class DebugToolkit(ctk.CTkToplevel):
         except ValueError:
             messagebox.showerror("Bad id", "Enter a numeric battlegroup id.", parent=self)
             return
-        # When rare mode is on and user picked a non-rare, still honor explicit pick;
-        # rare preference is for the rare button / overworld helpers.
+        if is_amalgomation_id(bg):
+            open_amalgomation_ui(
+                self,
+                data_win=self.data_win,
+                save_folder=self.save_dir,
+                on_status=self._say,
+            )
+            return
         ok, msg = start_fight(
             bg,
             data_win=self.data_win,
