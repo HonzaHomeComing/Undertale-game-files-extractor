@@ -43,8 +43,8 @@ python UndertaleExtractor.py
 3. Click **Debug Toolkit** for:
    - **Stats** — LOVE, HP, AT, DF, EXP, gold, kills  
    - **Items** — all 8 inventory slots + weapon/armor  
-   - **Fights** — pick a battlegroup and **Start Fight** (auto-finds Home battlegroup in data.win + live bytecode so it is not stuck on Mettaton)  
-   - **Chaos** — **Ruins reset (live)** (first Ruins SAVE + zeroed stats while the game stays open), **Randomize rooms** (door/warp only; restart game after), **Guarantee rarest encounters** toggle
+   - **Fights** — pick a battlegroup and **Start Fight** (Home battlegroup patch). Secret: type **666** for **AMALGOMATION** (not on the monster list)  
+   - **Chaos** — **Ruins reset (live)**, **Randomize rooms**, **Guarantee rarest encounters** toggle
 
 Live room clicks **force-load** even during cutscenes/battles (skips dialogue, Insert to leave battle room, then debug L).
 If the game will not start after patching, click **Restore data.win**, then **Launch Undertale** again.
