@@ -43,7 +43,8 @@ python UndertaleExtractor.py
 3. Click **Debug Toolkit** for:
    - **Stats** — LOVE, HP, AT, DF, EXP, gold, kills  
    - **Items** — all 8 inventory slots + weapon/armor  
-   - **Fights** — pick a battlegroup and **Start Fight** (debug Home key)
+   - **Fights** — pick a battlegroup and **Start Fight** (live memory patch so it is not always Mettaton)  
+   - **Chaos** — **Ruins reset (live)** (first Ruins SAVE + zeroed stats while the game stays open), **Randomize rooms** (shuffles doors; skips text rooms; restart game after), **Guarantee rarest encounters** toggle
 
 If the game will not start after patching, click **Restore data.win**, then **Launch Undertale** again.
 

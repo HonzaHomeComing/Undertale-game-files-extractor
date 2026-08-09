@@ -17,9 +17,11 @@ MODULES = [
     "teleport.py",
     "dogcheck.py",
     "live_teleport.py",
+    "memory_patch.py",
     "launcher.py",
     "save_editor.py",
     "battles.py",
+    "chaos.py",
     "toolkit.py",
     "parser.py",
     "gui.py",
@@ -33,7 +35,7 @@ Browse files, live-teleport rooms, launch a patched game, and edit saves.
 Buttons:
   Enable live patches — debug Load (L) + safe dogcheck disable
   Launch Undertale — force-start UNDERTALE.exe with current data.win
-  Debug Toolkit — stats, inventory, fights (Home battlegroup)
+  Debug Toolkit — stats, inventory, fights, Ruins reset, room chaos, rare mode
   Restore data.win — undo patches if the game will not start
 
 Windows: pip install Pillow customtkinter
@@ -45,7 +47,9 @@ from __future__ import annotations
 import argparse
 import ctypes
 import io
+import json
 import os
+import random
 import re
 import shutil
 import struct
@@ -70,7 +74,7 @@ except ImportError:
     input("Press Enter to exit...")
     raise SystemExit(1)
 
-__version__ = "1.6.0"
+__version__ = "1.7.0"
 
 '''
 
@@ -112,9 +116,9 @@ if __name__ == "__main__":
 
 SKIP_LINE = re.compile(
     r"^(from __future__ import .*|"
-    r"from \.(assets|binary|teleport|dogcheck|live_teleport|launcher|save_editor|battles|toolkit|parser|gui) import [^(].*|"
-    r"import (os|re|io|sys|struct|shutil|tempfile|threading|time|ctypes|tkinter|subprocess)( as .*)?|"
-    r"from (pathlib|dataclasses|enum|collections\.abc|ctypes|tkinter) import .*|"
+    r"from \.(assets|binary|teleport|dogcheck|live_teleport|memory_patch|launcher|save_editor|battles|chaos|toolkit|parser|gui) import [^(].*|"
+    r"import (os|re|io|sys|struct|shutil|tempfile|threading|time|ctypes|tkinter|subprocess|json|random)( as .*)?|"
+    r"from (pathlib|dataclasses|enum|collections\.abc|ctypes|tkinter|typing) import .*|"
     r"from PIL import .*|"
     r"import customtkinter as ctk|"
     r"from ctypes import wintypes)$"

@@ -7,7 +7,13 @@ from tkinter import messagebox
 
 import customtkinter as ctk
 
-from .battles import BATTLEGROUPS, start_fight
+from .battles import BATTLEGROUPS, RARE_BATTLEGROUPS, start_fight, start_random_rare_fight
+from .chaos import (
+    live_ruins_reset,
+    rare_mode_enabled,
+    randomize_room_gotos,
+    set_rare_encounters,
+)
 from .dogcheck import disable_dogcheck, dogcheck_likely_disabled
 from .launcher import launch_undertale
 from .live_teleport import enable_debug_mode, undertale_is_running
@@ -44,14 +50,15 @@ class DebugToolkit(ctk.CTkToplevel):
     ):
         super().__init__(master)
         self.title("Undertale Debug Toolkit")
-        self.geometry("640x560")
-        self.minsize(560, 480)
+        self.geometry("680x620")
+        self.minsize(560, 520)
         self.configure(fg_color=COLORS["bg"])
         self.data_win = Path(data_win) if data_win else None
         self.save_dir = Path(save_dir) if save_dir else None
         self.on_status = on_status
         self._stats = PlayerStats()
         self._inv_vars: list[ctk.StringVar] = []
+        self.var_rare = ctk.BooleanVar(value=False)
 
         ctk.CTkLabel(
             self,
@@ -61,7 +68,7 @@ class DebugToolkit(ctk.CTkToplevel):
         ).pack(anchor="w", padx=16, pady=(14, 2))
         ctk.CTkLabel(
             self,
-            text="Launch the patched game, edit stats/items, start any fight (debug Home).",
+            text="Launch, edit stats/items, fights, Ruins reset, room chaos, rare encounters.",
             text_color=COLORS["muted"],
             font=ctk.CTkFont(size=12),
         ).pack(anchor="w", padx=16, pady=(0, 8))
@@ -92,11 +99,13 @@ class DebugToolkit(ctk.CTkToplevel):
         self.tabs.add("Stats")
         self.tabs.add("Items")
         self.tabs.add("Fights")
+        self.tabs.add("Chaos")
         self._build_stats_tab(self.tabs.tab("Stats"))
         self._build_items_tab(self.tabs.tab("Items"))
         self._build_fights_tab(self.tabs.tab("Fights"))
+        self._build_chaos_tab(self.tabs.tab("Chaos"))
 
-        self.status = ctk.CTkLabel(self, text="", text_color=COLORS["muted"], wraplength=600)
+        self.status = ctk.CTkLabel(self, text="", text_color=COLORS["muted"], wraplength=640)
         self.status.pack(anchor="w", padx=16, pady=(0, 12))
 
         self.after(100, self.reload_from_save)
@@ -182,6 +191,10 @@ class DebugToolkit(ctk.CTkToplevel):
             var.set(f"{iid}: {item_name(iid)}")
         self.var_weapon.set(f"{s.weapon}: {WEAPONS.get(s.weapon, item_name(s.weapon))}")
         self.var_armor.set(f"{s.armor}: {ARMORS.get(s.armor, item_name(s.armor))}")
+        try:
+            self.var_rare.set(rare_mode_enabled(self.save_dir))
+        except Exception:
+            pass
         self._say(f"Loaded save ({s.name}, LV {s.love}, room {s.room}).")
 
     def _build_stats_tab(self, tab) -> None:
@@ -350,9 +363,10 @@ class DebugToolkit(ctk.CTkToplevel):
     def _build_fights_tab(self, tab) -> None:
         ctk.CTkLabel(
             tab,
-            text="Requires debug mode. Sets the Home-key battlegroup, then presses Home.",
+            text="Requires debug mode. Patches the Home battlegroup on disk and in live "
+            "memory (fixes always-Mettaton), then sends Home.",
             text_color=COLORS["muted"],
-            wraplength=560,
+            wraplength=600,
         ).pack(anchor="w", padx=8, pady=6)
         self.fight_var = ctk.StringVar(
             value=f"{BATTLEGROUPS[0].id}: {BATTLEGROUPS[0].name}"
@@ -366,20 +380,30 @@ class DebugToolkit(ctk.CTkToplevel):
         ctk.CTkLabel(custom_row, text="Or id:").pack(side="left")
         self.custom_fight = ctk.StringVar()
         ctk.CTkEntry(custom_row, textvariable=self.custom_fight, width=80).pack(side="left", padx=6)
+        btn_row = ctk.CTkFrame(tab, fg_color="transparent")
+        btn_row.pack(fill="x", padx=8, pady=12)
         ctk.CTkButton(
-            tab,
+            btn_row,
             text="Start Fight",
             command=self.do_start_fight,
             fg_color=COLORS["accent"],
             hover_color=COLORS["accent_hover"],
+            width=140,
+        ).pack(side="left", padx=(0, 8))
+        ctk.CTkButton(
+            btn_row,
+            text="Start rarest fight",
+            command=self.do_start_rare_fight,
+            fg_color=COLORS["ink"],
+            hover_color="#33302b",
             width=160,
-        ).pack(anchor="w", padx=8, pady=12)
+        ).pack(side="left")
         ctk.CTkLabel(
             tab,
-            text="Tip: if Undertale is already open, close it → Launch Patched Undertale "
-            "→ Continue → Start Fight (so the Home battlegroup patch is loaded).",
+            text="If live memory patch fails (permissions), close Undertale → Launch → "
+            "Continue → Start Fight. Rare list includes Glyde, So Sorry, Sans, amalgamates…",
             text_color=COLORS["muted"],
-            wraplength=560,
+            wraplength=600,
             justify="left",
         ).pack(anchor="w", padx=8, pady=4)
 
@@ -392,10 +416,144 @@ class DebugToolkit(ctk.CTkToplevel):
         except ValueError:
             messagebox.showerror("Bad id", "Enter a numeric battlegroup id.", parent=self)
             return
-        ok, msg = start_fight(bg, data_win=self.data_win, ensure_debug=True)
+        # When rare mode is on and user picked a non-rare, still honor explicit pick;
+        # rare preference is for the rare button / overworld helpers.
+        ok, msg = start_fight(
+            bg,
+            data_win=self.data_win,
+            ensure_debug=True,
+            save_folder=self.save_dir,
+        )
         if ok:
             self._say(msg)
             messagebox.showinfo("Fight", msg, parent=self)
         else:
             self._say(msg)
             messagebox.showwarning("Fight", msg, parent=self)
+
+    def do_start_rare_fight(self) -> None:
+        ok, msg = start_random_rare_fight(data_win=self.data_win, save_folder=self.save_dir)
+        if ok:
+            self._say(msg)
+            messagebox.showinfo("Rare fight", msg, parent=self)
+        else:
+            self._say(msg)
+            messagebox.showwarning("Rare fight", msg, parent=self)
+
+    def _build_chaos_tab(self, tab) -> None:
+        ctk.CTkLabel(
+            tab,
+            text="Live Ruins reset and room chaos. Rare toggle boosts FUN and prefers rare fights.",
+            text_color=COLORS["muted"],
+            wraplength=600,
+        ).pack(anchor="w", padx=8, pady=6)
+
+        ctk.CTkButton(
+            tab,
+            text="Ruins reset (live)",
+            command=self.do_ruins_reset,
+            fg_color=COLORS["accent"],
+            hover_color=COLORS["accent_hover"],
+            width=220,
+        ).pack(anchor="w", padx=8, pady=8)
+        ctk.CTkLabel(
+            tab,
+            text="First Ruins SAVE (Entrance), LOVE 1 / HP 20 / EXP·gold·kills 0, Stick+Bandage. "
+            "Works while the game is open (writes save + L reload).",
+            text_color=COLORS["muted"],
+            wraplength=600,
+            justify="left",
+        ).pack(anchor="w", padx=8, pady=(0, 10))
+
+        ctk.CTkButton(
+            tab,
+            text="Randomize rooms",
+            command=self.do_randomize_rooms,
+            fg_color=COLORS["ink"],
+            hover_color="#33302b",
+            width=220,
+        ).pack(anchor="w", padx=8, pady=8)
+        ctk.CTkLabel(
+            tab,
+            text="Shuffles door destinations among playable rooms (skips text/intro/credit/"
+            "battle/shop rooms). Backs up data.win.roomchaosbak — restart Undertale after.",
+            text_color=COLORS["muted"],
+            wraplength=600,
+            justify="left",
+        ).pack(anchor="w", padx=8, pady=(0, 10))
+
+        try:
+            self.var_rare.set(rare_mode_enabled(self.save_dir))
+        except Exception:
+            self.var_rare.set(False)
+        ctk.CTkCheckBox(
+            tab,
+            text="Guarantee rarest encounters",
+            variable=self.var_rare,
+            command=self.do_toggle_rare,
+            text_color=COLORS["ink"],
+        ).pack(anchor="w", padx=8, pady=8)
+        rare_names = ", ".join(b.name for b in RARE_BATTLEGROUPS[:6]) + "…"
+        ctk.CTkLabel(
+            tab,
+            text=f"Sets FUN=90, keeps a rare-mode flag, and unlocks rare fight helpers "
+            f"({rare_names}). Toggle again to turn off.",
+            text_color=COLORS["muted"],
+            wraplength=600,
+            justify="left",
+        ).pack(anchor="w", padx=8, pady=(0, 8))
+
+    def do_ruins_reset(self) -> None:
+        if not messagebox.askyesno(
+            "Ruins reset",
+            "Reset stats to defaults and jump to the first Ruins SAVE while the game stays open?",
+            parent=self,
+        ):
+            return
+        ok, msg = live_ruins_reset(save_folder=self.save_dir, data_win=self.data_win)
+        self._say(msg)
+        if ok:
+            self.reload_from_save()
+            messagebox.showinfo("Ruins reset", msg, parent=self)
+        else:
+            messagebox.showerror("Ruins reset", msg, parent=self)
+
+    def do_randomize_rooms(self) -> None:
+        if not self.data_win or not self.data_win.is_file():
+            messagebox.showinfo("No game", "Open your Undertale folder first.", parent=self)
+            return
+        if undertale_is_running():
+            if not messagebox.askyesno(
+                "Undertale is running",
+                "Room chaos patches data.win on disk. Close Undertale after this and relaunch "
+                "so the shuffle loads. Continue?",
+                parent=self,
+            ):
+                return
+        elif not messagebox.askyesno(
+            "Randomize rooms",
+            "Rewrite room transitions in data.win (backup created). Continue?",
+            parent=self,
+        ):
+            return
+        ok, msg, _mapping = randomize_room_gotos(self.data_win, backup=True)
+        self._say(msg)
+        if ok:
+            messagebox.showinfo("Room chaos", msg, parent=self)
+        else:
+            messagebox.showerror("Room chaos", msg, parent=self)
+
+    def do_toggle_rare(self) -> None:
+        enabled = bool(self.var_rare.get())
+        ok, msg = set_rare_encounters(
+            enabled,
+            save_folder=self.save_dir,
+            data_win=self.data_win,
+            live_reload=True,
+        )
+        self._say(msg)
+        if not ok:
+            messagebox.showerror("Rare mode", msg, parent=self)
+            self.var_rare.set(not enabled)
+        else:
+            messagebox.showinfo("Rare mode", msg, parent=self)
