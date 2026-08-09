@@ -401,9 +401,10 @@ class DebugToolkit(ctk.CTkToplevel):
         ).pack(side="left")
         ctk.CTkLabel(
             tab,
-            text="If the last fight glitched (wrong enemy / broken text): close Undertale → "
-            "Restore data.win (or Steam Verify) → Enable live patches → Launch → Start Fight. "
-            "Patches only the Home-key battlegroup next to vk_home (no memory spray).",
+            text="If the last fight was Mettaton/glitched: close Undertale → Restore data.win "
+            "(or Steam Verify) → Enable live patches → Launch → overworld → Start Fight. "
+            "Home fight patches obj_mainchara KeyPress_36 (battlegroup = 57+nnn). "
+            "Stay in the overworld. Do not spam the 5 key (that shifts the id).",
             text_color=COLORS["muted"],
             wraplength=600,
             justify="left",
