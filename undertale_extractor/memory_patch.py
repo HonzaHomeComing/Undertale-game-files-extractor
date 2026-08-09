@@ -197,14 +197,10 @@ def replace_u32_pattern_in_process(
     old_word: int,
     new_word: int,
     *,
-    max_replacements: int = 32,
+    max_replacements: int = 8,
     max_addr: int = 0x7FFFFFFF,
 ) -> int:
-    """
-    Replace little-endian uint32 words in committed memory.
-    Used to patch PushI immediates / raw battlegroup constants that GameMaker
-    may have copied out of the data.win mapping into a bytecode buffer.
-    """
+    """Replace little-endian uint32 words in committed memory (use sparingly)."""
     if old_word == new_word:
         return 0
     needle = struct.pack("<I", old_word & 0xFFFFFFFF)
@@ -212,59 +208,67 @@ def replace_u32_pattern_in_process(
     handle = _open_process(pid)
     replaced = 0
     try:
-        mbi = MEMORY_BASIC_INFORMATION()
-        address = 0
-        while address < max_addr and replaced < max_replacements:
-            result = kernel32.VirtualQueryEx(
-                handle,
-                ctypes.c_void_p(address),
-                ctypes.byref(mbi),
-                ctypes.sizeof(mbi),
-            )
-            if not result:
+        for base, data in iter_process_memory(handle, max_addr=max_addr):
+            idx = 0
+            while replaced < max_replacements:
+                found = data.find(needle, idx)
+                if found < 0:
+                    break
+                try:
+                    _write(handle, base + found, replacement)
+                    replaced += 1
+                except RuntimeError:
+                    pass
+                idx = found + 1
+            if replaced >= max_replacements:
                 break
-            base = int(mbi.BaseAddress or 0)
-            size = int(mbi.RegionSize or 0)
-            if size <= 0:
-                break
-            protect = int(mbi.Protect)
-            readable = (
-                int(mbi.State) == MEM_COMMIT
-                and not (protect & PAGE_NOACCESS)
-                and not (protect & PAGE_GUARD)
-                and size >= 4
-            )
-            if readable:
-                offset = 0
-                while offset < size and replaced < max_replacements:
-                    piece = min(1 * 1024 * 1024, size - offset)
-                    data = _read(handle, base + offset, piece)
-                    if data:
-                        idx = 0
-                        while True:
-                            found = data.find(needle, idx)
-                            if found < 0:
-                                break
-                            abs_addr = base + offset + found
-                            try:
-                                _write(handle, abs_addr, replacement)
-                                replaced += 1
-                                if replaced >= max_replacements:
-                                    break
-                            except RuntimeError:
-                                pass
-                            idx = found + 1
-                    next_off = offset + piece
-                    if next_off < size:
-                        next_off = max(0, next_off - 3)
-                    offset = next_off if next_off > offset else offset + piece
-            next_addr = base + size
-            if next_addr <= address:
-                break
-            address = next_addr
     finally:
         kernel32.CloseHandle(handle)
     return replaced
+
+
+def iter_process_memory(handle, *, max_addr: int = 0x7FFFFFFF):
+    """Yield (base_address, bytes) for committed readable regions."""
+    mbi = MEMORY_BASIC_INFORMATION()
+    address = 0
+    while address < max_addr:
+        result = kernel32.VirtualQueryEx(
+            handle,
+            ctypes.c_void_p(address),
+            ctypes.byref(mbi),
+            ctypes.sizeof(mbi),
+        )
+        if not result:
+            break
+        base = int(mbi.BaseAddress or 0)
+        size = int(mbi.RegionSize or 0)
+        if size <= 0:
+            break
+        protect = int(mbi.Protect)
+        readable = (
+            int(mbi.State) == MEM_COMMIT
+            and not (protect & PAGE_NOACCESS)
+            and not (protect & PAGE_GUARD)
+            and size >= 4
+        )
+        if readable:
+            # Cap huge regions into chunks
+            offset = 0
+            while offset < size:
+                piece = min(2 * 1024 * 1024, size - offset)
+                data = _read(handle, base + offset, piece)
+                if data:
+                    yield base + offset, data
+                offset += piece
+        next_addr = base + size
+        if next_addr <= address:
+            break
+        address = next_addr
+
+
+def replace_pattern_in_process(*_a, **_k):
+    """Deprecated alias placeholder."""
+    return 0
 
 
 from .live_teleport import find_undertale_pid, is_windows

@@ -401,8 +401,9 @@ class DebugToolkit(ctk.CTkToplevel):
         ).pack(side="left")
         ctk.CTkLabel(
             tab,
-            text="If live memory patch fails (permissions), close Undertale → Launch → "
-            "Continue → Start Fight. Rare list includes Glyde, So Sorry, Sans, amalgamates…",
+            text="If the last fight glitched (wrong enemy / broken text): close Undertale → "
+            "Restore data.win (or Steam Verify) → Enable live patches → Launch → Start Fight. "
+            "Patches only the Home-key battlegroup next to vk_home (no memory spray).",
             text_color=COLORS["muted"],
             wraplength=600,
             justify="left",
