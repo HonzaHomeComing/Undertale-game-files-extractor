@@ -601,9 +601,9 @@ class UndertaleExtractorApp(ctk.CTk):
         ok = messagebox.askokcancel(
             "Restore data.win?",
             "Replace data.win with the extractor backup "
-            "(data.win.dogcheckbak / data.win.debugbak).\n\n"
-            "Use this if Undertale crashes on L with a dogcheck error, "
-            "or will not start after patching.",
+            "(prefers data.win.roomchaosbak, then rarebak / dogcheckbak / debugbak).\n\n"
+            "Use this if Undertale crashes on boot (Code Error / ossafe_file_text_eof), "
+            "crashes on L with a dogcheck error, or will not start after patching.",
         )
         if not ok:
             return

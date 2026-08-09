@@ -57,7 +57,16 @@ DOGCHECK_ROOM_RANGES: tuple[tuple[int, int], ...] = (
     (266, 335),
 )
 
-BACKUP_SUFFIXES = (".dogcheckbak", ".debugbak", ".bak")
+# Prefer chaos/rare backups first — those patches can brick boot if they
+# rewrote unrelated bytecode; dogcheck/debug backups are older fallbacks.
+BACKUP_SUFFIXES = (
+    ".roomchaosbak",
+    ".rarebak",
+    ".dogcheckbak",
+    ".debugbak",
+    ".battlebak",
+    ".bak",
+)
 
 # Opcodes that look like real GML bytecode starts (not metadata).
 _CODE_START_OPS = frozenset(
