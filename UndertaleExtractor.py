@@ -6,7 +6,7 @@ Browse files, live-teleport rooms, launch a patched game, and edit saves.
 Buttons:
   Enable live patches — debug Load (L) + safe dogcheck disable
   Launch Undertale — force-start UNDERTALE.exe with current data.win
-  Debug Toolkit — stats, inventory, fights (Home battlegroup)
+  Debug Toolkit — stats, inventory, fights, Ruins reset, room chaos, rare mode
   Restore data.win — undo patches if the game will not start
 
 Windows: pip install Pillow customtkinter
@@ -18,7 +18,9 @@ from __future__ import annotations
 import argparse
 import ctypes
 import io
+import json
 import os
+import random
 import re
 import shutil
 import struct
@@ -43,14 +45,10 @@ except ImportError:
     input("Press Enter to exit...")
     raise SystemExit(1)
 
-__version__ = "1.6.0"
+__version__ = "1.7.0"
 
 
 # --- assets.py ---
-
-from typing import Callable
-
-
 
 class AssetKind(str, Enum):
     SPRITE = "Sprites"
@@ -1228,6 +1226,205 @@ def live_teleport_to_room(
     )
 
 
+# --- memory_patch.py ---
+
+PROCESS_VM_READ = 0x0010
+PROCESS_VM_WRITE = 0x0020
+PROCESS_VM_OPERATION = 0x0008
+PROCESS_QUERY_INFORMATION = 0x0400
+
+MEM_COMMIT = 0x1000
+PAGE_NOACCESS = 0x01
+PAGE_GUARD = 0x100
+
+kernel32 = ctypes.WinDLL("kernel32", use_last_error=True) if hasattr(ctypes, "WinDLL") else None
+
+
+class MEMORY_BASIC_INFORMATION(ctypes.Structure):
+    _fields_ = [
+        ("BaseAddress", ctypes.c_void_p),
+        ("AllocationBase", ctypes.c_void_p),
+        ("AllocationProtect", wintypes.DWORD),
+        ("RegionSize", ctypes.c_size_t),
+        ("State", wintypes.DWORD),
+        ("Protect", wintypes.DWORD),
+        ("Type", wintypes.DWORD),
+    ]
+
+
+def _open_process(pid: int):
+    if kernel32 is None:
+        raise RuntimeError("Memory patching requires Windows.")
+    access = (
+        PROCESS_VM_READ
+        | PROCESS_VM_WRITE
+        | PROCESS_VM_OPERATION
+        | PROCESS_QUERY_INFORMATION
+    )
+    handle = kernel32.OpenProcess(access, False, pid)
+    if not handle:
+        raise RuntimeError(
+            "Could not open Undertale process (try running as Administrator)."
+        )
+    return handle
+
+
+def _read(handle, address: int, size: int) -> bytes:
+    buf = (ctypes.c_char * size)()
+    read = ctypes.c_size_t(0)
+    ok = kernel32.ReadProcessMemory(
+        handle, ctypes.c_void_p(address), buf, size, ctypes.byref(read)
+    )
+    if not ok:
+        return b""
+    return bytes(buf[: read.value])
+
+
+def _write(handle, address: int, data: bytes) -> None:
+    written = ctypes.c_size_t(0)
+    ok = kernel32.WriteProcessMemory(
+        handle,
+        ctypes.c_void_p(address),
+        data,
+        len(data),
+        ctypes.byref(written),
+    )
+    if not ok or written.value != len(data):
+        raise RuntimeError("WriteProcessMemory failed (try Administrator).")
+
+
+def find_form_base(
+    handle,
+    *,
+    expected_size: int | None = None,
+    needle: bytes = b"FORM",
+    max_addr: int = 0x7FFFFFFF,
+) -> Optional[int]:
+    """Scan committed readable regions for a GameMaker FORM header."""
+    mbi = MEMORY_BASIC_INFORMATION()
+    address = 0
+    best: Optional[int] = None
+    while address < max_addr:
+        result = kernel32.VirtualQueryEx(
+            handle,
+            ctypes.c_void_p(address),
+            ctypes.byref(mbi),
+            ctypes.sizeof(mbi),
+        )
+        if not result:
+            break
+        base = int(mbi.BaseAddress or 0)
+        size = int(mbi.RegionSize or 0)
+        if size <= 0:
+            break
+        protect = int(mbi.Protect)
+        readable = (
+            int(mbi.State) == MEM_COMMIT
+            and not (protect & PAGE_NOACCESS)
+            and not (protect & PAGE_GUARD)
+            and size >= 16
+        )
+        if readable:
+            offset = 0
+            while offset < size:
+                piece = min(2 * 1024 * 1024, size - offset)
+                data = _read(handle, base + offset, piece)
+                if data:
+                    idx = data.find(needle)
+                    while idx != -1:
+                        abs_addr = base + offset + idx
+                        header = _read(handle, abs_addr, 8)
+                        if len(header) == 8 and header[:4] == b"FORM":
+                            declared = struct.unpack_from("<I", header, 4)[0]
+                            # data.win is typically multi-MB
+                            if 1_000_000 <= declared <= 200_000_000:
+                                if expected_size is not None:
+                                    # FORM size field is payload after header; file ≈ declared+8
+                                    if abs(declared + 8 - expected_size) <= 64:
+                                        return abs_addr
+                                    if best is None:
+                                        best = abs_addr
+                                else:
+                                    return abs_addr
+                        idx = data.find(needle, idx + 1)
+                next_off = offset + piece
+                if next_off < size:
+                    next_off = max(0, next_off - 3)  # overlap for split needle
+                offset = next_off if next_off > offset else offset + piece
+        next_addr = base + size
+        if next_addr <= address:
+            break
+        address = next_addr
+    return best
+
+
+def write_int32_in_running_game(
+    pid: int,
+    file_offset: int,
+    value: int,
+    *,
+    expected_size: int | None = None,
+    expected_old: int | None = None,
+) -> bool:
+    """Write a little-endian int32 at data.win file_offset inside the live process."""
+    handle = _open_process(pid)
+    try:
+        form = find_form_base(handle, expected_size=expected_size)
+        if form is None:
+            return False
+        addr = form + int(file_offset)
+        if expected_old is not None:
+            cur = _read(handle, addr, 4)
+            if len(cur) == 4:
+                got = struct.unpack("<i", cur)[0]
+                # Accept if already the new value, or matches expected old
+                if got != int(expected_old) and got != int(value):
+                    # Still try — disk may differ slightly from RAM after prior patches
+                    pass
+        payload = struct.pack("<i", int(value))
+        _write(handle, addr, payload)
+        return True
+    finally:
+        kernel32.CloseHandle(handle)
+
+
+
+
+def patch_int32_in_data_win_image(
+    data_win: str | Path,
+    file_offset: int,
+    value: int,
+    *,
+    expected_old: int | None = None,
+) -> tuple[bool, str]:
+    """
+    Locate Undertale's loaded data.win FORM in memory and write an int32 at file_offset.
+    Returns (ok, detail).
+    """
+    if not is_windows():
+        return False, "Windows only"
+    pid = find_undertale_pid()
+    if not pid:
+        return False, "Undertale not running"
+    path = Path(data_win)
+    if not path.is_file():
+        return False, "data.win missing"
+    size = path.stat().st_size
+    try:
+        ok = write_int32_in_running_game(
+            pid,
+            file_offset,
+            value,
+            expected_size=size,
+            expected_old=expected_old,
+        )
+    except RuntimeError as exc:
+        return False, str(exc)
+    if ok:
+        return True, f"wrote {value} @ 0x{file_offset:X}"
+    return False, "FORM image not found in process memory"
+
+
 # --- launcher.py ---
 
 EXE_NAMES = ("UNDERTALE.exe", "Undertale.exe", "undertale.exe")
@@ -1552,9 +1749,9 @@ VK_HOME = 0x24
 class Battlegroup:
     id: int
     name: str
+    rare: bool = False
 
 
-# Curated list — major encounters + notable groups (from scr_battlegroup).
 BATTLEGROUPS: tuple[Battlegroup, ...] = (
     Battlegroup(2, "Dummy"),
     Battlegroup(3, "Fake Froggit"),
@@ -1592,33 +1789,28 @@ BATTLEGROUPS: tuple[Battlegroup, ...] = (
     Battlegroup(76, "Royal Guards (alt)"),
     Battlegroup(80, "Mettaton (third)"),
     Battlegroup(81, "Mettaton EX"),
-    Battlegroup(82, "Lemon Bread"),
-    Battlegroup(83, "Reaper Bird"),
-    Battlegroup(84, "Snowdrake's Mother"),
-    Battlegroup(85, "Memoryheads"),
-    Battlegroup(86, "Endogeny"),
+    Battlegroup(82, "Lemon Bread", rare=True),
+    Battlegroup(83, "Reaper Bird", rare=True),
+    Battlegroup(84, "Snowdrake's Mother", rare=True),
+    Battlegroup(85, "Memoryheads", rare=True),
+    Battlegroup(86, "Endogeny", rare=True),
     Battlegroup(91, "Monster Kid"),
-    Battlegroup(92, "Undyne the Undying"),
+    Battlegroup(92, "Undyne the Undying", rare=True),
     Battlegroup(93, "Glad Dummy"),
-    Battlegroup(94, "Mettaton NEO"),
-    Battlegroup(95, "Sans"),
+    Battlegroup(94, "Mettaton NEO", rare=True),
+    Battlegroup(95, "Sans", rare=True),
     Battlegroup(100, "Asgore (intro)"),
     Battlegroup(101, "Asgore"),
-    Battlegroup(135, "Glyde"),
-    Battlegroup(140, "So Sorry"),
-    Battlegroup(255, "Asriel"),
-    Battlegroup(256, "Asriel (final)"),
+    Battlegroup(135, "Glyde", rare=True),
+    Battlegroup(140, "So Sorry", rare=True),
+    Battlegroup(255, "Asriel", rare=True),
+    Battlegroup(256, "Asriel (final)", rare=True),
 )
+
+RARE_BATTLEGROUPS = tuple(b for b in BATTLEGROUPS if b.rare)
 
 
 def set_home_battlegroup(data_win: str | Path, battlegroup_id: int, *, backup: bool = True) -> tuple[bool, str]:
-    """
-    Write the debug Home-key battlegroup id into data.win at known offsets.
-    Close Undertale before calling for a reliable write; if the game is already
-    running with debug on, the in-memory value may not update until restart —
-    but sending Home still uses whatever is loaded. Prefer set-then-restart, or
-    set while closed then Launch.
-    """
     if battlegroup_id < 0 or battlegroup_id > 1000:
         return False, "Battlegroup id must be between 0 and 1000."
     path = Path(data_win)
@@ -1628,8 +1820,8 @@ def set_home_battlegroup(data_win: str | Path, battlegroup_id: int, *, backup: b
         if offset + 4 > len(data):
             continue
         current = struct.unpack_from("<I", data, offset)[0]
-        # Only patch if it already looks like a battlegroup slot (0..400).
-        if current > 400:
+        # Accept common defaults (incl. Mettaton 80 / 57 / So Sorry 140).
+        if current > 400 and current != battlegroup_id:
             continue
         if current == battlegroup_id:
             wrote.append(f"0x{offset:X}=already")
@@ -1637,21 +1829,40 @@ def set_home_battlegroup(data_win: str | Path, battlegroup_id: int, *, backup: b
         if backup:
             bak = path.with_suffix(path.suffix + ".battlebak")
             if not bak.exists():
-                bak.write_bytes(path.read_bytes())
+                bak.write_bytes(bytes(data))
         struct.pack_into("<I", data, offset, int(battlegroup_id))
         wrote.append(f"0x{offset:X}")
     if not wrote:
         return (
             False,
-            "Could not find a Home battlegroup slot in this data.win.\n"
-            "Enable live patches (debug), or set the fight in UndertaleModTool.",
+            "Could not find a Home battlegroup slot in this data.win.",
         )
     path.write_bytes(data)
-    return True, f"Home battlegroup set to {battlegroup_id} ({', '.join(wrote)})."
+    return True, f"Home battlegroup set to {battlegroup_id} on disk ({', '.join(wrote)})."
+
+
+def set_home_battlegroup_live(data_win: str | Path, battlegroup_id: int) -> tuple[bool, str]:
+    """Patch the Home battlegroup inside the running game's loaded data.win image."""
+    path = Path(data_win)
+    raw = path.read_bytes()
+    notes = []
+    any_ok = False
+    for offset in HOME_BATTLEGROUP_OFFSETS:
+        if offset + 4 > len(raw):
+            continue
+        current = struct.unpack_from("<I", raw, offset)[0]
+        if current > 400:
+            continue
+        ok, msg = patch_int32_in_data_win_image(path, offset, battlegroup_id, expected_old=current)
+        notes.append(f"0x{offset:X}:{msg}")
+        if ok:
+            any_ok = True
+    if any_ok:
+        return True, "Live memory patched (" + "; ".join(notes) + ")."
+    return False, "Live memory patch failed (" + "; ".join(notes) + ")."
 
 
 def trigger_home_fight() -> tuple[bool, str]:
-    """Focus Undertale and press Home to start the current battlegroup fight."""
     if not undertale_is_running():
         return False, "Undertale is not running. Launch it first, load a save, then start the fight."
     if not find_undertale_hwnd():
@@ -1667,44 +1878,462 @@ def start_fight(
     *,
     data_win: str | Path | None = None,
     ensure_debug: bool = True,
+    save_folder: str | Path | None = None,
+    prefer_rare_if_enabled: bool = False,
 ) -> tuple[bool, str]:
     """
-    Set Home battlegroup (if data_win given) and trigger the fight.
-    If Undertale is running, data.win writes may not apply until restart —
-    we still try Home with the currently loaded debug battlegroup, and tell
-    the user to relaunch if needed.
+    Set Home battlegroup and trigger the fight.
+    Always writes data.win; if the game is running, also patches memory so the
+    selection applies immediately (fixes always-Mettaton bug).
     """
-    notes = []
-    if data_win and Path(data_win).is_file():
-        if ensure_debug and not debug_flag_enabled(data_win):
-            try:
-                if not undertale_is_running():
-                    enable_debug_mode(data_win, backup=True)
-                    notes.append("enabled debug")
-            except Exception as exc:
-                notes.append(f"debug failed: {exc}")
-        if undertale_is_running():
-            notes.append(
-                "Undertale is open — Home battlegroup patch needs a restart to take effect. "
-                "Close the game, click Launch Patched Undertale, load a save, then Start Fight again."
-            )
-            # Still try Home in case the value was already set from a previous launch.
-        else:
-            ok, msg = set_home_battlegroup(data_win, battlegroup_id, backup=True)
-            notes.append(msg)
-            if not ok:
-                return False, " | ".join(notes)
+    notes: list[str] = []
+    if not data_win or not Path(data_win).is_file():
+        return False, "Open your Undertale folder (data.win) first."
 
-    if not undertale_is_running():
-        return (
-            False,
-            "Battlegroup saved. Launch Undertale, load your save, then click Start Fight "
-            "(or press Home in-game).\n" + " | ".join(notes),
-        )
+    if prefer_rare_if_enabled:
 
-    ok, msg = trigger_home_fight()
+        if rare_mode_enabled(save_folder):
+            rare_ids = {b.id for b in RARE_BATTLEGROUPS}
+            if battlegroup_id not in rare_ids and RARE_BATTLEGROUPS:
+                battlegroup_id = RARE_BATTLEGROUPS[0].id
+                notes.append(f"rare mode → battlegroup {battlegroup_id}")
+
+    if ensure_debug and not debug_flag_enabled(data_win):
+        try:
+            if not undertale_is_running():
+                enable_debug_mode(data_win, backup=True)
+                notes.append("enabled debug")
+            else:
+                notes.append("debug flag off on disk — relaunch after Enable live patches")
+        except Exception as exc:
+            notes.append(f"debug failed: {exc}")
+
+    ok, msg = set_home_battlegroup(data_win, battlegroup_id, backup=True)
     notes.append(msg)
-    return ok, " | ".join(notes)
+    if not ok:
+        return False, " | ".join(notes)
+
+    if undertale_is_running():
+        live_ok, live_msg = set_home_battlegroup_live(data_win, battlegroup_id)
+        notes.append(live_msg)
+        if not live_ok:
+            notes.append(
+                "Could not patch the live game — close Undertale, Launch again, "
+                "then Start Fight (disk patch is ready)."
+            )
+            return False, " | ".join(notes)
+        ok2, msg2 = trigger_home_fight()
+        notes.append(msg2)
+        return ok2, " | ".join(notes)
+
+    return (
+        False,
+        "Battlegroup saved to data.win. Launch Undertale, load your save, then Start Fight "
+        "(or press Home).\n" + " | ".join(notes),
+    )
+
+
+def start_random_rare_fight(
+    *,
+    data_win: str | Path | None = None,
+    save_folder: str | Path | None = None,
+) -> tuple[bool, str]:
+    """Start a fight from the rare battlegroup list."""
+
+    if not RARE_BATTLEGROUPS:
+        return False, "No rare battlegroups configured."
+    bg = random.choice(RARE_BATTLEGROUPS)
+    ok, msg = start_fight(bg.id, data_win=data_win, save_folder=save_folder)
+    return ok, f"{bg.name} ({bg.id}): {msg}"
+
+
+# --- chaos.py ---
+
+# First SAVE point in the Ruins (Entrance).
+RUINS_FIRST_SAVE_ROOM = 6  # room_ruins1 — "Ruins - Entrance"
+# Leaf Pile (first encounter SAVE) as alternate.
+RUINS_LEAF_PILE_ROOM = 12
+
+# file0 line 36 (1-based) = fun value
+LINE_FUN = 35
+
+OP_PUSHI = 0x84
+OP_PUSH = 0xC0
+OP_CALL_V15 = 0xD9
+OP_CALL_V14 = 0xDA
+
+# Room name substrings that should NOT be chaos destinations / door targets.
+_TEXT_ROOM_MARKERS = (
+    "intro",
+    "story",
+    "credit",
+    "ending",
+    "end_",
+    "gameover",
+    "battle",
+    "battlegroup",
+    "menu",
+    "name",
+    "gaster",
+    "dogcheck",
+    "of_dog",
+    "room_of_dog",
+    "shop",  # keep shops stable
+    "phone",
+    "writer",
+    "dialog",
+    "text",
+    "savepoint",  # not real rooms
+    "area0",
+    "nothing",
+    "blank",
+    "test",
+    "flowey_defeat",
+    "sansemail",
+)
+
+
+def _is_text_or_special_room(name: str) -> bool:
+    low = name.lower()
+    return any(m in low for m in _TEXT_ROOM_MARKERS)
+
+
+def list_rooms_from_data_win(data_win: str | Path) -> list[tuple[int, str]]:
+    """Return (room_id, name) for all ROOM entries."""
+    path = Path(data_win)
+    reader = BinaryReader.from_path(path)
+    reader.seek(0)
+    if reader.read_tag() != "FORM":
+        return []
+    form_size = reader.read_u32()
+    form_end = reader.position + form_size
+    room_start = None
+    while reader.position + 8 <= form_end:
+        tag = reader.read_tag()
+        size = reader.read_u32()
+        start = reader.position
+        if tag == "ROOM":
+            room_start = start
+        reader.seek(start + size)
+    if room_start is None:
+        return []
+    reader.seek(room_start)
+    count = reader.read_u32()
+    if count <= 0 or count > 50_000:
+        return []
+    offsets = [reader.read_u32() for _ in range(count)]
+    rooms: list[tuple[int, str]] = []
+    for index, off in enumerate(offsets):
+        try:
+            reader.seek(off)
+            name = reader.read_offset_string() or f"room_{index}"
+        except Exception:
+            name = f"room_{index}"
+        rooms.append((index, name))
+    return rooms
+
+
+def playable_room_ids(data_win: str | Path) -> list[int]:
+    return [rid for rid, name in list_rooms_from_data_win(data_win) if not _is_text_or_special_room(name)]
+
+
+def fresh_ruins_stats(name: str = "CHARA") -> PlayerStats:
+    """Default / zeroed new-game-ish stats at Ruins start."""
+    return PlayerStats(
+        name=name or "CHARA",
+        love=1,
+        hp=20,
+        max_hp=20,
+        at=10,
+        weapon_at=0,
+        df=10,
+        armor_df=0,
+        exp=0,
+        gold=0,
+        kills=0,
+        inventory=[0] * 8,
+        weapon=3,  # Stick
+        armor=4,  # Bandage
+        room=RUINS_FIRST_SAVE_ROOM,
+    )
+
+
+def live_ruins_reset(
+    *,
+    save_folder: str | Path | None = None,
+    data_win: str | Path | None = None,
+    room_id: int = RUINS_FIRST_SAVE_ROOM,
+) -> tuple[bool, str]:
+    """
+    Reset stats to defaults, move to first Ruins SAVE, and live-reload (L) if running.
+    """
+    try:
+        current = read_player_stats(save_folder)
+        name = current.name or "CHARA"
+    except Exception:
+        name = "CHARA"
+    stats = fresh_ruins_stats(name)
+    stats.room = room_id
+    path = write_player_stats(stats, save_folder, backup=True)
+    # Also set room line / ini via teleport helper
+    teleport_to_room(room_id, save_folder, backup=False)
+
+    if undertale_is_running() and data_win:
+        result, _ = live_teleport_to_room(room_id, save_folder=save_folder, data_win=data_win)
+        if result.ok:
+            return True, f"Live reset → Ruins SAVE (room {room_id}), stats cleared. ({path})"
+        return True, (
+            f"Save reset → Ruins room {room_id}, stats cleared ({path}). "
+            f"Live reload: {result.detail}"
+        )
+    return True, (
+        f"Save reset → Ruins room {room_id}, stats cleared ({path}). "
+        "Start Undertale / press Continue (or L with debug)."
+    )
+
+
+def _opcode(word: int) -> int:
+    return (word >> 24) & 0xFF
+
+
+def randomize_room_gotos(
+    data_win: str | Path,
+    *,
+    seed: int | None = None,
+    backup: bool = True,
+) -> tuple[bool, str, dict[int, int]]:
+    """
+    Shuffle room_goto destinations among playable (non-text) rooms by rewriting
+    PushI immediates that look like room ids and sit just before a Call.
+    """
+    path = Path(data_win)
+    playable = playable_room_ids(path)
+    if len(playable) < 10:
+        return False, "Not enough playable rooms found to shuffle.", {}
+
+    rng = random.Random(seed)
+    shuffled = playable[:]
+    rng.shuffle(shuffled)
+    mapping = {old: new for old, new in zip(playable, shuffled)}
+    # Avoid fixed points a bit
+    for _ in range(3):
+        fixed = [a for a, b in mapping.items() if a == b]
+        if len(fixed) < 2:
+            break
+        rng.shuffle(fixed)
+        for i in range(0, len(fixed) - 1, 2):
+            a, b = fixed[i], fixed[i + 1]
+            mapping[a], mapping[b] = mapping[b], mapping[a]
+
+    raw = bytearray(path.read_bytes())
+    reader = BinaryReader(bytes(raw))
+    # Walk CODE entries' bytecode and rewrite pushi room ids before calls
+    changed = 0
+    for _name, bc_off, length in _find_code_entries(reader):
+        pos = 0
+        while pos + 8 <= length:
+            word = struct.unpack_from("<I", raw, bc_off + pos)[0]
+            op = _opcode(word)
+            # PushI (v15) with room id in low 16 bits
+            if op == OP_PUSHI:
+                value = word & 0xFFFF
+                if value in mapping:
+                    # Look ahead for Call within next 3 instructions
+                    ahead = pos + 4
+                    found_call = False
+                    for _ in range(3):
+                        if ahead + 4 > length:
+                            break
+                        w2 = struct.unpack_from("<I", raw, bc_off + ahead)[0]
+                        op2 = _opcode(w2)
+                        if op2 in (OP_CALL_V15, OP_CALL_V14):
+                            found_call = True
+                            break
+                        # skip typical 1-word ops; pop/call may be 2 words
+                        if op2 in (0x45, 0x41, OP_CALL_V15, OP_CALL_V14):
+                            ahead += 8
+                        else:
+                            ahead += 4
+                    if found_call:
+                        new_val = mapping[value]
+                        new_word = (word & 0xFFFF0000) | (new_val & 0xFFFF)
+                        struct.pack_into("<I", raw, bc_off + pos, new_word)
+                        changed += 1
+                pos += 4
+                continue
+            if op in (0x45, 0x41):  # Pop 2 words
+                pos += 8
+                continue
+            if op in (OP_CALL_V15, OP_CALL_V14):
+                pos += 8
+                continue
+            pos += 4
+
+    if changed == 0:
+        return False, "No room_goto-style PushI sites found to rewrite.", mapping
+
+    if backup:
+        bak = path.with_suffix(path.suffix + ".roomchaosbak")
+        if not bak.exists():
+            bak.write_bytes(path.read_bytes())
+    path.write_bytes(raw)
+
+    meta = path.with_suffix(path.suffix + ".roomchaos.json")
+    meta.write_text(json.dumps({str(k): v for k, v in mapping.items()}, indent=2), encoding="utf-8")
+    return (
+        True,
+        f"Randomized {changed} room transitions among {len(playable)} playable rooms "
+        f"(excluded text/cutscene rooms). Restart Undertale to load. Backup: data.win.roomchaosbak",
+        mapping,
+    )
+
+
+def _force_rare_chance_pushes(data_win: str | Path, *, backup: bool = True) -> tuple[int, str]:
+    """
+    Bump small chance immediates that sit near rare battlegroup PushIs to 100,
+    so rare fights win RNG checks more reliably.
+    """
+
+    rare_ids = {b.id for b in RARE_BATTLEGROUPS}
+    path = Path(data_win)
+    if not path.is_file():
+        return 0, "no data.win"
+    raw = bytearray(path.read_bytes())
+    reader = BinaryReader(bytes(raw))
+
+    changed = 0
+    for _name, bc_off, length in _find_code_entries(reader):
+        # Collect PushI sites in this script
+        sites: list[tuple[int, int]] = []  # (pos, value)
+        pos = 0
+        while pos + 4 <= length:
+            word = struct.unpack_from("<I", raw, bc_off + pos)[0]
+            op = _opcode(word)
+            if op == OP_PUSHI:
+                sites.append((pos, word & 0xFFFF))
+                pos += 4
+                continue
+            if op in (0x45, 0x41, OP_CALL_V15, OP_CALL_V14):
+                pos += 8
+                continue
+            pos += 4
+        for i, (pos_i, val_i) in enumerate(sites):
+            if val_i not in rare_ids:
+                continue
+            # Look backward for a small chance PushI (1..50) within ~12 instructions
+            for j in range(i - 1, max(-1, i - 12), -1):
+                pos_j, val_j = sites[j]
+                if 1 <= val_j <= 50:
+                    new_word = (struct.unpack_from("<I", raw, bc_off + pos_j)[0] & 0xFFFF0000) | 100
+                    struct.pack_into("<I", raw, bc_off + pos_j, new_word)
+                    changed += 1
+                    break
+    if changed:
+        if backup:
+            bak = path.with_suffix(path.suffix + ".rarebak")
+            if not bak.exists():
+                bak.write_bytes(path.read_bytes())
+        path.write_bytes(raw)
+    return changed, f"bumped {changed} rare-chance PushI(s)"
+
+
+def set_rare_encounters(
+    enabled: bool,
+    *,
+    save_folder: str | Path | None = None,
+    data_win: str | Path | None = None,
+    live_reload: bool = True,
+) -> tuple[bool, str]:
+    """
+    Toggle 'guarantee rare encounters' helpers:
+    - Sets FUN high enough for rare overworld events
+    - Stores a sidecar flag the toolkit uses to prefer rare fights
+    - When enabling with data.win, bumps rare encounter chance immediates toward 100
+    - When enabled live, reloads save with L
+    """
+    info = read_save_info(save_folder)
+    lines = info.file0.read_text(encoding="utf-8", errors="replace").splitlines()
+    while len(lines) <= max(LINE_FUN, ROOM_LINE_INDEX):
+        lines.append("0")
+
+    flag_path = info.folder / "extractor_rare_mode.json"
+    extras: list[str] = []
+    if enabled:
+        # FUN values that unlock rare phone / fun events (community lists use 56–90+)
+        lines[LINE_FUN] = "90"
+        flag_path.write_text(json.dumps({"rare": True, "fun": 90}), encoding="utf-8")
+        note = "Rare mode ON (FUN=90). Rare fights preferred; fun events boosted."
+        if data_win and Path(data_win).is_file():
+            try:
+
+                if not undertale_is_running():
+                    n, detail = _force_rare_chance_pushes(data_win, backup=True)
+                    extras.append(detail)
+                    # Default Home to first rare so debug Home is rare-ready
+
+                    if RARE_BATTLEGROUPS:
+                        ok_bg, msg_bg = set_home_battlegroup(
+                            data_win, RARE_BATTLEGROUPS[0].id, backup=True
+                        )
+                        extras.append(msg_bg if ok_bg else f"home bg: {msg_bg}")
+                else:
+                    extras.append(
+                        "close game + toggle again to patch rare chances in data.win"
+                    )
+            except Exception as exc:
+                extras.append(f"rare patch skipped: {exc}")
+    else:
+        lines[LINE_FUN] = "0"
+        if flag_path.exists():
+            flag_path.unlink()
+        note = "Rare mode OFF (FUN=0)."
+        # Restore rarebak if present
+        if data_win:
+            path = Path(data_win)
+            bak = path.with_suffix(path.suffix + ".rarebak")
+            if bak.is_file() and not undertale_is_running():
+                try:
+                    path.write_bytes(bak.read_bytes())
+                    extras.append("restored data.win.rarebak")
+                except Exception as exc:
+                    extras.append(f"restore failed: {exc}")
+
+    payload = "\n".join(lines)
+    if info.file0.read_bytes().endswith(b"\n"):
+        payload += "\n"
+    info.file0.write_text(payload, encoding="utf-8")
+    file9 = info.folder / "file9"
+    if file9.is_file():
+        file9.write_text(payload if payload.endswith("\n") else payload + "\n", encoding="utf-8")
+
+    if extras:
+        note = note + " " + "; ".join(extras)
+
+    if live_reload and undertale_is_running() and data_win:
+        room = None
+        try:
+            room = int(float(lines[ROOM_LINE_INDEX]))
+        except ValueError:
+            room = 6
+        result, _ = live_teleport_to_room(room, save_folder=save_folder, data_win=data_win)
+        if result.ok:
+            return True, note + " Live reloaded."
+        return True, note + f" (reload: {result.detail})"
+    return True, note
+
+
+def rare_mode_enabled(save_folder: str | Path | None = None) -> bool:
+    try:
+        info = read_save_info(save_folder)
+    except Exception:
+        return False
+    flag_path = info.folder / "extractor_rare_mode.json"
+    if not flag_path.is_file():
+        return False
+    try:
+        return bool(json.loads(flag_path.read_text(encoding="utf-8")).get("rare"))
+    except Exception:
+        return False
 
 
 # --- toolkit.py ---
@@ -1732,14 +2361,15 @@ class DebugToolkit(ctk.CTkToplevel):
     ):
         super().__init__(master)
         self.title("Undertale Debug Toolkit")
-        self.geometry("640x560")
-        self.minsize(560, 480)
+        self.geometry("680x620")
+        self.minsize(560, 520)
         self.configure(fg_color=COLORS["bg"])
         self.data_win = Path(data_win) if data_win else None
         self.save_dir = Path(save_dir) if save_dir else None
         self.on_status = on_status
         self._stats = PlayerStats()
         self._inv_vars: list[ctk.StringVar] = []
+        self.var_rare = ctk.BooleanVar(value=False)
 
         ctk.CTkLabel(
             self,
@@ -1749,7 +2379,7 @@ class DebugToolkit(ctk.CTkToplevel):
         ).pack(anchor="w", padx=16, pady=(14, 2))
         ctk.CTkLabel(
             self,
-            text="Launch the patched game, edit stats/items, start any fight (debug Home).",
+            text="Launch, edit stats/items, fights, Ruins reset, room chaos, rare encounters.",
             text_color=COLORS["muted"],
             font=ctk.CTkFont(size=12),
         ).pack(anchor="w", padx=16, pady=(0, 8))
@@ -1780,11 +2410,13 @@ class DebugToolkit(ctk.CTkToplevel):
         self.tabs.add("Stats")
         self.tabs.add("Items")
         self.tabs.add("Fights")
+        self.tabs.add("Chaos")
         self._build_stats_tab(self.tabs.tab("Stats"))
         self._build_items_tab(self.tabs.tab("Items"))
         self._build_fights_tab(self.tabs.tab("Fights"))
+        self._build_chaos_tab(self.tabs.tab("Chaos"))
 
-        self.status = ctk.CTkLabel(self, text="", text_color=COLORS["muted"], wraplength=600)
+        self.status = ctk.CTkLabel(self, text="", text_color=COLORS["muted"], wraplength=640)
         self.status.pack(anchor="w", padx=16, pady=(0, 12))
 
         self.after(100, self.reload_from_save)
@@ -1870,6 +2502,10 @@ class DebugToolkit(ctk.CTkToplevel):
             var.set(f"{iid}: {item_name(iid)}")
         self.var_weapon.set(f"{s.weapon}: {WEAPONS.get(s.weapon, item_name(s.weapon))}")
         self.var_armor.set(f"{s.armor}: {ARMORS.get(s.armor, item_name(s.armor))}")
+        try:
+            self.var_rare.set(rare_mode_enabled(self.save_dir))
+        except Exception:
+            pass
         self._say(f"Loaded save ({s.name}, LV {s.love}, room {s.room}).")
 
     def _build_stats_tab(self, tab) -> None:
@@ -2038,9 +2674,10 @@ class DebugToolkit(ctk.CTkToplevel):
     def _build_fights_tab(self, tab) -> None:
         ctk.CTkLabel(
             tab,
-            text="Requires debug mode. Sets the Home-key battlegroup, then presses Home.",
+            text="Requires debug mode. Patches the Home battlegroup on disk and in live "
+            "memory (fixes always-Mettaton), then sends Home.",
             text_color=COLORS["muted"],
-            wraplength=560,
+            wraplength=600,
         ).pack(anchor="w", padx=8, pady=6)
         self.fight_var = ctk.StringVar(
             value=f"{BATTLEGROUPS[0].id}: {BATTLEGROUPS[0].name}"
@@ -2054,20 +2691,30 @@ class DebugToolkit(ctk.CTkToplevel):
         ctk.CTkLabel(custom_row, text="Or id:").pack(side="left")
         self.custom_fight = ctk.StringVar()
         ctk.CTkEntry(custom_row, textvariable=self.custom_fight, width=80).pack(side="left", padx=6)
+        btn_row = ctk.CTkFrame(tab, fg_color="transparent")
+        btn_row.pack(fill="x", padx=8, pady=12)
         ctk.CTkButton(
-            tab,
+            btn_row,
             text="Start Fight",
             command=self.do_start_fight,
             fg_color=COLORS["accent"],
             hover_color=COLORS["accent_hover"],
+            width=140,
+        ).pack(side="left", padx=(0, 8))
+        ctk.CTkButton(
+            btn_row,
+            text="Start rarest fight",
+            command=self.do_start_rare_fight,
+            fg_color=COLORS["ink"],
+            hover_color="#33302b",
             width=160,
-        ).pack(anchor="w", padx=8, pady=12)
+        ).pack(side="left")
         ctk.CTkLabel(
             tab,
-            text="Tip: if Undertale is already open, close it → Launch Patched Undertale "
-            "→ Continue → Start Fight (so the Home battlegroup patch is loaded).",
+            text="If live memory patch fails (permissions), close Undertale → Launch → "
+            "Continue → Start Fight. Rare list includes Glyde, So Sorry, Sans, amalgamates…",
             text_color=COLORS["muted"],
-            wraplength=560,
+            wraplength=600,
             justify="left",
         ).pack(anchor="w", padx=8, pady=4)
 
@@ -2080,13 +2727,147 @@ class DebugToolkit(ctk.CTkToplevel):
         except ValueError:
             messagebox.showerror("Bad id", "Enter a numeric battlegroup id.", parent=self)
             return
-        ok, msg = start_fight(bg, data_win=self.data_win, ensure_debug=True)
+        # When rare mode is on and user picked a non-rare, still honor explicit pick;
+        # rare preference is for the rare button / overworld helpers.
+        ok, msg = start_fight(
+            bg,
+            data_win=self.data_win,
+            ensure_debug=True,
+            save_folder=self.save_dir,
+        )
         if ok:
             self._say(msg)
             messagebox.showinfo("Fight", msg, parent=self)
         else:
             self._say(msg)
             messagebox.showwarning("Fight", msg, parent=self)
+
+    def do_start_rare_fight(self) -> None:
+        ok, msg = start_random_rare_fight(data_win=self.data_win, save_folder=self.save_dir)
+        if ok:
+            self._say(msg)
+            messagebox.showinfo("Rare fight", msg, parent=self)
+        else:
+            self._say(msg)
+            messagebox.showwarning("Rare fight", msg, parent=self)
+
+    def _build_chaos_tab(self, tab) -> None:
+        ctk.CTkLabel(
+            tab,
+            text="Live Ruins reset and room chaos. Rare toggle boosts FUN and prefers rare fights.",
+            text_color=COLORS["muted"],
+            wraplength=600,
+        ).pack(anchor="w", padx=8, pady=6)
+
+        ctk.CTkButton(
+            tab,
+            text="Ruins reset (live)",
+            command=self.do_ruins_reset,
+            fg_color=COLORS["accent"],
+            hover_color=COLORS["accent_hover"],
+            width=220,
+        ).pack(anchor="w", padx=8, pady=8)
+        ctk.CTkLabel(
+            tab,
+            text="First Ruins SAVE (Entrance), LOVE 1 / HP 20 / EXP·gold·kills 0, Stick+Bandage. "
+            "Works while the game is open (writes save + L reload).",
+            text_color=COLORS["muted"],
+            wraplength=600,
+            justify="left",
+        ).pack(anchor="w", padx=8, pady=(0, 10))
+
+        ctk.CTkButton(
+            tab,
+            text="Randomize rooms",
+            command=self.do_randomize_rooms,
+            fg_color=COLORS["ink"],
+            hover_color="#33302b",
+            width=220,
+        ).pack(anchor="w", padx=8, pady=8)
+        ctk.CTkLabel(
+            tab,
+            text="Shuffles door destinations among playable rooms (skips text/intro/credit/"
+            "battle/shop rooms). Backs up data.win.roomchaosbak — restart Undertale after.",
+            text_color=COLORS["muted"],
+            wraplength=600,
+            justify="left",
+        ).pack(anchor="w", padx=8, pady=(0, 10))
+
+        try:
+            self.var_rare.set(rare_mode_enabled(self.save_dir))
+        except Exception:
+            self.var_rare.set(False)
+        ctk.CTkCheckBox(
+            tab,
+            text="Guarantee rarest encounters",
+            variable=self.var_rare,
+            command=self.do_toggle_rare,
+            text_color=COLORS["ink"],
+        ).pack(anchor="w", padx=8, pady=8)
+        rare_names = ", ".join(b.name for b in RARE_BATTLEGROUPS[:6]) + "…"
+        ctk.CTkLabel(
+            tab,
+            text=f"Sets FUN=90, keeps a rare-mode flag, and unlocks rare fight helpers "
+            f"({rare_names}). Toggle again to turn off.",
+            text_color=COLORS["muted"],
+            wraplength=600,
+            justify="left",
+        ).pack(anchor="w", padx=8, pady=(0, 8))
+
+    def do_ruins_reset(self) -> None:
+        if not messagebox.askyesno(
+            "Ruins reset",
+            "Reset stats to defaults and jump to the first Ruins SAVE while the game stays open?",
+            parent=self,
+        ):
+            return
+        ok, msg = live_ruins_reset(save_folder=self.save_dir, data_win=self.data_win)
+        self._say(msg)
+        if ok:
+            self.reload_from_save()
+            messagebox.showinfo("Ruins reset", msg, parent=self)
+        else:
+            messagebox.showerror("Ruins reset", msg, parent=self)
+
+    def do_randomize_rooms(self) -> None:
+        if not self.data_win or not self.data_win.is_file():
+            messagebox.showinfo("No game", "Open your Undertale folder first.", parent=self)
+            return
+        if undertale_is_running():
+            if not messagebox.askyesno(
+                "Undertale is running",
+                "Room chaos patches data.win on disk. Close Undertale after this and relaunch "
+                "so the shuffle loads. Continue?",
+                parent=self,
+            ):
+                return
+        elif not messagebox.askyesno(
+            "Randomize rooms",
+            "Rewrite room transitions in data.win (backup created). Continue?",
+            parent=self,
+        ):
+            return
+        ok, msg, _mapping = randomize_room_gotos(self.data_win, backup=True)
+        self._say(msg)
+        if ok:
+            messagebox.showinfo("Room chaos", msg, parent=self)
+        else:
+            messagebox.showerror("Room chaos", msg, parent=self)
+
+    def do_toggle_rare(self) -> None:
+        enabled = bool(self.var_rare.get())
+        ok, msg = set_rare_encounters(
+            enabled,
+            save_folder=self.save_dir,
+            data_win=self.data_win,
+            live_reload=True,
+        )
+        self._say(msg)
+        if not ok:
+            messagebox.showerror("Rare mode", msg, parent=self)
+            self.var_rare.set(not enabled)
+        else:
+            messagebox.showinfo("Rare mode", msg, parent=self)
 
 
 # --- parser.py ---

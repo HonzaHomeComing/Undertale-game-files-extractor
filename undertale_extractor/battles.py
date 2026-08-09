@@ -1,4 +1,4 @@
-"""Undertale battlegroup / fight launcher (debug Home key)."""
+"""Undertale battlegroup / fight launcher (debug Home key + live memory patch)."""
 
 from __future__ import annotations
 
@@ -14,6 +14,7 @@ from .live_teleport import (
     find_undertale_hwnd,
     undertale_is_running,
 )
+from .memory_patch import patch_int32_in_data_win_image
 
 # data.win offsets for the Home-key battlegroup id (little-endian int32).
 HOME_BATTLEGROUP_OFFSETS = (
@@ -30,9 +31,9 @@ VK_HOME = 0x24
 class Battlegroup:
     id: int
     name: str
+    rare: bool = False
 
 
-# Curated list — major encounters + notable groups (from scr_battlegroup).
 BATTLEGROUPS: tuple[Battlegroup, ...] = (
     Battlegroup(2, "Dummy"),
     Battlegroup(3, "Fake Froggit"),
@@ -70,33 +71,28 @@ BATTLEGROUPS: tuple[Battlegroup, ...] = (
     Battlegroup(76, "Royal Guards (alt)"),
     Battlegroup(80, "Mettaton (third)"),
     Battlegroup(81, "Mettaton EX"),
-    Battlegroup(82, "Lemon Bread"),
-    Battlegroup(83, "Reaper Bird"),
-    Battlegroup(84, "Snowdrake's Mother"),
-    Battlegroup(85, "Memoryheads"),
-    Battlegroup(86, "Endogeny"),
+    Battlegroup(82, "Lemon Bread", rare=True),
+    Battlegroup(83, "Reaper Bird", rare=True),
+    Battlegroup(84, "Snowdrake's Mother", rare=True),
+    Battlegroup(85, "Memoryheads", rare=True),
+    Battlegroup(86, "Endogeny", rare=True),
     Battlegroup(91, "Monster Kid"),
-    Battlegroup(92, "Undyne the Undying"),
+    Battlegroup(92, "Undyne the Undying", rare=True),
     Battlegroup(93, "Glad Dummy"),
-    Battlegroup(94, "Mettaton NEO"),
-    Battlegroup(95, "Sans"),
+    Battlegroup(94, "Mettaton NEO", rare=True),
+    Battlegroup(95, "Sans", rare=True),
     Battlegroup(100, "Asgore (intro)"),
     Battlegroup(101, "Asgore"),
-    Battlegroup(135, "Glyde"),
-    Battlegroup(140, "So Sorry"),
-    Battlegroup(255, "Asriel"),
-    Battlegroup(256, "Asriel (final)"),
+    Battlegroup(135, "Glyde", rare=True),
+    Battlegroup(140, "So Sorry", rare=True),
+    Battlegroup(255, "Asriel", rare=True),
+    Battlegroup(256, "Asriel (final)", rare=True),
 )
+
+RARE_BATTLEGROUPS = tuple(b for b in BATTLEGROUPS if b.rare)
 
 
 def set_home_battlegroup(data_win: str | Path, battlegroup_id: int, *, backup: bool = True) -> tuple[bool, str]:
-    """
-    Write the debug Home-key battlegroup id into data.win at known offsets.
-    Close Undertale before calling for a reliable write; if the game is already
-    running with debug on, the in-memory value may not update until restart —
-    but sending Home still uses whatever is loaded. Prefer set-then-restart, or
-    set while closed then Launch.
-    """
     if battlegroup_id < 0 or battlegroup_id > 1000:
         return False, "Battlegroup id must be between 0 and 1000."
     path = Path(data_win)
@@ -106,8 +102,8 @@ def set_home_battlegroup(data_win: str | Path, battlegroup_id: int, *, backup: b
         if offset + 4 > len(data):
             continue
         current = struct.unpack_from("<I", data, offset)[0]
-        # Only patch if it already looks like a battlegroup slot (0..400).
-        if current > 400:
+        # Accept common defaults (incl. Mettaton 80 / 57 / So Sorry 140).
+        if current > 400 and current != battlegroup_id:
             continue
         if current == battlegroup_id:
             wrote.append(f"0x{offset:X}=already")
@@ -115,21 +111,40 @@ def set_home_battlegroup(data_win: str | Path, battlegroup_id: int, *, backup: b
         if backup:
             bak = path.with_suffix(path.suffix + ".battlebak")
             if not bak.exists():
-                bak.write_bytes(path.read_bytes())
+                bak.write_bytes(bytes(data))
         struct.pack_into("<I", data, offset, int(battlegroup_id))
         wrote.append(f"0x{offset:X}")
     if not wrote:
         return (
             False,
-            "Could not find a Home battlegroup slot in this data.win.\n"
-            "Enable live patches (debug), or set the fight in UndertaleModTool.",
+            "Could not find a Home battlegroup slot in this data.win.",
         )
     path.write_bytes(data)
-    return True, f"Home battlegroup set to {battlegroup_id} ({', '.join(wrote)})."
+    return True, f"Home battlegroup set to {battlegroup_id} on disk ({', '.join(wrote)})."
+
+
+def set_home_battlegroup_live(data_win: str | Path, battlegroup_id: int) -> tuple[bool, str]:
+    """Patch the Home battlegroup inside the running game's loaded data.win image."""
+    path = Path(data_win)
+    raw = path.read_bytes()
+    notes = []
+    any_ok = False
+    for offset in HOME_BATTLEGROUP_OFFSETS:
+        if offset + 4 > len(raw):
+            continue
+        current = struct.unpack_from("<I", raw, offset)[0]
+        if current > 400:
+            continue
+        ok, msg = patch_int32_in_data_win_image(path, offset, battlegroup_id, expected_old=current)
+        notes.append(f"0x{offset:X}:{msg}")
+        if ok:
+            any_ok = True
+    if any_ok:
+        return True, "Live memory patched (" + "; ".join(notes) + ")."
+    return False, "Live memory patch failed (" + "; ".join(notes) + ")."
 
 
 def trigger_home_fight() -> tuple[bool, str]:
-    """Focus Undertale and press Home to start the current battlegroup fight."""
     if not undertale_is_running():
         return False, "Undertale is not running. Launch it first, load a save, then start the fight."
     if not find_undertale_hwnd():
@@ -145,41 +160,72 @@ def start_fight(
     *,
     data_win: str | Path | None = None,
     ensure_debug: bool = True,
+    save_folder: str | Path | None = None,
+    prefer_rare_if_enabled: bool = False,
 ) -> tuple[bool, str]:
     """
-    Set Home battlegroup (if data_win given) and trigger the fight.
-    If Undertale is running, data.win writes may not apply until restart —
-    we still try Home with the currently loaded debug battlegroup, and tell
-    the user to relaunch if needed.
+    Set Home battlegroup and trigger the fight.
+    Always writes data.win; if the game is running, also patches memory so the
+    selection applies immediately (fixes always-Mettaton bug).
     """
-    notes = []
-    if data_win and Path(data_win).is_file():
-        if ensure_debug and not debug_flag_enabled(data_win):
-            try:
-                if not undertale_is_running():
-                    enable_debug_mode(data_win, backup=True)
-                    notes.append("enabled debug")
-            except Exception as exc:
-                notes.append(f"debug failed: {exc}")
-        if undertale_is_running():
-            notes.append(
-                "Undertale is open — Home battlegroup patch needs a restart to take effect. "
-                "Close the game, click Launch Patched Undertale, load a save, then Start Fight again."
-            )
-            # Still try Home in case the value was already set from a previous launch.
-        else:
-            ok, msg = set_home_battlegroup(data_win, battlegroup_id, backup=True)
-            notes.append(msg)
-            if not ok:
-                return False, " | ".join(notes)
+    notes: list[str] = []
+    if not data_win or not Path(data_win).is_file():
+        return False, "Open your Undertale folder (data.win) first."
 
-    if not undertale_is_running():
-        return (
-            False,
-            "Battlegroup saved. Launch Undertale, load your save, then click Start Fight "
-            "(or press Home in-game).\n" + " | ".join(notes),
-        )
+    if prefer_rare_if_enabled:
+        from .chaos import rare_mode_enabled
 
-    ok, msg = trigger_home_fight()
+        if rare_mode_enabled(save_folder):
+            rare_ids = {b.id for b in RARE_BATTLEGROUPS}
+            if battlegroup_id not in rare_ids and RARE_BATTLEGROUPS:
+                battlegroup_id = RARE_BATTLEGROUPS[0].id
+                notes.append(f"rare mode → battlegroup {battlegroup_id}")
+
+    if ensure_debug and not debug_flag_enabled(data_win):
+        try:
+            if not undertale_is_running():
+                enable_debug_mode(data_win, backup=True)
+                notes.append("enabled debug")
+            else:
+                notes.append("debug flag off on disk — relaunch after Enable live patches")
+        except Exception as exc:
+            notes.append(f"debug failed: {exc}")
+
+    ok, msg = set_home_battlegroup(data_win, battlegroup_id, backup=True)
     notes.append(msg)
-    return ok, " | ".join(notes)
+    if not ok:
+        return False, " | ".join(notes)
+
+    if undertale_is_running():
+        live_ok, live_msg = set_home_battlegroup_live(data_win, battlegroup_id)
+        notes.append(live_msg)
+        if not live_ok:
+            notes.append(
+                "Could not patch the live game — close Undertale, Launch again, "
+                "then Start Fight (disk patch is ready)."
+            )
+            return False, " | ".join(notes)
+        ok2, msg2 = trigger_home_fight()
+        notes.append(msg2)
+        return ok2, " | ".join(notes)
+
+    return (
+        False,
+        "Battlegroup saved to data.win. Launch Undertale, load your save, then Start Fight "
+        "(or press Home).\n" + " | ".join(notes),
+    )
+
+
+def start_random_rare_fight(
+    *,
+    data_win: str | Path | None = None,
+    save_folder: str | Path | None = None,
+) -> tuple[bool, str]:
+    """Start a fight from the rare battlegroup list."""
+    import random
+
+    if not RARE_BATTLEGROUPS:
+        return False, "No rare battlegroups configured."
+    bg = random.choice(RARE_BATTLEGROUPS)
+    ok, msg = start_fight(bg.id, data_win=data_win, save_folder=save_folder)
+    return ok, f"{bg.name} ({bg.id}): {msg}"
