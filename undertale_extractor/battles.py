@@ -39,7 +39,9 @@ HOME_BATTLEGROUP_OFFSETS = (
 
 HOME_DEFAULTS = frozenset({57, 80, 140, 81})
 
-OP_PUSHI = 0x84
+OP_PUSHI = 0x84  # bytecode 15+
+OP_PUSH = 0xC0  # bytecode 14 (Int16 push uses this)
+DT_INT16 = 0x0F  # UndertaleInstruction.DataType.Int16 — lives in bits 16–19
 VK_HOME = 0x24
 VK_HOME_KEY = 0x24  # Win32 / GML
 
@@ -57,12 +59,39 @@ class HomeBattlegroupSite:
     value: int
     kind: str  # "raw" | "pushi"
     source: str = ""
+    # Full original dword so we preserve opcode + type nibble when rewriting
+    template: int = 0
 
     def encode(self, battlegroup_id: int) -> int:
         bg = int(battlegroup_id) & 0xFFFF
         if self.kind == "pushi":
-            return (OP_PUSHI << 24) | bg
+            tmpl = self.template or pushi_word(self.value)
+            return (tmpl & 0xFFFF0000) | bg
         return bg
+
+
+def pushi_word(value: int, *, opcode: int = OP_PUSHI, type_nibble: int = DT_INT16) -> int:
+    """GameMaker PushI / Push.e encoding: opcode | type | int16 value."""
+    return ((opcode & 0xFF) << 24) | ((type_nibble & 0xF) << 16) | (int(value) & 0xFFFF)
+
+
+def _pushi_bytes(value: int, *, opcode: int = OP_PUSHI) -> bytes:
+    return struct.pack("<I", pushi_word(value, opcode=opcode))
+
+
+def is_int16_push(word: int) -> bool:
+    """True for PushI (0x84) or bytecode-14 Push with Int16 type (0xC0 / 0x0F)."""
+    op = (word >> 24) & 0xFF
+    typ = (word >> 16) & 0xF
+    if op == OP_PUSHI:
+        return True  # type should be 0x0F; still accept odd type=0 from older buggy patches
+    if op == OP_PUSH and typ == DT_INT16:
+        return True
+    return False
+
+
+def push_imm(word: int) -> int:
+    return word & 0xFFFF
 
 
 BATTLEGROUPS: tuple[Battlegroup, ...] = (
@@ -123,54 +152,82 @@ BATTLEGROUPS: tuple[Battlegroup, ...] = (
 RARE_BATTLEGROUPS = tuple(b for b in BATTLEGROUPS if b.rare)
 
 
-def _pushi(value: int) -> bytes:
-    return struct.pack("<I", (OP_PUSHI << 24) | (int(value) & 0xFFFF))
-
-
 def find_home_pushi_sites_in_bytes(data: bytes) -> list[HomeBattlegroupSite]:
     """
-    Find PushI battlegroup immediates that sit shortly after PushI vk_home (36).
+    Find int16-push battlegroup immediates that sit shortly after vk_home (36).
 
-    This is the assignment inside: if (keyboard_check_pressed(vk_home)) battlegroup = N;
+    Real data.win encodes PushI as 0x840F00xx (type Int16=0x0F), not 0x840000xx.
     """
-    needle = _pushi(VK_HOME)
     sites: list[HomeBattlegroupSite] = []
     seen: set[int] = set()
-    start = 0
-    while True:
-        idx = data.find(needle, start)
-        if idx < 0:
-            break
-        # Scan the next ~96 bytes for a PushI whose immediate is a battlegroup id
-        window = data[idx : idx + 96]
-        pos = 4
-        while pos + 4 <= len(window):
-            word = struct.unpack_from("<I", window, pos)[0]
-            if (word >> 24) == OP_PUSHI:
-                imm = word & 0xFFFF
-                # Factory defaults OR any already-patched small id (so re-patch works)
-                if imm in HOME_DEFAULTS or 1 <= imm <= 256:
-                    abs_off = idx + pos
-                    if abs_off not in seen:
-                        seen.add(abs_off)
-                        sites.append(
-                            HomeBattlegroupSite(abs_off, imm, "pushi", "vk_home_pattern")
-                        )
-                    break
-            pos += 4
-        start = idx + 4
+    # Match both bytecode 15 PushI and bytecode 14 Push.e for vk_home
+    needles = (_pushi_bytes(VK_HOME, opcode=OP_PUSHI), _pushi_bytes(VK_HOME, opcode=OP_PUSH))
+    for needle in needles:
+        start = 0
+        while True:
+            idx = data.find(needle, start)
+            if idx < 0:
+                break
+            window = data[idx : idx + 128]
+            pos = 4
+            while pos + 4 <= len(window):
+                word = struct.unpack_from("<I", window, pos)[0]
+                if is_int16_push(word):
+                    imm = push_imm(word)
+                    if imm in HOME_DEFAULTS or 1 <= imm <= 256:
+                        abs_off = idx + pos
+                        if abs_off not in seen:
+                            seen.add(abs_off)
+                            sites.append(
+                                HomeBattlegroupSite(
+                                    abs_off, imm, "pushi", "vk_home_pattern", template=word
+                                )
+                            )
+                        break
+                pos += 4
+            start = idx + 4
     return sites
 
 
+def _obj_time_default_pushis(raw: bytes) -> list[HomeBattlegroupSite]:
+    """Fallback: factory-default PushIs inside obj_time scripts only."""
+    out: list[HomeBattlegroupSite] = []
+    try:
+        reader = BinaryReader(raw)
+        for name, bc_off, length in _find_code_entries(reader):
+            if "obj_time" not in (name or "").lower():
+                continue
+            pos = 0
+            while pos + 4 <= length:
+                word = struct.unpack_from("<I", raw, bc_off + pos)[0]
+                if is_int16_push(word) and push_imm(word) in HOME_DEFAULTS:
+                    out.append(
+                        HomeBattlegroupSite(
+                            bc_off + pos,
+                            push_imm(word),
+                            "pushi",
+                            f"obj_time_default:{name}",
+                            template=word,
+                        )
+                    )
+                op = (word >> 24) & 0xFF
+                if op in (0x45, 0x41, 0xD9, 0xDA):
+                    pos += 8
+                else:
+                    pos += 4
+    except Exception:
+        pass
+    return out
+
+
 def discover_home_battlegroup_sites(data: bytes | bytearray) -> list[HomeBattlegroupSite]:
-    """Surgical discovery — pattern + TCRF defaults only. No broad PushI sweeps."""
+    """Find Home battlegroup slots — correct PushI encoding + safe fallbacks."""
     raw = bytes(data)
     found: dict[int, HomeBattlegroupSite] = {}
 
     for site in find_home_pushi_sites_in_bytes(raw):
         found[site.offset] = site
 
-    # Prefer obj_time-confirmed sites when CODE parse works (same offsets, better tag)
     try:
         reader = BinaryReader(raw)
         for name, bc_off, length in _find_code_entries(reader):
@@ -180,20 +237,31 @@ def discover_home_battlegroup_sites(data: bytes | bytearray) -> list[HomeBattleg
             for site in find_home_pushi_sites_in_bytes(chunk):
                 abs_off = bc_off + site.offset
                 found[abs_off] = HomeBattlegroupSite(
-                    abs_off, site.value, "pushi", f"obj_time:{name}"
+                    abs_off,
+                    site.value,
+                    "pushi",
+                    f"obj_time:{name}",
+                    template=site.template,
                 )
     except Exception:
         pass
 
-    # TCRF raw offsets — only if they still hold a factory default (avoid random dwords)
+    # TCRF offsets — factory default raw int OR correctly-typed PushI
     for offset in HOME_BATTLEGROUP_OFFSETS:
         if offset + 4 > len(raw):
             continue
         word = struct.unpack_from("<I", raw, offset)[0]
-        if (word >> 24) == OP_PUSHI and (word & 0xFFFF) in HOME_DEFAULTS:
-            found[offset] = HomeBattlegroupSite(offset, word & 0xFFFF, "pushi", "tcrf")
+        if is_int16_push(word) and push_imm(word) in HOME_DEFAULTS:
+            found[offset] = HomeBattlegroupSite(
+                offset, push_imm(word), "pushi", "tcrf", template=word
+            )
         elif word in HOME_DEFAULTS:
             found[offset] = HomeBattlegroupSite(offset, word, "raw", "tcrf")
+
+    # If vk_home pattern missed (odd build), use obj_time factory defaults only
+    if not found:
+        for site in _obj_time_default_pushis(raw):
+            found[site.offset] = site
 
     return sorted(found.values(), key=lambda s: s.offset)
 
@@ -205,10 +273,12 @@ def set_home_battlegroup(data_win: str | Path, battlegroup_id: int, *, backup: b
     data = bytearray(path.read_bytes())
     sites = discover_home_battlegroup_sites(data)
     if not sites:
+        debug = "on" if debug_flag_enabled(path) else "off"
         return (
             False,
-            "Could not find the Home-key battlegroup (vk_home PushI) in this data.win. "
-            "Enable debug mode, then try again — or use UndertaleModTool → ChangeHomeBattlegroup.",
+            f"Could not find the Home-key battlegroup in this data.win (debug flag is {debug}). "
+            "Click Restore data.win, then Enable live patches, Launch Undertale once, "
+            "close it, and try Start Fight again. Or use UndertaleModTool → ChangeHomeBattlegroup.",
         )
 
     if backup:
@@ -257,38 +327,39 @@ def replace_home_battlegroup_near_vk_home(
     *,
     max_hits: int = 6,
 ) -> int:
-    """Replace PushI battlegroup after PushI vk_home in process memory."""
+    """Replace int16-push battlegroup after vk_home push in process memory."""
     from .memory_patch import iter_process_memory
 
-    home = _pushi(VK_HOME)
-    new_word = _pushi(new_id)
+    needles = (_pushi_bytes(VK_HOME, opcode=OP_PUSHI), _pushi_bytes(VK_HOME, opcode=OP_PUSH))
     handle = _open_process(pid)
     hits = 0
     try:
         for base, data in iter_process_memory(handle):
-            start = 0
-            while hits < max_hits:
-                idx = data.find(home, start)
-                if idx < 0:
-                    break
-                end = min(len(data), idx + 96)
-                pos = idx + 4
-                while pos + 4 <= end:
-                    word = struct.unpack_from("<I", data, pos)[0]
-                    if (word >> 24) == OP_PUSHI:
-                        imm = word & 0xFFFF
-                        match = (old_id is None and 1 <= imm <= 256 and imm != new_id) or (
-                            old_id is not None and imm == old_id
-                        )
-                        if match:
-                            try:
-                                _write(handle, base + pos, new_word)
-                                hits += 1
-                            except RuntimeError:
-                                pass
-                            break
-                    pos += 4
-                start = idx + 4
+            for home in needles:
+                start = 0
+                while hits < max_hits:
+                    idx = data.find(home, start)
+                    if idx < 0:
+                        break
+                    end = min(len(data), idx + 128)
+                    pos = idx + 4
+                    while pos + 4 <= end:
+                        word = struct.unpack_from("<I", data, pos)[0]
+                        if is_int16_push(word):
+                            imm = push_imm(word)
+                            match = (old_id is None and 1 <= imm <= 256 and imm != new_id) or (
+                                old_id is not None and imm == old_id
+                            )
+                            if match:
+                                new_word = (word & 0xFFFF0000) | (new_id & 0xFFFF)
+                                try:
+                                    _write(handle, base + pos, struct.pack("<I", new_word))
+                                    hits += 1
+                                except RuntimeError:
+                                    pass
+                                break
+                        pos += 4
+                    start = idx + 4
             if hits >= max_hits:
                 break
     finally:

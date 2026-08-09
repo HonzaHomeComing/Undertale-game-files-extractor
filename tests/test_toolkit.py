@@ -89,8 +89,8 @@ def test_set_home_battlegroup_preserves_pushi_opcode(tmp_path: Path):
     offset = battles.HOME_BATTLEGROUP_OFFSETS[0]
     data = bytearray(offset + 16)
     data[0:4] = b"FORM"
-    # PushI 80 (Mettaton) — must keep opcode when rewriting
-    pushi_80 = (0x84 << 24) | 80
+    # Real PushI encoding: opcode 0x84, type Int16 0x0F, value 80
+    pushi_80 = battles.pushi_word(80)
     struct.pack_into("<I", data, offset, pushi_80)
     path = tmp_path / "data.win"
     path.write_bytes(data)
@@ -98,18 +98,17 @@ def test_set_home_battlegroup_preserves_pushi_opcode(tmp_path: Path):
     assert ok is True, msg
     word = struct.unpack_from("<I", path.read_bytes(), offset)[0]
     assert (word >> 24) == 0x84
+    assert ((word >> 16) & 0xF) == 0x0F
     assert (word & 0xFFFF) == 4
 
 
 def test_discover_home_near_vk_home(tmp_path: Path):
-    """PushI vk_home then PushI 80 in an obj_time-like CODE entry is discovered."""
-    OP_PUSHI = 0x84
-    OP_CALL = 0xD9
+    """PushI vk_home then PushI 80 (with Int16 type) is discovered."""
     bytecode = b""
-    bytecode += struct.pack("<I", (OP_PUSHI << 24) | 0x24)  # vk_home
-    bytecode += struct.pack("<I", (OP_CALL << 24)) + struct.pack("<I", 0)
-    bytecode += struct.pack("<I", (OP_PUSHI << 24) | 80)  # battlegroup
-    bytecode += struct.pack("<I", (OP_CALL << 24)) + struct.pack("<I", 0)
+    bytecode += struct.pack("<I", battles.pushi_word(0x24))  # vk_home
+    bytecode += struct.pack("<I", (0xD9 << 24)) + struct.pack("<I", 0)  # Call
+    bytecode += struct.pack("<I", battles.pushi_word(80))  # battlegroup
+    bytecode += struct.pack("<I", (0xD9 << 24)) + struct.pack("<I", 0)
 
     name = b"gml_Object_obj_time_Step_1"
     code = bytearray()
@@ -135,18 +134,26 @@ def test_discover_home_near_vk_home(tmp_path: Path):
     buf[code_at + name_ptr_pos : code_at + name_ptr_pos + 4] = struct.pack("<I", str_at + 4)
 
     sites = battles.discover_home_battlegroup_sites(bytes(buf))
-    assert any(s.kind == "pushi" and s.value == 80 for s in sites)
+    assert any(s.kind == "pushi" and s.value == 80 for s in sites), sites
     path = tmp_path / "data.win"
     path.write_bytes(buf)
-    ok, msg = battles.set_home_battlegroup(path, 4, backup=False)
+    ok, msg = battles.set_home_battlegroup(path, 47, backup=False)
     assert ok is True, msg
     data = path.read_bytes()
-    # The battlegroup PushI (second PushI in bytecode) should now be 4
     bc = entry_abs + 8
-    # layout: pushi home (4), call (8), pushi bg (4) → bg at bc+12
     word = struct.unpack_from("<I", data, bc + 12)[0]
-    assert (word >> 24) == OP_PUSHI
-    assert (word & 0xFFFF) == 4
+    assert (word >> 24) == 0x84
+    assert ((word >> 16) & 0xF) == 0x0F
+    assert (word & 0xFFFF) == 47
+
+
+def test_pushi_word_encoding():
+    w = battles.pushi_word(36)
+    assert w == 0x840F0024
+    assert battles.is_int16_push(w)
+    assert battles.push_imm(w) == 36
+    # Old buggy encoding without type nibble must not be required for discovery needles
+    assert battles.pushi_word(80) != (0x84 << 24) | 80
 
 
 def test_dogcheck_stub_does_not_wipe_trailing_bytes(tmp_path: Path):
