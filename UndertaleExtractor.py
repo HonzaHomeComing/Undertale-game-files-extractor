@@ -2747,73 +2747,94 @@ def rare_mode_enabled(save_folder: str | Path | None = None) -> bool:
 # --- amalgomation.py ---
 
 AMALGOMATION_ID = 666
-# In-game host: Endogeny — "It's the Amalgamate."
+# Vessel fight: Endogeny battlegroup — rewritten in-place into Amalgomation.
 HOST_BATTLEGROUP = 86
 
-# Attack themes stacked every 2 director "rounds"
-ATTACK_POOL: tuple[str, ...] = (
-    "Froggit flies",
-    "Whimsun tears",
-    "Migosp swarm",
-    "Vegetoid carrots",
-    "Loox rings",
-    "Snowdrake puns",
-    "Icecap hats",
-    "Doggo spears",
-    "Lesser Dog neck",
-    "Papyrus bones",
-    "Gyftrot gifts",
-    "Aaron flexes",
-    "Woshua water",
-    "Shyren notes",
-    "Mad Dummy missiles",
-    "Undyne spears",
-    "Mettaton discs",
-    "Muffet webs",
-    "Royal Guard guns",
-    "Tsunderplane jets",
-    "Vulkin lava",
-    "Pyrope fire",
-    "Madjick orbs",
-    "Knight Knight stars",
-    "Final Froggit",
-    "Astigmatism glare",
-    "Whimsalot butterflies",
-    "Sans bones",
-    "Sans gasterblasters",
-    "Asgore fire",
-    "Asriel chaos buster",
-    "Flowey pellets",
-    "Memoryhead faces",
-    "Reaper Bird",
-    "Lemon Bread",
-    "Glyde circles",
+VK_F6 = 0x75  # debug: mercy 0, ATK 999
+
+OP_PUSHI = 0x84
+OP_BF = 0xB8
+OP_B = 0xB6
+OP_BT = 0xB7
+
+_DRAW_NAMES = (
+    "gml_Object_obj_endogeny_body_Draw_0",
+    "gml_Object_obj_endogeny_body_Draw",
+)
+_STEP_NAMES = (
+    "gml_Object_obj_endogeny_Step_0",
+    "gml_Object_obj_endogeny_Step",
 )
 
-DIALOGS: tuple[str, ...] = (
-    "* It's raining somewhere else.",
-    "* You feel your sins crawling on your back.",
-    "* But nobody came.",
-    "* Get Dunked On!!!!!",
-    "* You're gonna have a bad time.",
-    "* ABSOLUTELY SCREAMING!!!",
-    "* ahuhuhuhu...",
-    "* Hoi! I'm temmie!",
-    "* I'M NOT GONNA TELL YOU TO STOP HAVING A GOOD TIME.",
-    "* The music grows more distorted.",
-    "* Files that should not touch are touching.",
-    "* SPRITE_SHEET_ERROR: too many faces.",
-    "* It smells like sweet lemons and ozone.",
-    "* Determination, but wrong.",
-    "* The save file is watching you.",
-    "* loading mus_zzz_c... failed... retrying...",
-    "* (The amalgam hums in a voice made of UI fonts.)",
-    "* Your inventory contains 1x [UNDEFINED].",
-    "* * * Mettaton attacks! Undyne attacks! Froggit attacks!",
-    "* It's so cold. It's so hot. It's room_void.",
+# Object-name substrings that look like bullet / attack generators
+_GEN_NEEDLES = (
+    "bulletgen",
+    "bulgen",
+    "blt_",
+    "gen",
+    "blaster",
+    "gaster",
+    "spear",
+    "bonebox",
+    "bone",
+    "rocketdog",
+    "laserdog",
+    "amalgam",
+    "spiderbullet",
+    "lavafire",
+    "butterfly",
+    "carrot",
+    "blackbox",
+    "gigavine",
+    "sidegen",
+    "vertbullet",
+    "randomgen",
+    "stormstar",
+    "asgore",
+    "sans",
+    "mettaton",
 )
 
-VK_F6 = 0x75  # battle debug: mercy 0, ATK 999
+_HOST_GEN_NAMES = (
+    "obj_amalgam_rocketdog",
+    "obj_amalgam_laserdog",
+)
+
+_HOST_SPRITE_NAMES = (
+    "spr_endogeny",
+    "spr_endogeny_head",
+    "spr_endogeny_2",
+)
+
+_NAME_STRINGS = (
+    b"Amalgamate",
+    b"Endogeny",
+)
+
+
+@dataclass
+class ResourceIndex:
+    sprites: dict[str, int] = field(default_factory=dict)
+    objects: dict[str, int] = field(default_factory=dict)
+    sprite_ids: list[int] = field(default_factory=list)
+    gen_object_ids: list[int] = field(default_factory=list)
+
+
+@dataclass
+class PatchSite:
+    offset: int  # file offset of PushI dword
+    original: int
+    kind: str
+
+
+@dataclass
+class AmalgomationPlan:
+    sprite_sites: list[PatchSite] = field(default_factory=list)
+    attack_sites: list[PatchSite] = field(default_factory=list)
+    firingrate_sites: list[PatchSite] = field(default_factory=list)
+    branch_sites: list[PatchSite] = field(default_factory=list)
+    mercymod_sites: list[PatchSite] = field(default_factory=list)
+    resources: ResourceIndex = field(default_factory=ResourceIndex)
 
 
 @dataclass
@@ -2821,20 +2842,302 @@ class ChaosState:
     layer: int = 1
     rounds: int = 0
     stack: list[str] = field(default_factory=list)
-    last_dialog: str = ""
+    running: bool = False
     fake_hp: int = 666
     fake_df: int = 66
     fake_damage: int = 9999
-    running: bool = False
+
+
+_DIRECTOR_LOCK = threading.Lock()
+_ACTIVE_DIRECTOR: "AmalgomationDirector | None" = None
 
 
 def is_amalgomation_id(battlegroup_id: int) -> bool:
     return int(battlegroup_id) == AMALGOMATION_ID
 
 
-def _pick_attack(rng: random.Random, used: set[str]) -> str:
-    choices = [a for a in ATTACK_POOL if a not in used] or list(ATTACK_POOL)
-    return rng.choice(choices)
+def _list_chunk_names(data: bytes, tag: str) -> dict[str, int]:
+    """Return {name: index} for a GameMaker pointer-list chunk (SPRT/OBJT/…)."""
+    reader = BinaryReader(data)
+    reader.seek(0)
+    if reader.read_tag() != "FORM":
+        return {}
+    form_size = reader.read_u32()
+    form_end = reader.position + form_size
+    chunk_start = None
+    while reader.position + 8 <= form_end:
+        t = reader.read_tag()
+        size = reader.read_u32()
+        start = reader.position
+        if t == tag:
+            chunk_start = start
+        try:
+            reader.seek(start + size)
+        except ValueError:
+            break
+    if chunk_start is None:
+        return {}
+    reader.seek(chunk_start)
+    count = reader.read_u32()
+    if count <= 0 or count > 200_000:
+        return {}
+    offsets = [reader.read_u32() for _ in range(count)]
+    out: dict[str, int] = {}
+    for idx, off in enumerate(offsets):
+        try:
+            if off <= 0 or off >= len(data):
+                continue
+            reader.seek(off)
+            name = reader.read_offset_string() or ""
+            if name:
+                out[name] = idx
+        except Exception:
+            continue
+    return out
+
+
+def discover_resources(data: bytes) -> ResourceIndex:
+    sprites = _list_chunk_names(data, "SPRT")
+    objects = _list_chunk_names(data, "OBJT")
+    sprite_ids = sorted({i for i in sprites.values() if 1 <= i <= 20000})
+    gen_ids: list[int] = []
+    seen: set[int] = set()
+    for name, idx in objects.items():
+        low = name.lower()
+        if not any(n in low for n in _GEN_NEEDLES):
+            continue
+        # Skip pure monster controllers that are not gens when possible
+        if low.startswith("obj_") and "monster" in low and "gen" not in low:
+            continue
+        if idx in seen:
+            continue
+        seen.add(idx)
+        gen_ids.append(idx)
+    # Prefer known host gens first if present
+    preferred = []
+    for hn in _HOST_GEN_NAMES:
+        if hn in objects and objects[hn] not in preferred:
+            preferred.append(objects[hn])
+    rest = [g for g in gen_ids if g not in preferred]
+    random.Random(666).shuffle(rest)
+    return ResourceIndex(
+        sprites=sprites,
+        objects=objects,
+        sprite_ids=sprite_ids,
+        gen_object_ids=preferred + rest,
+    )
+
+
+def _find_named_code(data: bytes, names: tuple[str, ...]) -> list[tuple[str, int, int]]:
+    want = {n.lower() for n in names}
+    out = []
+    for name, off, length in _find_code_entries(BinaryReader(data)):
+        if name.lower() in want or any(name.lower().endswith(n.lower()) for n in names):
+            out.append((name, off, length))
+    return out
+
+
+def _scan_pushi(data: bytes, bc_off: int, length: int) -> list[tuple[int, int]]:
+    """Return list of (abs_offset, imm) for PushI-like words in a code blob."""
+    hits = []
+    pos = 0
+    end = min(length, len(data) - bc_off)
+    while pos + 4 <= end:
+        word = struct.unpack_from("<I", data, bc_off + pos)[0]
+        op = (word >> 24) & 0xFF
+        if op in (OP_PUSHI, 0xC0):
+            hits.append((bc_off + pos, push_imm(word)))
+        pos += 4
+    return hits
+
+
+def _scan_branches(data: bytes, bc_off: int, length: int) -> list[tuple[int, int, int]]:
+    """Return (abs_offset, opcode, word) for B/BT/BF in blob."""
+    hits = []
+    pos = 0
+    end = min(length, len(data) - bc_off)
+    while pos + 4 <= end:
+        word = struct.unpack_from("<I", data, bc_off + pos)[0]
+        op = (word >> 24) & 0xFF
+        if op in (OP_B, OP_BT, OP_BF):
+            hits.append((bc_off + pos, op, word))
+        pos += 4
+    return hits
+
+
+def build_amalgomation_plan(data: bytes) -> AmalgomationPlan:
+    res = discover_resources(data)
+    plan = AmalgomationPlan(resources=res)
+
+    host_sprite_ids = {
+        res.sprites[n] for n in _HOST_SPRITE_NAMES if n in res.sprites
+    }
+    # Also accept any spr_*endogeny*
+    for name, idx in res.sprites.items():
+        if "endogeny" in name.lower():
+            host_sprite_ids.add(idx)
+
+    host_gen_ids = {
+        res.objects[n] for n in _HOST_GEN_NAMES if n in res.objects
+    }
+    for name, idx in res.objects.items():
+        low = name.lower()
+        if "amalgam_rocketdog" in low or "amalgam_laserdog" in low:
+            host_gen_ids.add(idx)
+
+    for _name, off, length in _find_named_code(data, _DRAW_NAMES):
+        for abs_off, imm in _scan_pushi(data, off, length):
+            if imm in host_sprite_ids or (host_sprite_ids and imm in host_sprite_ids):
+                word = struct.unpack_from("<I", data, abs_off)[0]
+                plan.sprite_sites.append(PatchSite(abs_off, word, "sprite"))
+            elif not host_sprite_ids and 1 <= imm <= 8000:
+                # Fallback: first few PushIs in Draw are usually sprite ids
+                word = struct.unpack_from("<I", data, abs_off)[0]
+                if len([s for s in plan.sprite_sites if s.kind == "sprite"]) < 4:
+                    plan.sprite_sites.append(PatchSite(abs_off, word, "sprite"))
+
+    gen_set = set(res.gen_object_ids[:120])
+    for _name, off, length in _find_named_code(data, _STEP_NAMES):
+        pushis = _scan_pushi(data, off, length)
+        for abs_off, imm in pushis:
+            word = struct.unpack_from("<I", data, abs_off)[0]
+            if imm in host_gen_ids or imm in gen_set:
+                plan.attack_sites.append(PatchSite(abs_off, word, "attack"))
+            elif imm == 10:
+                # global.firingrate = 10 in stock Endogeny
+                plan.firingrate_sites.append(PatchSite(abs_off, word, "firingrate"))
+            elif imm in (999999, 222):
+                plan.mercymod_sites.append(PatchSite(abs_off, word, "mercy"))
+        # Soften BF between the first two host-gen creates so both patterns can fire
+        host_hits = [s for s in plan.attack_sites if push_imm(s.original) in host_gen_ids]
+        if len(host_hits) >= 2:
+            lo = min(s.offset for s in host_hits[:2])
+            hi = max(s.offset for s in host_hits[:2])
+            for abs_off, op, word in _scan_branches(data, off, length):
+                if lo <= abs_off <= hi and op == OP_BF:
+                    plan.branch_sites.append(PatchSite(abs_off, word, "branch_bf"))
+
+    # Nested gens: Alarm/Create on rocketdog/laserdog — more stack slots as layers grow
+    nested_names = tuple(
+        f"gml_Object_{n}_{suffix}"
+        for n in ("obj_amalgam_rocketdog", "obj_amalgam_laserdog")
+        for suffix in ("Alarm_0", "Alarm_1", "Alarm_2", "Alarm_3", "Alarm_4", "Step_0", "Create_0")
+    )
+    for _name, off, length in _find_named_code(data, nested_names):
+        for abs_off, imm in _scan_pushi(data, off, length):
+            if imm in gen_set or imm in host_gen_ids:
+                word = struct.unpack_from("<I", data, abs_off)[0]
+                plan.attack_sites.append(PatchSite(abs_off, word, "attack_nested"))
+
+    # De-dupe sites by offset
+    seen_off: set[int] = set()
+    uniq: list[PatchSite] = []
+    for s in plan.attack_sites:
+        if s.offset in seen_off:
+            continue
+        seen_off.add(s.offset)
+        uniq.append(s)
+    plan.attack_sites = uniq[:16]
+
+    return plan
+
+
+def _write_pushi(data: bytearray, offset: int, template: int, value: int) -> None:
+    new_word = (template & 0xFFFF0000) | (int(value) & 0xFFFF)
+    struct.pack_into("<I", data, offset, new_word)
+
+
+def _patch_disk_and_live(
+    data_win: Path,
+    data: bytearray,
+    sites: list[tuple[int, int]],
+) -> list[str]:
+    """sites: (offset, new_u32_word). Writes disk + live FORM copy."""
+    notes = []
+    for offset, word in sites:
+        if offset < 0 or offset + 4 > len(data):
+            continue
+        struct.pack_into("<I", data, offset, word & 0xFFFFFFFF)
+    try:
+        data_win.write_bytes(data)
+        notes.append("data.win updated")
+    except OSError as exc:
+        notes.append(f"disk write failed: {exc}")
+        return notes
+    if undertale_is_running() and is_windows():
+        pid = find_undertale_pid()
+        size = data_win.stat().st_size
+        for offset, word in sites:
+            try:
+                ok = write_int32_in_running_game(
+                    pid, offset, word & 0xFFFFFFFF, expected_size=size
+                )
+                if ok:
+                    notes.append(f"live@0x{offset:X}")
+            except Exception:
+                continue
+    return notes
+
+
+def _backup(data_win: Path) -> Path:
+    bak = data_win.with_suffix(data_win.suffix + ".amalgobak")
+    if not bak.exists():
+        bak.write_bytes(data_win.read_bytes())
+    return bak
+
+
+def install_amalgomation_into_data_win(data_win: str | Path) -> tuple[bool, str, AmalgomationPlan]:
+    """
+    One-shot structural patches: neutralize mercy shortcuts, open both attack
+    branches, stamp AMALGOMATION name strings. Sprite/attack IDs are left to
+    the live director so they keep changing.
+    """
+    path = Path(data_win)
+    if not path.is_file():
+        return False, "data.win missing", AmalgomationPlan()
+    _backup(path)
+    raw = bytearray(path.read_bytes())
+    plan = build_amalgomation_plan(bytes(raw))
+    writes: list[tuple[int, int]] = []
+
+    # Soften BF between the two host creates so the false-branch skip is tiny
+    # (both attack patterns can run in one turn). Offset encoded in low 24 bits.
+    for site in plan.branch_sites:
+        if (site.original >> 24) & 0xFF == OP_BF:
+            writes.append((site.offset, (OP_BF << 24) | 0x000002))
+
+    # Break spare thresholds (999999 / 222) so petting never soft-locks to spare
+    for site in plan.mercymod_sites:
+        writes.append((site.offset, (site.original & 0xFFFF0000) | 0x0001))
+
+    # Rename visible "Amalgamate" / "Endogeny" strings when length allows
+    for needle in _NAME_STRINGS:
+        replacement = b"AMALGOMATION"
+        start = 0
+        while True:
+            idx = raw.find(needle, start)
+            if idx < 0:
+                break
+            # Only replace if we have room (same or shorter) or exact field
+            if len(replacement) <= len(needle) + 4:
+                # Write replacement and pad with spaces/nulls into old span
+                span = max(len(needle), len(replacement))
+                chunk = replacement[:span].ljust(span, b"\x00")
+                raw[idx : idx + span] = chunk[:span]
+                # Also try live later via full file write
+            start = idx + 1
+
+    notes = _patch_disk_and_live(path, raw, writes)
+    # Re-read plan from patched file for director
+    plan = build_amalgomation_plan(path.read_bytes())
+    ok = bool(plan.sprite_sites or plan.attack_sites or plan.resources.sprite_ids)
+    msg = (
+        f"Amalgomation installed in-game "
+        f"(sprites={len(plan.sprite_sites)}, attacks={len(plan.attack_sites)}, "
+        f"gens={len(plan.resources.gen_object_ids)}, "
+        f"spritepool={len(plan.resources.sprite_ids)}). " + "; ".join(notes)
+    )
+    return ok, msg, plan
 
 
 def scramble_u32_candidates(
@@ -2845,7 +3148,6 @@ def scramble_u32_candidates(
     *,
     limit: int = 12,
 ) -> int:
-    """Write random int32 values to previously found addresses."""
     if not candidates:
         return 0
     handle = _open_process(pid)
@@ -2865,7 +3167,6 @@ def scramble_u32_candidates(
 
 
 def find_int32_addresses(pid: int, value: int, *, max_hits: int = 40) -> list[int]:
-    """Scan process memory for a little-endian int32 (battle HP hunting)."""
     needle = struct.pack("<i", int(value))
     hits: list[int] = []
     handle = _open_process(pid)
@@ -2876,7 +3177,6 @@ def find_int32_addresses(pid: int, value: int, *, max_hits: int = 40) -> list[in
                 idx = data.find(needle, start)
                 if idx < 0:
                     break
-                # Prefer aligned hits
                 if idx % 4 == 0:
                     hits.append(base + idx)
                 start = idx + 4
@@ -2888,62 +3188,48 @@ def find_int32_addresses(pid: int, value: int, *, max_hits: int = 40) -> list[in
     return hits
 
 
-def start_amalgomation_fight(
-    *,
-    data_win: str | Path | None,
-    save_folder: str | Path | None = None,
-) -> tuple[bool, str]:
-    """Begin the host amalgamate battle (Endogeny). Director is started by the UI."""
-    if not data_win or not Path(data_win).is_file():
-        return False, "Open your Undertale folder (data.win) first."
-    if not undertale_is_running():
-        return (
-            False,
-            "Launch Undertale, load a save, stand in the overworld, then enter 666 again.",
-        )
-    ok, msg = start_fight(
-        HOST_BATTLEGROUP,
-        data_win=data_win,
-        ensure_debug=True,
-        save_folder=save_folder,
-    )
-    if not ok:
-        return False, f"Amalgomation host fight failed: {msg}"
-    return (
-        True,
-        "AMALGOMATION stirring (host: Endogeny). Chaos Director will escalate attacks. "
-        "It cannot be reasoned with. " + msg,
-    )
-
-
 class AmalgomationDirector:
-    """
-    Tk-friendly chaos loop. Call tick() on a timer from the UI thread,
-    or run_background() from a daemon thread with a stop event.
-    """
+    """Silent in-process chaos loop — no UI window."""
 
-    def __init__(self, *, on_update=None):
+    def __init__(self, data_win: Path, plan: AmalgomationPlan):
+        self.data_win = Path(data_win)
+        self.plan = plan
         self.state = ChaosState()
         self.rng = random.Random()
-        self.on_update = on_update
         self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
         self._player_hp_addrs: list[int] = []
         self._monster_hp_addrs: list[int] = []
+        self._monster_df_addrs: list[int] = []
         self._tick_count = 0
+        self._file_size = self.data_win.stat().st_size if self.data_win.is_file() else None
+        self._active_attack_slots: list[int] = []  # object ids currently stacked
 
     def start(self) -> None:
         self.state = ChaosState(running=True, layer=1, rounds=0, stack=[])
-        first = _pick_attack(self.rng, set())
-        self.state.stack = [first]
-        self.state.last_dialog = self.rng.choice(DIALOGS)
         self._stop.clear()
         self._tick_count = 0
+        gens = self.plan.resources.gen_object_ids or [1]
+        first = self.rng.choice(gens)
+        self._active_attack_slots = [first]
+        self.state.stack = [self._label_for_gen(first)]
         self._prime_memory_targets()
-        self._push_update()
+        self._apply_attack_slots()
+        self._morph_sprites()
+        if self._thread and self._thread.is_alive():
+            return
+        self._thread = threading.Thread(target=self._loop, daemon=True)
+        self._thread.start()
 
     def stop(self) -> None:
         self.state.running = False
         self._stop.set()
+
+    def _label_for_gen(self, oid: int) -> str:
+        for name, idx in self.plan.resources.objects.items():
+            if idx == oid:
+                return name.replace("obj_", "")
+        return f"gen#{oid}"
 
     def _prime_memory_targets(self) -> None:
         if not is_windows():
@@ -2952,97 +3238,207 @@ class AmalgomationDirector:
         if not pid:
             return
         try:
-            # Player often starts fights at 20 HP; monster amalgamate HP is larger
             self._player_hp_addrs = find_int32_addresses(pid, 20, max_hits=24)
             self._monster_hp_addrs = []
-            for seed in (100, 200, 300, 500, 1000, 1500):
-                self._monster_hp_addrs.extend(find_int32_addresses(pid, seed, max_hits=8))
-            # de-dupe
-            self._monster_hp_addrs = list(dict.fromkeys(self._monster_hp_addrs))[:40]
+            for seed in (50, 100, 150, 200, 300, 500, 1000, 1500):
+                self._monster_hp_addrs.extend(find_int32_addresses(pid, seed, max_hits=6))
+            self._monster_hp_addrs = list(dict.fromkeys(self._monster_hp_addrs))[:48]
+            self._monster_df_addrs = []
+            for seed in (0, 1, 2, 3, 4, 5, 10, 20, 25):
+                self._monster_df_addrs.extend(find_int32_addresses(pid, seed, max_hits=4))
+            self._monster_df_addrs = list(dict.fromkeys(self._monster_df_addrs))[:24]
         except Exception:
             self._player_hp_addrs = []
             self._monster_hp_addrs = []
+            self._monster_df_addrs = []
+
+    def _write_site_value(self, site: PatchSite, value: int) -> None:
+        word = (site.original & 0xFFFF0000) | (int(value) & 0xFFFF)
+        if not is_windows():
+            return
+        pid = find_undertale_pid()
+        if not pid or not self._file_size:
+            return
+        try:
+            write_int32_in_running_game(
+                pid, site.offset, word, expected_size=self._file_size
+            )
+        except Exception:
+            try:
+                patch_int32_in_data_win_image(self.data_win, site.offset, word)
+            except Exception:
+                pass
+
+    def _morph_sprites(self) -> None:
+        pool = self.plan.resources.sprite_ids
+        if not pool or not self.plan.sprite_sites:
+            return
+        # Each site gets a different random sprite → mismatched file-meat body
+        used: set[int] = set()
+        for site in self.plan.sprite_sites:
+            choices = [s for s in pool if s not in used] or pool
+            pick = self.rng.choice(choices)
+            used.add(pick)
+            self._write_site_value(site, pick)
+
+    def _apply_attack_slots(self) -> None:
+        if not self.plan.attack_sites:
+            return
+        slots = list(self._active_attack_slots) or [self.rng.choice(self.plan.resources.gen_object_ids or [1])]
+        # Assign stacked gens across all known attack PushI sites (cycle)
+        for i, site in enumerate(self.plan.attack_sites):
+            oid = slots[i % len(slots)]
+            self._write_site_value(site, oid)
+        # As layers grow, crank firing rate down (more bullets)
+        rate = max(1, 10 - self.state.layer * 2)
+        for site in self.plan.firingrate_sites[:4]:
+            self._write_site_value(site, rate)
+
+    def _add_stacked_attack(self) -> None:
+        gens = self.plan.resources.gen_object_ids
+        if not gens:
+            return
+        used = set(self._active_attack_slots)
+        choices = [g for g in gens if g not in used] or gens
+        nxt = self.rng.choice(choices)
+        self._active_attack_slots.append(nxt)
+        self.state.stack.append(self._label_for_gen(nxt))
+        self.state.layer = len(self._active_attack_slots)
+        self._apply_attack_slots()
 
     def tick(self) -> ChaosState:
-        """One director pulse (~1 second). Safe to call from UI timer."""
         if not self.state.running:
             return self.state
         self._tick_count += 1
         st = self.state
 
-        # Fake readouts (damage text / armor / hp display chaos)
         st.fake_hp = self.rng.randint(1, 99999)
         st.fake_df = self.rng.randint(0, 999)
         st.fake_damage = self.rng.choice(
             [0, 1, 9, 99, 999, 9999, 99999, -1, 32767, self.rng.randint(0, 999999)]
         )
 
-        if self._tick_count % 3 == 0:
-            st.last_dialog = self.rng.choice(DIALOGS)
+        # Appearance: constantly change between random game sprites
+        self._morph_sprites()
 
-        # Every ~2 rounds (≈ 8 ticks): add another stacked attack pattern
-        if self._tick_count % 8 == 0:
+        # Every round (~4s): swap the newest attack pattern for another random one
+        if self._tick_count % 4 == 0:
             st.rounds += 1
-            if st.rounds % 2 == 0 or len(st.stack) == 1:
-                nxt = _pick_attack(self.rng, set(st.stack))
-                st.stack.append(nxt)
-                st.layer = len(st.stack)
-            # Crank in-battle ATK / disable mercy as layers grow
-            if st.layer >= 2 and find_undertale_hwnd():
-                _send_key_to_undertale(VK_F6, presses=1)
+            gens = self.plan.resources.gen_object_ids
+            if gens and self._active_attack_slots:
+                self._active_attack_slots[-1] = self.rng.choice(gens)
+                st.stack[-1] = self._label_for_gen(self._active_attack_slots[-1])
+            self._apply_attack_slots()
+            # Every 2 rounds: stack another attack
+            if st.rounds > 0 and st.rounds % 2 == 0:
+                self._add_stacked_attack()
+                if find_undertale_hwnd():
+                    _send_key_to_undertale(VK_F6, presses=1)
 
-        # Memory scramble: monster HP/DF-like values + chip player HP at high layers
+        # HP / armor scramble every second
         pid = find_undertale_pid()
         if pid and is_windows():
             try:
-                scramble_u32_candidates(pid, self._monster_hp_addrs, 1, 99999, limit=10)
+                scramble_u32_candidates(pid, self._monster_hp_addrs, 1, 99999, limit=12)
+                scramble_u32_candidates(pid, self._monster_df_addrs, 0, 999, limit=8)
+                # Glitch damage readouts — poke common damage ints
+                dmg_addrs = find_int32_addresses(pid, 0, max_hits=8) if self._tick_count % 5 == 0 else []
+                if dmg_addrs:
+                    scramble_u32_candidates(
+                        pid, dmg_addrs, -9, 99999, limit=6
+                    )
+                # Escalate: chip then kill the player
                 if st.layer >= 3:
-                    # Chip the player — amalgomation cannot be escaped forever
-                    scramble_u32_candidates(pid, self._player_hp_addrs, 1, max(2, 12 - st.layer), limit=6)
+                    scramble_u32_candidates(
+                        pid, self._player_hp_addrs, 1, max(2, 14 - st.layer), limit=6
+                    )
                 if st.layer >= 6:
-                    scramble_u32_candidates(pid, self._player_hp_addrs, 0, 1, limit=8)
+                    scramble_u32_candidates(pid, self._player_hp_addrs, 0, 1, limit=10)
+                if st.layer >= 8:
+                    scramble_u32_candidates(pid, self._player_hp_addrs, 0, 0, limit=12)
             except Exception:
                 pass
 
-        self._push_update()
         return st
 
-    def _push_update(self) -> None:
-        if self.on_update:
+    def _loop(self) -> None:
+        while not self._stop.is_set() and self.state.running:
             try:
-                self.on_update(self.state)
+                self.tick()
             except Exception:
                 pass
+            self._stop.wait(1.0)
 
-    def run_background(self, interval: float = 1.0) -> None:
-        self.start()
 
-        def loop() -> None:
-            while not self._stop.is_set() and self.state.running:
-                try:
-                    self.tick()
-                except Exception:
-                    pass
-                self._stop.wait(interval)
+def stop_amalgomation_director() -> None:
+    global _ACTIVE_DIRECTOR
+    with _DIRECTOR_LOCK:
+        if _ACTIVE_DIRECTOR is not None:
+            _ACTIVE_DIRECTOR.stop()
+            _ACTIVE_DIRECTOR = None
 
-        threading.Thread(target=loop, daemon=True).start()
+
+def start_amalgomation_fight(
+    *,
+    data_win: str | Path | None,
+    save_folder: str | Path | None = None,
+) -> tuple[bool, str]:
+    """Install in-game morph patches, start host fight, run silent director."""
+    if not data_win or not Path(data_win).is_file():
+        return False, "Open your Undertale folder (data.win) first."
+    if not undertale_is_running():
+        return (
+            False,
+            "Launch Undertale, load a save, stand in the overworld, then enter 666 again.",
+        )
+
+    stop_amalgomation_director()
+    ok_inst, inst_msg, plan = install_amalgomation_into_data_win(data_win)
+    if not plan.resources.sprite_ids and not plan.sprite_sites:
+        return (
+            False,
+            "Could not index sprites/objects in data.win for Amalgomation. " + inst_msg,
+        )
+
+    ok, msg = start_fight(
+        HOST_BATTLEGROUP,
+        data_win=data_win,
+        ensure_debug=True,
+        save_folder=save_folder,
+    )
+    if not ok:
+        return False, f"Amalgomation fight failed: {msg}"
+
+    director = AmalgomationDirector(Path(data_win), plan)
+    with _DIRECTOR_LOCK:
+        global _ACTIVE_DIRECTOR
+        _ACTIVE_DIRECTOR = director
+    # Give the battle a moment to spawn, then morph hard
+    def _boot() -> None:
+        time.sleep(0.8)
+        director.start()
+
+    threading.Thread(target=_boot, daemon=True).start()
+
+    return (
+        True,
+        "AMALGOMATION is inside the game now (no extra window). "
+        "Appearance morphs across random sprites; attacks stack every 2 rounds. "
+        "It cannot be spared, killed, or fled from. "
+        + inst_msg
+        + " | "
+        + msg,
+    )
 
 
 def open_amalgomation_ui(parent, *, data_win: Path | None, save_folder: Path | None, on_status=None):
-    """Modal-ish director window with shifting sprite collage + chaos readout."""
-
-    COLORS = {
-        "bg": "#1a1210",
-        "panel": "#2a1c18",
-        "ink": "#f2e6d8",
-        "muted": "#a89080",
-        "accent": "#c43c2e",
-    }
+    """Confirm + launch — everything stays in the Undertale window."""
 
     warn = (
-        "AMALGOMATION is exclusive to this toolkit (id 666).\n\n"
-        "It starts an amalgamate host fight, then stacks random attack patterns "
-        "every two rounds until you cannot dodge. It cannot be spared, killed, or fled from.\n\n"
+        "AMALGOMATION (id 666) runs entirely inside Undertale.\n\n"
+        "A creature made of random game files will morph in battle, use random "
+        "stacked attacks that escalate every 2 rounds, scramble HP/armor, and "
+        "glitch damage text. It cannot be spared, killed, or fled from.\n\n"
         "Stand in the overworld. Continue?"
     )
     if not messagebox.askyesno("AMALGOMATION", warn, parent=parent):
@@ -3051,140 +3447,10 @@ def open_amalgomation_ui(parent, *, data_win: Path | None, save_folder: Path | N
     ok, msg = start_amalgomation_fight(data_win=data_win, save_folder=save_folder)
     if on_status:
         on_status(msg)
-    if not ok:
+    if ok:
+        messagebox.showinfo("AMALGOMATION", msg, parent=parent)
+    else:
         messagebox.showwarning("AMALGOMATION", msg, parent=parent)
-        return
-
-    win = ctk.CTkToplevel(parent)
-    win.title("AMALGOMATION")
-    win.geometry("520x640")
-    win.configure(fg_color=COLORS["bg"])
-    win.attributes("-topmost", True)
-
-    ctk.CTkLabel(
-        win,
-        text="AMALGOMATION",
-        font=ctk.CTkFont(family="Courier New", size=26, weight="bold"),
-        text_color=COLORS["accent"],
-    ).pack(anchor="w", padx=16, pady=(14, 2))
-    ctk.CTkLabel(
-        win,
-        text="a creature made of files that should not combine",
-        text_color=COLORS["muted"],
-    ).pack(anchor="w", padx=16)
-
-    canvas = ctk.CTkLabel(win, text="", width=480, height=220, fg_color=COLORS["panel"])
-    canvas.pack(padx=16, pady=12)
-
-    dialog_var = ctk.StringVar(value="* …")
-    stats_var = ctk.StringVar(value="HP ????   DF ????   DMG ????")
-    stack_var = ctk.StringVar(value="Layer 1")
-    ctk.CTkLabel(win, textvariable=dialog_var, text_color=COLORS["ink"], wraplength=480, justify="left").pack(
-        anchor="w", padx=16, pady=6
-    )
-    ctk.CTkLabel(win, textvariable=stats_var, text_color=COLORS["accent"], font=ctk.CTkFont(family="Courier New", size=14)).pack(
-        anchor="w", padx=16
-    )
-    ctk.CTkLabel(win, textvariable=stack_var, text_color=COLORS["muted"], wraplength=480, justify="left").pack(
-        anchor="w", padx=16, pady=8
-    )
-
-    sprite_images: list = []
-    photo_holder = {"img": None}
-
-    def load_sprite_pool() -> None:
-        nonlocal sprite_images
-        if not data_win or not Path(data_win).is_file():
-            return
-        try:
-
-            result = load_undertale_assets(str(data_win), progress=lambda _m: None)
-            imgs = []
-            for asset in result.assets:
-                if asset.kind != AssetKind.SPRITE:
-                    continue
-                try:
-                    im = asset.get_image()
-                    if im is None:
-                        continue
-                    im = im.convert("RGBA")
-                    im.thumbnail((160, 160))
-                    imgs.append(im)
-                    if len(imgs) >= 80:
-                        break
-                except Exception:
-                    continue
-            sprite_images = imgs
-        except Exception:
-            sprite_images = []
-
-    win.after(100, load_sprite_pool)
-
-    def paint_creature() -> None:
-        if not sprite_images:
-            canvas.configure(text="loading file-meat…")
-            return
-        base = Image.new("RGBA", (480, 220), (20, 12, 10, 255))
-        for _ in range(random.randint(3, 8)):
-            piece = random.choice(sprite_images).copy()
-            piece = piece.rotate(random.randint(0, 359), expand=True)
-            piece.thumbnail((random.randint(40, 140), random.randint(40, 140)))
-            x = random.randint(-20, 400)
-            y = random.randint(-20, 160)
-            base.alpha_composite(piece, (x, y))
-        # jitter / glitch bars
-        for _ in range(5):
-            y = random.randint(0, 210)
-            for x in range(0, 480, 3):
-                if random.random() < 0.15:
-                    base.putpixel((x, y), (255, random.randint(0, 80), random.randint(0, 40), 200))
-        photo = ImageTk.PhotoImage(base)
-        photo_holder["img"] = photo
-        canvas.configure(image=photo, text="")
-
-    director = AmalgomationDirector()
-
-    def on_update(st: ChaosState) -> None:
-        dialog_var.set(st.last_dialog)
-        stats_var.set(
-            f"HP {st.fake_hp}   DF {st.fake_df}   DMG {st.fake_damage}   [UNSTABLE]"
-        )
-        stack_var.set(
-            f"Chaos layer {st.layer} — stacked patterns:\n"
-            + " + ".join(st.stack[-8:])
-            + (" …" if len(st.stack) > 8 else "")
-        )
-
-    director.on_update = on_update
-    director.start()
-
-    def pulse() -> None:
-        if not director.state.running:
-            return
-        director.tick()
-        paint_creature()
-        win.after(1000, pulse)
-
-    def halt() -> None:
-        director.stop()
-        win.destroy()
-
-    ctk.CTkButton(
-        win,
-        text="Sever link (stop director)",
-        command=halt,
-        fg_color=COLORS["accent"],
-        hover_color="#a03020",
-    ).pack(pady=12)
-
-    win.protocol("WM_DELETE_WINDOW", halt)
-    win.after(400, pulse)
-    messagebox.showinfo(
-        "AMALGOMATION",
-        "The host fight has started. Keep Undertale focused in the overworld/battle.\n"
-        "Patterns will stack every two rounds. Do not expect mercy.",
-        parent=win,
-    )
 
 
 # --- toolkit.py ---
@@ -3566,7 +3832,7 @@ class DebugToolkit(ctk.CTkToplevel):
             "(or Steam Verify) → Enable live patches → Launch → overworld → Start Fight. "
             "Home fight patches obj_mainchara KeyPress_36 (battlegroup = 57+nnn). "
             "Stay in the overworld. Do not spam the 5 key (that shifts the id).\n"
-            "Secret: type 666 as the id for AMALGOMATION (not on the monster list).",
+            "Secret: type 666 for AMALGOMATION — in-game only (morphing sprite, stacked attacks).",
             text_color=COLORS["muted"],
             wraplength=600,
             justify="left",
