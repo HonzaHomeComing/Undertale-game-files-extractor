@@ -18,6 +18,7 @@ from .live_teleport import (
     _send_key_to_undertale,
     debug_flag_enabled,
     enable_debug_mode,
+    enable_debug_mode_live,
     find_undertale_hwnd,
     undertale_is_running,
     VK_ESCAPE,
@@ -303,12 +304,18 @@ def trigger_home_fight() -> tuple[bool, str]:
     if not find_undertale_hwnd():
         return False, "Could not find the UNDERTALE window."
     # Must be in the overworld with Frisk (KeyPress_36 is on obj_mainchara).
-    _send_key_to_undertale(VK_ESCAPE, presses=1)
-    time.sleep(0.08)
-    if not _send_key_to_undertale(VK_HOME_KEY, presses=2):
+    # Clear menus/dialog so Home is received by the player object.
+    for _ in range(3):
+        _send_key_to_undertale(VK_ESCAPE, presses=1)
+        time.sleep(0.06)
+    time.sleep(0.1)
+    if not _send_key_to_undertale(VK_HOME_KEY, presses=3):
         return False, "Could not send the Home key. Click the Undertale window and press Home."
+    time.sleep(0.35)
+    # Second burst — first Home is sometimes eaten while focus settles.
+    _send_key_to_undertale(VK_HOME_KEY, presses=2)
     time.sleep(0.2)
-    return True, "Sent Home — be in the overworld (not a menu). Fight starts if debug is on."
+    return True, "Sent Home — fight should start in the overworld (debug must be on)."
 
 
 def start_fight(
@@ -335,13 +342,18 @@ def start_fight(
                 battlegroup_id = RARE_BATTLEGROUPS[0].id
                 notes.append(f"rare mode → battlegroup {battlegroup_id}")
 
-    if ensure_debug and not debug_flag_enabled(data_win):
+    if ensure_debug:
         try:
-            if not undertale_is_running():
-                enable_debug_mode(data_win, backup=True)
-                notes.append("enabled debug")
-            else:
-                notes.append("debug flag off on disk — relaunch after Enable live patches")
+            if undertale_is_running():
+                ok_dbg, dbg_msg = enable_debug_mode_live(data_win)
+                notes.append(dbg_msg)
+                if not ok_dbg and not debug_flag_enabled(data_win):
+                    notes.append("debug off — click Enable live patches, relaunch, retry")
+            elif not debug_flag_enabled(data_win):
+                if enable_debug_mode(data_win, backup=True):
+                    notes.append("enabled debug")
+                else:
+                    notes.append("debug offsets not found")
         except Exception as exc:
             notes.append(f"debug failed: {exc}")
 
@@ -355,7 +367,7 @@ def start_fight(
         notes.append(live_msg)
         if not live_ok:
             return False, " | ".join(notes)
-        time.sleep(0.15)
+        time.sleep(0.2)
         ok2, msg2 = trigger_home_fight()
         notes.append(msg2)
         return ok2, " | ".join(notes)

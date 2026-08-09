@@ -101,11 +101,6 @@ _HOST_SPRITE_NAMES = (
     "spr_endogeny_2",
 )
 
-_NAME_STRINGS = (
-    b"Amalgamate",
-    b"Endogeny",
-)
-
 
 @dataclass
 class ResourceIndex:
@@ -337,102 +332,62 @@ def build_amalgomation_plan(data: bytes) -> AmalgomationPlan:
     return plan
 
 
-def _write_pushi(data: bytearray, offset: int, template: int, value: int) -> None:
-    new_word = (template & 0xFFFF0000) | (int(value) & 0xFFFF)
-    struct.pack_into("<I", data, offset, new_word)
-
-
-def _patch_disk_and_live(
-    data_win: Path,
-    data: bytearray,
-    sites: list[tuple[int, int]],
-) -> list[str]:
-    """sites: (offset, new_u32_word). Writes disk + live FORM copy."""
-    notes = []
-    for offset, word in sites:
-        if offset < 0 or offset + 4 > len(data):
-            continue
-        struct.pack_into("<I", data, offset, word & 0xFFFFFFFF)
-    try:
-        data_win.write_bytes(data)
-        notes.append("data.win updated")
-    except OSError as exc:
-        notes.append(f"disk write failed: {exc}")
-        return notes
-    if undertale_is_running() and is_windows():
-        pid = find_undertale_pid()
-        size = data_win.stat().st_size
-        for offset, word in sites:
-            try:
-                ok = write_int32_in_running_game(
-                    pid, offset, word & 0xFFFFFFFF, expected_size=size
-                )
-                if ok:
-                    notes.append(f"live@0x{offset:X}")
-            except Exception:
-                continue
-    return notes
-
-
-def _backup(data_win: Path) -> Path:
-    bak = data_win.with_suffix(data_win.suffix + ".amalgobak")
-    if not bak.exists():
-        bak.write_bytes(data_win.read_bytes())
-    return bak
-
-
-def install_amalgomation_into_data_win(data_win: str | Path) -> tuple[bool, str, AmalgomationPlan]:
+def restore_amalgomation_backup_if_any(data_win: str | Path) -> tuple[bool, str]:
     """
-    One-shot structural patches: neutralize mercy shortcuts, open both attack
-    branches, stamp AMALGOMATION name strings. Sprite/attack IDs are left to
-    the live director so they keep changing.
+    Undo prior Amalgomation disk corruption (string overflows / branch hacks).
+    Returns (restored, message).
+    """
+    path = Path(data_win)
+    bak = path.with_suffix(path.suffix + ".amalgobak")
+    if not bak.is_file():
+        return False, ""
+    try:
+        current = path.read_bytes()
+        clean = bak.read_bytes()
+    except OSError as exc:
+        return False, f"Could not read amalgomation backup: {exc}"
+    if current == clean:
+        return False, ""
+    try:
+        path.write_bytes(clean)
+    except OSError as exc:
+        return False, f"Could not restore amalgomation backup: {exc}"
+    return True, (
+        "Restored data.win from .amalgobak (previous Amalgomation install corrupted it). "
+        "Close Undertale completely, click Launch Undertale, load your save, then enter 666 again."
+    )
+
+
+def prepare_amalgomation_plan(data_win: str | Path) -> tuple[bool, str, AmalgomationPlan]:
+    """
+    Index sprites/attack sites only. Does NOT rewrite data.win structure
+    (earlier installs corrupted strings and broke fight start).
     """
     path = Path(data_win)
     if not path.is_file():
         return False, "data.win missing", AmalgomationPlan()
-    _backup(path)
-    raw = bytearray(path.read_bytes())
-    plan = build_amalgomation_plan(bytes(raw))
-    writes: list[tuple[int, int]] = []
-
-    # Soften BF between the two host creates so the false-branch skip is tiny
-    # (both attack patterns can run in one turn). Offset encoded in low 24 bits.
-    for site in plan.branch_sites:
-        if (site.original >> 24) & 0xFF == OP_BF:
-            writes.append((site.offset, (OP_BF << 24) | 0x000002))
-
-    # Break spare thresholds (999999 / 222) so petting never soft-locks to spare
-    for site in plan.mercymod_sites:
-        writes.append((site.offset, (site.original & 0xFFFF0000) | 0x0001))
-
-    # Rename visible "Amalgamate" / "Endogeny" strings when length allows
-    for needle in _NAME_STRINGS:
-        replacement = b"AMALGOMATION"
-        start = 0
-        while True:
-            idx = raw.find(needle, start)
-            if idx < 0:
-                break
-            # Only replace if we have room (same or shorter) or exact field
-            if len(replacement) <= len(needle) + 4:
-                # Write replacement and pad with spaces/nulls into old span
-                span = max(len(needle), len(replacement))
-                chunk = replacement[:span].ljust(span, b"\x00")
-                raw[idx : idx + span] = chunk[:span]
-                # Also try live later via full file write
-            start = idx + 1
-
-    notes = _patch_disk_and_live(path, raw, writes)
-    # Re-read plan from patched file for director
-    plan = build_amalgomation_plan(path.read_bytes())
-    ok = bool(plan.sprite_sites or plan.attack_sites or plan.resources.sprite_ids)
+    restored, restore_msg = restore_amalgomation_backup_if_any(path)
+    if restored:
+        # Caller must relaunch — in-memory FORM is still dirty.
+        return False, restore_msg, AmalgomationPlan()
+    try:
+        raw = path.read_bytes()
+    except OSError as exc:
+        return False, str(exc), AmalgomationPlan()
+    plan = build_amalgomation_plan(raw)
+    ok = bool(plan.resources.sprite_ids) or bool(plan.sprite_sites) or bool(plan.attack_sites)
     msg = (
-        f"Amalgomation installed in-game "
-        f"(sprites={len(plan.sprite_sites)}, attacks={len(plan.attack_sites)}, "
+        f"Amalgomation ready (sprite sites={len(plan.sprite_sites)}, "
+        f"attack sites={len(plan.attack_sites)}, "
         f"gens={len(plan.resources.gen_object_ids)}, "
-        f"spritepool={len(plan.resources.sprite_ids)}). " + "; ".join(notes)
+        f"spritepool={len(plan.resources.sprite_ids)})"
     )
     return ok, msg, plan
+
+
+def install_amalgomation_into_data_win(data_win: str | Path) -> tuple[bool, str, AmalgomationPlan]:
+    """Backward-compatible name — now non-destructive (plan only). """
+    return prepare_amalgomation_plan(data_win)
 
 
 def scramble_u32_candidates(
@@ -678,7 +633,7 @@ def start_amalgomation_fight(
     data_win: str | Path | None,
     save_folder: str | Path | None = None,
 ) -> tuple[bool, str]:
-    """Install in-game morph patches, start host fight, run silent director."""
+    """Start host fight first, then morph it live — no extra windows, no disk corruption."""
     if not data_win or not Path(data_win).is_file():
         return False, "Open your Undertale folder (data.win) first."
     if not undertale_is_running():
@@ -688,13 +643,12 @@ def start_amalgomation_fight(
         )
 
     stop_amalgomation_director()
-    ok_inst, inst_msg, plan = install_amalgomation_into_data_win(data_win)
-    if not plan.resources.sprite_ids and not plan.sprite_sites:
-        return (
-            False,
-            "Could not index sprites/objects in data.win for Amalgomation. " + inst_msg,
-        )
+    ok_inst, inst_msg, plan = prepare_amalgomation_plan(data_win)
+    if not ok_inst:
+        # Includes "close and relaunch" after restoring a corrupted backup.
+        return False, inst_msg
 
+    # Fight first — director only starts after the battle has time to appear.
     ok, msg = start_fight(
         HOST_BATTLEGROUP,
         data_win=data_win,
@@ -702,24 +656,34 @@ def start_amalgomation_fight(
         save_folder=save_folder,
     )
     if not ok:
-        return False, f"Amalgomation fight failed: {msg}"
+        return False, f"Amalgomation fight failed to start: {msg}"
 
     director = AmalgomationDirector(Path(data_win), plan)
     with _DIRECTOR_LOCK:
         global _ACTIVE_DIRECTOR
         _ACTIVE_DIRECTOR = director
-    # Give the battle a moment to spawn, then morph hard
+
     def _boot() -> None:
-        time.sleep(0.8)
-        director.start()
+        # One more Home burst after focus settles, then morph once battle exists.
+        time.sleep(0.9)
+        if not undertale_is_running():
+            return
+        from .battles import VK_HOME_KEY
+
+        if find_undertale_hwnd():
+            _send_key_to_undertale(0x1B, presses=1)  # Esc — leave menus
+            time.sleep(0.08)
+            _send_key_to_undertale(VK_HOME_KEY, presses=3)
+        time.sleep(1.6)
+        if undertale_is_running():
+            director.start()
 
     threading.Thread(target=_boot, daemon=True).start()
 
     return (
         True,
-        "AMALGOMATION is inside the game now (no extra window). "
-        "Appearance morphs across random sprites; attacks stack every 2 rounds. "
-        "It cannot be spared, killed, or fled from. "
+        "AMALGOMATION — focus the Undertale window; the fight should start now. "
+        "If not, press Home once in the overworld. "
         + inst_msg
         + " | "
         + msg,
@@ -727,23 +691,8 @@ def start_amalgomation_fight(
 
 
 def open_amalgomation_ui(parent, *, data_win: Path | None, save_folder: Path | None, on_status=None):
-    """Confirm + launch — everything stays in the Undertale window."""
-    from tkinter import messagebox
-
-    warn = (
-        "AMALGOMATION (id 666) runs entirely inside Undertale.\n\n"
-        "A creature made of random game files will morph in battle, use random "
-        "stacked attacks that escalate every 2 rounds, scramble HP/armor, and "
-        "glitch damage text. It cannot be spared, killed, or fled from.\n\n"
-        "Stand in the overworld. Continue?"
-    )
-    if not messagebox.askyesno("AMALGOMATION", warn, parent=parent):
-        return
-
+    """Launch with no popup dialogs — status line only."""
     ok, msg = start_amalgomation_fight(data_win=data_win, save_folder=save_folder)
     if on_status:
-        on_status(msg)
-    if ok:
-        messagebox.showinfo("AMALGOMATION", msg, parent=parent)
-    else:
-        messagebox.showwarning("AMALGOMATION", msg, parent=parent)
+        on_status(msg if ok else f"AMALGOMATION: {msg}")
+    # Intentionally no messagebox — user wants only the game window.

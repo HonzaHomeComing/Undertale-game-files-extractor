@@ -202,6 +202,49 @@ def enable_debug_mode(data_win: str | Path, *, backup: bool = True) -> bool:
     return True
 
 
+def enable_debug_mode_live(data_win: str | Path) -> tuple[bool, str]:
+    """
+    Enable debug on disk and in the running process FORM image.
+    Home-key fights need the in-memory flag, not only the file on disk.
+    """
+    path = Path(data_win)
+    if not path.is_file():
+        return False, "data.win missing"
+    disk_ok = enable_debug_mode(path, backup=True)
+    if not is_windows() or not undertale_is_running():
+        return disk_ok, "debug on disk" if disk_ok else "debug offsets not found"
+    from .memory_patch import _open_process, _write, find_form_base, kernel32
+
+    pid = find_undertale_pid()
+    if not pid:
+        return disk_ok, "debug on disk (process not found)"
+    size = path.stat().st_size
+    data = path.read_bytes()
+    wrote = 0
+    handle = None
+    try:
+        handle = _open_process(pid)
+        form = find_form_base(handle, expected_size=size)
+        if form is None:
+            return disk_ok, "debug on disk (live FORM not found — relaunch after Enable live patches)"
+        for offset in DEBUG_OFFSETS:
+            if offset >= len(data):
+                continue
+            try:
+                _write(handle, form + offset, b"\x01")
+                wrote += 1
+            except RuntimeError:
+                continue
+    except RuntimeError as exc:
+        return disk_ok, f"debug on disk; live failed: {exc}"
+    finally:
+        if handle and kernel32:
+            kernel32.CloseHandle(handle)
+    if wrote:
+        return True, f"debug live ({wrote} flag byte(s))"
+    return disk_ok, "debug on disk (live write missed)"
+
+
 def debug_flag_enabled(data_win: str | Path) -> bool:
     path = Path(data_win)
     data = path.read_bytes()
