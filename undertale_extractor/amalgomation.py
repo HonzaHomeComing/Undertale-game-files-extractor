@@ -21,31 +21,56 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from .battles import push_imm, start_fight
+from .battles import (
+    VK_HOME_KEY,
+    push_imm,
+    set_home_battlegroup,
+    set_home_battlegroup_live,
+    trigger_home_fight,
+)
 from .binary import BinaryReader
-from .dogcheck import _find_code_entries
+from .dogcheck import (
+    _find_code_entries,
+    disable_dogcheck,
+    dogcheck_exit_stubbed,
+    restore_data_win_backup,
+)
+from .launcher import launch_undertale
 from .live_teleport import (
     _send_key_to_undertale,
+    enable_debug_mode,
+    enable_debug_mode_live,
     find_undertale_hwnd,
     find_undertale_pid,
     is_windows,
+    kill_undertale,
     undertale_is_running,
+    wait_for_undertale_window,
 )
 from .memory_patch import (
     _open_process,
-    _read,
     _write,
     iter_process_memory,
     kernel32,
     patch_int32_in_data_win_image,
     write_int32_in_running_game,
 )
+from .teleport import teleport_to_room
 
 AMALGOMATION_ID = 666
 # Vessel fight: Endogeny battlegroup — rewritten in-place into Amalgomation.
 HOST_BATTLEGROUP = 86
+# Ruins Entrance SAVE — Continue lands in overworld (skips intro cutscenes).
+OVERWORLD_SKIP_ROOM = 6
 
 VK_F6 = 0x75  # debug: mercy 0, ATK 999
+VK_Z = 0x5A
+VK_RETURN = 0x0D
+VK_DOWN = 0x28
+VK_UP = 0x26
+VK_X = 0x58
+VK_ESCAPE = 0x1B
+VK_C = 0x43
 
 OP_PUSHI = 0x84
 OP_BF = 0xB8
@@ -358,18 +383,27 @@ def restore_amalgomation_backup_if_any(data_win: str | Path) -> tuple[bool, str]
     )
 
 
-def prepare_amalgomation_plan(data_win: str | Path) -> tuple[bool, str, AmalgomationPlan]:
+def prepare_amalgomation_plan(
+    data_win: str | Path,
+    *,
+    abort_after_restore: bool = True,
+) -> tuple[bool, str, AmalgomationPlan]:
     """
-    Index sprites/attack sites only. Does NOT rewrite data.win structure
-    (earlier installs corrupted strings and broke fight start).
+    Index sprites/attack sites only. Does NOT rewrite data.win structure.
+
+    If abort_after_restore is False (autofight), restore dirty files then continue.
     """
     path = Path(data_win)
     if not path.is_file():
         return False, "data.win missing", AmalgomationPlan()
     restored, restore_msg = restore_amalgomation_backup_if_any(path)
-    if restored:
-        # Caller must relaunch — in-memory FORM is still dirty.
-        return False, restore_msg, AmalgomationPlan()
+    if restored and abort_after_restore:
+        return (
+            False,
+            restore_msg
+            + " Use the AMALGOMATION AUTO button to close/launch/fight for you.",
+            AmalgomationPlan(),
+        )
     try:
         raw = path.read_bytes()
     except OSError as exc:
@@ -382,6 +416,8 @@ def prepare_amalgomation_plan(data_win: str | Path) -> tuple[bool, str, Amalgoma
         f"gens={len(plan.resources.gen_object_ids)}, "
         f"spritepool={len(plan.resources.sprite_ids)})"
     )
+    if restored:
+        msg = restore_msg + " | " + msg
     return ok, msg, plan
 
 
@@ -628,71 +664,190 @@ def stop_amalgomation_director() -> None:
             _ACTIVE_DIRECTOR = None
 
 
+def _status(on_status, msg: str) -> None:
+    if on_status:
+        try:
+            on_status(msg)
+        except Exception:
+            pass
+
+
+def _mash_confirm(*, rounds: int = 12, delay: float = 0.18) -> None:
+    """Skip logos / dialogue / menus with Z + Enter."""
+    for _ in range(rounds):
+        _send_key_to_undertale(VK_Z, presses=1)
+        _send_key_to_undertale(VK_RETURN, presses=1)
+        time.sleep(delay)
+
+
+def _skip_intro_and_continue_save() -> None:
+    """
+    After launch: blast through splash screens, pick Continue, clear dialogue
+    so Frisk is controllable in the overworld.
+    """
+    time.sleep(2.5)
+    _mash_confirm(rounds=18, delay=0.16)
+    # Title menu — Continue is usually first when a save exists; nudge selection.
+    _send_key_to_undertale(VK_UP, presses=2)
+    time.sleep(0.1)
+    _send_key_to_undertale(VK_Z, presses=2)
+    _send_key_to_undertale(VK_RETURN, presses=1)
+    time.sleep(1.2)
+    # Skip any post-load text / Toriel lines
+    for _ in range(25):
+        _send_key_to_undertale(VK_X, presses=1)
+        _send_key_to_undertale(VK_C, presses=1)
+        _send_key_to_undertale(VK_Z, presses=1)
+        _send_key_to_undertale(VK_ESCAPE, presses=1)
+        time.sleep(0.12)
+    _send_key_to_undertale(VK_ESCAPE, presses=2)
+    time.sleep(0.3)
+
+
+def _boot_director(data_win: Path, plan: AmalgomationPlan) -> None:
+    director = AmalgomationDirector(data_win, plan)
+    with _DIRECTOR_LOCK:
+        global _ACTIVE_DIRECTOR
+        _ACTIVE_DIRECTOR = director
+
+    def _run() -> None:
+        time.sleep(1.2)
+        if undertale_is_running():
+            director.start()
+
+    threading.Thread(target=_run, daemon=True).start()
+
+
+def run_amalgomation_autofight(
+    *,
+    data_win: str | Path | None,
+    save_folder: str | Path | None = None,
+    on_status=None,
+) -> tuple[bool, str]:
+    """
+    One-click: close Undertale → restore/patch → launch → skip intro → start fight.
+
+    No manual close/launch/Continue required.
+    """
+    if not data_win or not Path(data_win).is_file():
+        return False, "Open your Undertale folder (data.win) first."
+    if not is_windows():
+        return False, "AMALGOMATION auto requires Windows."
+
+    path = Path(data_win)
+    stop_amalgomation_director()
+    steps: list[str] = []
+
+    _status(on_status, "AMALGOMATION: closing Undertale…")
+    ok_kill, kill_msg = kill_undertale()
+    steps.append(kill_msg)
+    time.sleep(1.0)
+    if find_undertale_pid():
+        return False, "Could not close Undertale. End it in Task Manager, then try again."
+
+    # Broken Exit-stub dogcheck → full restore first
+    try:
+        if dogcheck_exit_stubbed(path):
+            _status(on_status, "AMALGOMATION: restoring broken data.win…")
+            rok, rmsg = restore_data_win_backup(path)
+            steps.append(rmsg if rok else f"restore: {rmsg}")
+    except Exception as exc:
+        steps.append(f"dogcheck check: {exc}")
+
+    _status(on_status, "AMALGOMATION: preparing patches…")
+    ok_plan, plan_msg, plan = prepare_amalgomation_plan(path, abort_after_restore=False)
+    steps.append(plan_msg)
+    if not ok_plan and not plan.resources.sprite_ids:
+        return False, " | ".join(steps)
+
+    try:
+        if enable_debug_mode(path, backup=True):
+            steps.append("debug ON")
+    except Exception as exc:
+        steps.append(f"debug failed: {exc}")
+    try:
+        dok, dmsg = disable_dogcheck(path, backup=True)
+        steps.append("dogcheck OFF" if dok else dmsg)
+    except Exception as exc:
+        steps.append(f"dogcheck failed: {exc}")
+
+    ok_bg, bg_msg = set_home_battlegroup(path, HOST_BATTLEGROUP, backup=True)
+    steps.append(bg_msg)
+    if not ok_bg:
+        return False, " | ".join(steps)
+
+    # Skip intro: Continue loads Ruins Entrance overworld
+    _status(on_status, "AMALGOMATION: writing overworld save (skip intro)…")
+    try:
+        teleport_to_room(OVERWORLD_SKIP_ROOM, save_folder, backup=True)
+        steps.append(f"save → room {OVERWORLD_SKIP_ROOM}")
+    except Exception as exc:
+        steps.append(f"save teleport failed: {exc} (will still try Continue)")
+
+    _status(on_status, "AMALGOMATION: launching Undertale…")
+    lok, lmsg = launch_undertale(data_win=path)
+    steps.append(lmsg)
+    if not lok:
+        return False, " | ".join(steps)
+
+    _status(on_status, "AMALGOMATION: waiting for game window…")
+    if not wait_for_undertale_window(timeout=75.0):
+        return False, "Undertale did not open a window. | " + " | ".join(steps)
+
+    _status(on_status, "AMALGOMATION: skipping intro / Continue…")
+    _skip_intro_and_continue_save()
+
+    _status(on_status, "AMALGOMATION: enabling live debug + starting fight…")
+    try:
+        enable_debug_mode_live(path)
+    except Exception:
+        pass
+    live_ok, live_msg = set_home_battlegroup_live(path, HOST_BATTLEGROUP)
+    steps.append(live_msg)
+    time.sleep(0.25)
+    tok, tmsg = trigger_home_fight()
+    steps.append(tmsg)
+    # Extra Home bursts while overworld settles
+    time.sleep(0.6)
+    for _ in range(3):
+        _send_key_to_undertale(VK_ESCAPE, presses=1)
+        time.sleep(0.05)
+        _send_key_to_undertale(VK_HOME_KEY, presses=2)
+        time.sleep(0.45)
+
+    _boot_director(path, plan)
+    _status(on_status, "AMALGOMATION fight should be running in Undertale.")
+    return True, "AMALGOMATION AUTO done. | " + " | ".join(steps)
+
+
 def start_amalgomation_fight(
     *,
     data_win: str | Path | None,
     save_folder: str | Path | None = None,
 ) -> tuple[bool, str]:
-    """Start host fight first, then morph it live — no extra windows, no disk corruption."""
-    if not data_win or not Path(data_win).is_file():
-        return False, "Open your Undertale folder (data.win) first."
-    if not undertale_is_running():
-        return (
-            False,
-            "Launch Undertale, load a save, stand in the overworld, then enter 666 again.",
-        )
-
-    stop_amalgomation_director()
-    ok_inst, inst_msg, plan = prepare_amalgomation_plan(data_win)
-    if not ok_inst:
-        # Includes "close and relaunch" after restoring a corrupted backup.
-        return False, inst_msg
-
-    # Fight first — director only starts after the battle has time to appear.
-    ok, msg = start_fight(
-        HOST_BATTLEGROUP,
-        data_win=data_win,
-        ensure_debug=True,
-        save_folder=save_folder,
-    )
-    if not ok:
-        return False, f"Amalgomation fight failed to start: {msg}"
-
-    director = AmalgomationDirector(Path(data_win), plan)
-    with _DIRECTOR_LOCK:
-        global _ACTIVE_DIRECTOR
-        _ACTIVE_DIRECTOR = director
-
-    def _boot() -> None:
-        # One more Home burst after focus settles, then morph once battle exists.
-        time.sleep(0.9)
-        if not undertale_is_running():
-            return
-        from .battles import VK_HOME_KEY
-
-        if find_undertale_hwnd():
-            _send_key_to_undertale(0x1B, presses=1)  # Esc — leave menus
-            time.sleep(0.08)
-            _send_key_to_undertale(VK_HOME_KEY, presses=3)
-        time.sleep(1.6)
-        if undertale_is_running():
-            director.start()
-
-    threading.Thread(target=_boot, daemon=True).start()
-
-    return (
-        True,
-        "AMALGOMATION — focus the Undertale window; the fight should start now. "
-        "If not, press Home once in the overworld. "
-        + inst_msg
-        + " | "
-        + msg,
-    )
+    """Prefer the full autofight path (close → launch → skip intro → fight)."""
+    return run_amalgomation_autofight(data_win=data_win, save_folder=save_folder)
 
 
 def open_amalgomation_ui(parent, *, data_win: Path | None, save_folder: Path | None, on_status=None):
-    """Launch with no popup dialogs — status line only."""
-    ok, msg = start_amalgomation_fight(data_win=data_win, save_folder=save_folder)
-    if on_status:
-        on_status(msg if ok else f"AMALGOMATION: {msg}")
-    # Intentionally no messagebox — user wants only the game window.
+    """Run autofight on a background thread — no popups."""
+
+    def _ui_status(msg: str) -> None:
+        if not on_status:
+            return
+        try:
+            parent.after(0, lambda m=msg: on_status(m))
+        except Exception:
+            on_status(msg)
+
+    _ui_status("AMALGOMATION AUTO: closing Undertale, patching, launching, starting fight…")
+
+    def work() -> None:
+        ok, msg = run_amalgomation_autofight(
+            data_win=data_win,
+            save_folder=save_folder,
+            on_status=_ui_status,
+        )
+        _ui_status(msg if ok else f"AMALGOMATION failed: {msg}")
+
+    threading.Thread(target=work, daemon=True).start()

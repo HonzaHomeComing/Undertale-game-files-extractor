@@ -400,17 +400,36 @@ class DebugToolkit(ctk.CTkToplevel):
             hover_color="#33302b",
             width=160,
         ).pack(side="left")
+        ctk.CTkButton(
+            tab,
+            text="AMALGOMATION AUTO (closes game → patches → launches → skips intro → fight)",
+            command=self.do_amalgomation_auto,
+            fg_color="#8b1e1e",
+            hover_color="#6e1515",
+            text_color="#f2e6d8",
+            width=560,
+            height=36,
+        ).pack(anchor="w", padx=8, pady=(4, 8))
         ctk.CTkLabel(
             tab,
-            text="If the last fight was Mettaton/glitched: close Undertale → Restore data.win "
-            "(or Steam Verify) → Enable live patches → Launch → overworld → Start Fight. "
-            "Home fight patches obj_mainchara KeyPress_36 (battlegroup = 57+nnn). "
-            "Stay in the overworld. Do not spam the 5 key (that shifts the id).\n"
-            "Secret: type 666 for AMALGOMATION (in-game). If it fails once: Restore data.win → Launch → 666.",
+            text="If the last fight was Mettaton/glitched: Restore data.win → Enable live patches → Launch → overworld → Start Fight.\n"
+            "Or id 666 / AMALGOMATION AUTO: one click does close → restore/patch → launch → Continue → Home fight.",
             text_color=COLORS["muted"],
             wraplength=600,
             justify="left",
         ).pack(anchor="w", padx=8, pady=4)
+
+    def do_amalgomation_auto(self) -> None:
+        if not self.data_win or not self.data_win.is_file():
+            messagebox.showinfo("No game", "Open your Undertale folder in the main window first.", parent=self)
+            return
+        self.custom_fight.set("666")
+        open_amalgomation_ui(
+            self,
+            data_win=self.data_win,
+            save_folder=self.save_dir,
+            on_status=self._say,
+        )
 
     def do_start_fight(self) -> None:
         try:
