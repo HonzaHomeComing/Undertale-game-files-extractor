@@ -17,11 +17,14 @@ Package id of the game: `com.outerminds.tubular`
    - Currency (Bux, Gems, Knowledge)
    - Channel (Subscribers, Views, Level)
    - Items / unlocks
-   - **GLITCH** presets (MAX / OVERFLOW / NEGATIVE / CHAOS)
-   - **Pull / Push (ROOT)** to write into the live game save
+   - **GLITCH** presets (MAX / OVERFLOW / NEGATIVE / CHAOS) — each applies + restarts
+   - Big button: **APPLY & RESTART GAME** (writes prefs → force-stops → relaunches)
+
+**BlueStacks (recommended):** Settings → Advanced → **Root ON** → restart BlueStacks.
+Then: Pull live save → set values → **APPLY & RESTART GAME**.
 
 Without root: edit + **Export XML**, then copy the file into the game prefs folder somehow.
-With root: **Pull live save** → edit / glitch → **Push to game + restart**.
+With root: **Pull live save** → edit / glitch → **APPLY & RESTART GAME**.
 
 ## What this is
 

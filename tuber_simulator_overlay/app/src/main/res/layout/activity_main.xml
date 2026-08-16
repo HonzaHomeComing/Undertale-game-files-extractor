@@ -23,7 +23,7 @@
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:layout_marginTop="8dp"
-            android:text="Tap the red bubble while in Tuber Simulator. A full cheat menu stays open over the game (currency, subs, items, glitch buttons). Root needed to Push live into the game."
+            android:text="Tap the red bubble in Tuber Simulator. Set values, then tap APPLY &amp; RESTART GAME (writes prefs, force-stops, relaunches). Needs Root — enable it in BlueStacks Settings → Advanced."
             android:textColor="@color/muted"
             android:textSize="14sp" />
 

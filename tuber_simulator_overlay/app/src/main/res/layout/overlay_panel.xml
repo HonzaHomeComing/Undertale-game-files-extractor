@@ -230,28 +230,40 @@
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
                 android:layout_marginTop="8dp"
-                android:text="SAVE / APPLY"
+                android:text="APPLY"
                 android:textColor="@color/ink"
                 android:textStyle="bold" />
 
             <com.google.android.material.button.MaterialButton
-                android:id="@+id/btnApplyFields"
+                android:id="@+id/btnApplyRestart"
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
-                android:text="Apply numbers into save keys" />
+                android:text="APPLY &amp; RESTART GAME"
+                android:textSize="14sp" />
+
+            <com.google.android.material.button.MaterialButton
+                android:id="@+id/btnApplyFields"
+                style="@style/Widget.MaterialComponents.Button.OutlinedButton"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="Only update keys (don't restart)"
+                android:textSize="11sp" />
 
             <com.google.android.material.button.MaterialButton
                 android:id="@+id/btnPullRoot"
                 style="@style/Widget.MaterialComponents.Button.OutlinedButton"
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
-                android:text="Pull live save (ROOT)" />
+                android:text="Pull live save (ROOT)"
+                android:textSize="11sp" />
 
             <com.google.android.material.button.MaterialButton
                 android:id="@+id/btnPushRoot"
+                style="@style/Widget.MaterialComponents.Button.OutlinedButton"
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
-                android:text="Push to game + restart (ROOT)" />
+                android:text="Push only (no relaunch)"
+                android:textSize="11sp" />
 
             <LinearLayout
                 android:layout_width="match_parent"

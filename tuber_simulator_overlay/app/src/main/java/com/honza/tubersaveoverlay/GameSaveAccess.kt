@@ -5,8 +5,7 @@ import java.io.File
 import java.io.InputStreamReader
 
 /**
- * Root helpers to read/write Tuber Simulator PlayerPrefs and force-stop the game
- * so values reload.
+ * Root helpers to read/write Tuber Simulator PlayerPrefs, then the UI relaunches the game.
  */
 object GameSaveAccess {
     const val PACKAGE = "com.outerminds.tubular"
@@ -18,7 +17,6 @@ object GameSaveAccess {
         "/data/user/0/$PACKAGE/shared_prefs/$PACKAGE.playerprefs.xml",
     )
 
-    /** Keys we always ensure exist so the cheat menu has something to write. */
     val DEFAULT_KEYS: List<PrefEntry> = listOf(
         PrefEntry("Bux", PrefType.INT, "0"),
         PrefEntry("SoftBux", PrefType.INT, "0"),
@@ -48,7 +46,6 @@ object GameSaveAccess {
         for (p in CANDIDATE_PATHS) {
             if (runSu("ls \"$p\"").success) return p
         }
-        // Fallback search
         val find = runSu("find /data/data/$PACKAGE/shared_prefs -name '*playerprefs*' 2>/dev/null | head -5")
         return find.output.lineSequence().map { it.trim() }.firstOrNull { it.endsWith(".xml") }
     }
@@ -63,24 +60,36 @@ object GameSaveAccess {
         return true to res.output
     }
 
-    fun pushPrefsXml(xml: String, workingFile: File): Pair<Boolean, String> {
+    /**
+     * Write prefs into the game, force-stop it. Caller should relaunch the app afterward.
+     */
+    fun pushPrefsAndStopGame(xml: String, workingFile: File): Pair<Boolean, String> {
         val path = findPrefsPath()
-            ?: return false to "No playerprefs path (need root)."
+            ?: return false to "No playerprefs path (need root / BlueStacks root ON)."
+        workingFile.parentFile?.mkdirs()
         workingFile.writeText(xml)
-        // Copy into place, fix ownership/mode, kill game so it reloads
+        // Make readable by root copy; BlueStacks sometimes needs world-readable temp
+        workingFile.setReadable(true, false)
+
         val script = """
             cp "${workingFile.absolutePath}" "$path"
             chmod 660 "$path"
-            chown $(stat -c %u:%g $(dirname "$path")/..) "$path" 2>/dev/null || true
             am force-stop $PACKAGE
+            sleep 0.4
             """.trimIndent().replace("\n", "; ")
         val res = runSu(script)
         return if (res.success) {
-            true to "Pushed to game and force-stopped. Reopen Tuber Simulator."
+            true to "Saved. Restarting Tuber Simulator…"
         } else {
-            false to "Push failed: ${res.output}"
+            // Still try force-stop; report error
+            runSu("am force-stop $PACKAGE")
+            false to "Push failed (is BlueStacks root ON?): ${res.output}"
         }
     }
+
+    /** @deprecated use pushPrefsAndStopGame */
+    fun pushPrefsXml(xml: String, workingFile: File): Pair<Boolean, String> =
+        pushPrefsAndStopGame(xml, workingFile)
 
     fun ensureDefaults(entries: MutableList<PrefEntry>) {
         val have = entries.map { it.name.lowercase() }.toHashSet()
@@ -103,7 +112,7 @@ object GameSaveAccess {
             val code = p.waitFor()
             SuResult(code == 0, out.trim())
         } catch (e: Exception) {
-            SuResult(false, e.message ?: "su missing")
+            SuResult(false, e.message ?: "su missing — turn on Root in BlueStacks Settings → Advanced")
         }
     }
 }
