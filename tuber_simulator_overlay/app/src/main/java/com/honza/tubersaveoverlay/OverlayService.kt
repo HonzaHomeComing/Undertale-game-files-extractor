@@ -9,7 +9,9 @@ import android.content.Intent
 import android.graphics.PixelFormat
 import android.net.Uri
 import android.os.Build
+import android.os.Handler
 import android.os.IBinder
+import android.os.Looper
 import android.provider.OpenableColumns
 import android.view.Gravity
 import android.view.LayoutInflater
@@ -22,7 +24,9 @@ import android.widget.Toast
 import androidx.core.app.NotificationCompat
 import com.honza.tubersaveoverlay.databinding.OverlayBubbleBinding
 import com.honza.tubersaveoverlay.databinding.OverlayPanelBinding
+import java.io.File
 import kotlin.math.abs
+import kotlin.random.Random
 
 class OverlayService : Service() {
     companion object {
@@ -30,28 +34,32 @@ class OverlayService : Service() {
         const val ACTION_STOP = "com.honza.tubersaveoverlay.STOP"
         const val ACTION_FILE_LOADED = "com.honza.tubersaveoverlay.FILE_LOADED"
         const val EXTRA_URI = "uri"
-        const val EXTRA_MODE = "mode" // load | save
+        const val EXTRA_MODE = "mode"
         @Volatile
         var isRunning: Boolean = false
             private set
     }
 
     private lateinit var windowManager: WindowManager
+    private val mainHandler = Handler(Looper.getMainLooper())
     private var bubbleView: View? = null
     private var panelView: View? = null
     private var bubbleBinding: OverlayBubbleBinding? = null
     private var panelBinding: OverlayPanelBinding? = null
     private var bubbleParams: WindowManager.LayoutParams? = null
-    private var panelParams: WindowManager.LayoutParams? = null
 
     private var entries: MutableList<PrefEntry> = mutableListOf()
-    private var loadedName: String = "No file loaded"
+    private var loadedName: String = "Working save: empty — Pull (root) or Load XML"
+    private var ignoreBubbleTapUntil = 0L
+    private val keyEditors = mutableMapOf<String, EditText>()
 
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onCreate() {
         super.onCreate()
         windowManager = getSystemService(WINDOW_SERVICE) as WindowManager
+        // Start with default cheat keys so the menu is usable immediately.
+        entries = GameSaveAccess.DEFAULT_KEYS.map { it.copy() }.toMutableList()
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -62,13 +70,14 @@ class OverlayService : Service() {
                 return START_NOT_STICKY
             }
             ACTION_FILE_LOADED -> {
-                val uri = intent.getParcelableExtra<Uri>(EXTRA_URI) ?: return START_STICKY
+                val uri = intent.parcelableUri(EXTRA_URI) ?: return START_STICKY
                 val mode = intent.getStringExtra(EXTRA_MODE) ?: "load"
-                if (mode == "save") {
-                    writeToUri(uri)
-                } else {
-                    readFromUri(uri)
-                }
+                if (mode == "save") writeToUri(uri) else readFromUri(uri)
+                // Re-show panel after file picker (picker used to eat the menu).
+                mainHandler.postDelayed({
+                    if (panelView == null) showPanel()
+                    ignoreBubbleTapUntil = System.currentTimeMillis() + 600
+                }, 250)
                 return START_STICKY
             }
             else -> {
@@ -82,27 +91,28 @@ class OverlayService : Service() {
         return START_STICKY
     }
 
+    private fun Intent.parcelableUri(key: String): Uri? =
+        if (Build.VERSION.SDK_INT >= 33) {
+            getParcelableExtra(key, Uri::class.java)
+        } else {
+            @Suppress("DEPRECATION")
+            getParcelableExtra(key)
+        }
+
     private fun startAsForeground() {
         val channelId = "tuber_overlay"
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            val nm = getSystemService(NotificationManager::class.java)
-            nm.createNotificationChannel(
-                NotificationChannel(
-                    channelId,
-                    getString(R.string.overlay_channel),
-                    NotificationManager.IMPORTANCE_LOW,
-                ),
+            getSystemService(NotificationManager::class.java).createNotificationChannel(
+                NotificationChannel(channelId, getString(R.string.overlay_channel), NotificationManager.IMPORTANCE_LOW),
             )
         }
         val open = PendingIntent.getActivity(
-            this,
-            0,
-            Intent(this, MainActivity::class.java),
+            this, 0, Intent(this, MainActivity::class.java),
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
         )
         val notification: Notification = NotificationCompat.Builder(this, channelId)
             .setContentTitle(getString(R.string.app_name))
-            .setContentText(getString(R.string.overlay_running))
+            .setContentText("Tap the red bubble for the cheat menu")
             .setSmallIcon(R.drawable.ic_bubble)
             .setContentIntent(open)
             .setOngoing(true)
@@ -126,52 +136,70 @@ class OverlayService : Service() {
             WindowManager.LayoutParams.WRAP_CONTENT,
             WindowManager.LayoutParams.WRAP_CONTENT,
             overlayType(),
-            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE,
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
+                WindowManager.LayoutParams.FLAG_HARDWARE_ACCELERATED,
             PixelFormat.TRANSLUCENT,
         ).apply {
             gravity = Gravity.TOP or Gravity.START
-            x = 40
-            y = 200
+            x = 36
+            y = 220
         }
         bubbleParams = params
-        attachDrag(bubbleView!!, params) { togglePanel() }
-        windowManager.addView(bubbleView, params)
-    }
-
-    private fun togglePanel() {
-        if (panelView != null) {
-            hidePanel()
-        } else {
-            showPanel()
+        // Bubble only OPENS the menu (X closes). Avoids flashy open/close toggles.
+        attachDrag(bubbleView!!, params) {
+            if (System.currentTimeMillis() < ignoreBubbleTapUntil) return@attachDrag
+            if (panelView == null) showPanel()
         }
+        windowManager.addView(bubbleView, params)
     }
 
     private fun showPanel() {
         if (panelView != null) return
         panelBinding = OverlayPanelBinding.inflate(LayoutInflater.from(this))
         panelView = panelBinding!!.root
+
+        // Focusable so EditTexts work over the game; NOT_TOUCH_MODAL so game can still run under it.
         val params = WindowManager.LayoutParams(
-            dp(320),
-            dp(420),
+            dp(340),
+            dp(520),
             overlayType(),
-            WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL,
+            WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
+                WindowManager.LayoutParams.FLAG_HARDWARE_ACCELERATED or
+                WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL,
             PixelFormat.TRANSLUCENT,
         ).apply {
             gravity = Gravity.TOP or Gravity.START
-            x = 48
-            y = 280
-            softInputMode = WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE
+            x = 28
+            y = 100
+            softInputMode = WindowManager.LayoutParams.SOFT_INPUT_ADJUST_PAN
         }
-        panelParams = params
+
         val b = panelBinding!!
         b.fileLabel.text = loadedName
-        b.btnClosePanel.setOnClickListener { hidePanel() }
+        b.statusLine.text = if (GameSaveAccess.hasRoot()) {
+            "ROOT detected — Pull / Push works live."
+        } else {
+            "No root — use Load/Export XML, or root the phone for live Push."
+        }
+        b.btnClosePanel.setOnClickListener {
+            hidePanel()
+            ignoreBubbleTapUntil = System.currentTimeMillis() + 400
+        }
         b.btnLoad.setOnClickListener { requestFile(load = true) }
         b.btnSave.setOnClickListener { requestFile(load = false) }
-        b.btnApplyQuick.setOnClickListener { applyQuickFields() }
+        b.btnApplyFields.setOnClickListener { applyAllFields() }
+        b.btnPullRoot.setOnClickListener { pullRoot() }
+        b.btnPushRoot.setOnClickListener { pushRoot() }
+        b.btnGlitchMax.setOnClickListener { glitchPreset("max") }
+        b.btnGlitchOverflow.setOnClickListener { glitchPreset("overflow") }
+        b.btnGlitchNeg.setOnClickListener { glitchPreset("neg") }
+        b.btnGlitchChaos.setOnClickListener { glitchPreset("chaos") }
+
         refreshQuickFields()
         rebuildKeyEditors()
         windowManager.addView(panelView, params)
+        toast("Cheat menu open — use X to close")
     }
 
     private fun hidePanel() {
@@ -183,21 +211,25 @@ class OverlayService : Service() {
         }
         panelView = null
         panelBinding = null
-        panelParams = null
+        keyEditors.clear()
+    }
+
+    private fun setStatus(msg: String) {
+        panelBinding?.statusLine?.text = msg
+    }
+
+    private fun toast(msg: String) {
+        mainHandler.post { Toast.makeText(this, msg, Toast.LENGTH_SHORT).show() }
     }
 
     private fun requestFile(load: Boolean) {
-        // Overlay can't host SAF pickers reliably — bounce through MainActivity helper.
+        // Keep menu; picker activity used to make it look like the menu "vanished".
+        ignoreBubbleTapUntil = System.currentTimeMillis() + 1500
         val intent = Intent(this, FilePickActivity::class.java).apply {
             addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
             putExtra(EXTRA_MODE, if (load) "load" else "save")
         }
         startActivity(intent)
-        Toast.makeText(
-            this,
-            if (load) "Pick your playerprefs XML" else "Choose where to save XML",
-            Toast.LENGTH_SHORT,
-        ).show()
     }
 
     private fun readFromUri(uri: Uri) {
@@ -205,29 +237,35 @@ class OverlayService : Service() {
             contentResolver.openInputStream(uri)?.use { input ->
                 val text = input.bufferedReader().readText()
                 entries = PlayerPrefsXml.parse(text)
-                loadedName = queryName(uri) ?: uri.lastPathSegment ?: "loaded.xml"
+                GameSaveAccess.ensureDefaults(entries)
+                loadedName = "Loaded: " + (queryName(uri) ?: "file")
                 panelBinding?.fileLabel?.text = loadedName
                 refreshQuickFields()
                 rebuildKeyEditors()
-                Toast.makeText(this, "Loaded ${entries.size} keys", Toast.LENGTH_SHORT).show()
+                setStatus("Loaded ${entries.size} keys")
+                toast("Loaded ${entries.size} keys")
             }
         } catch (e: Exception) {
-            Toast.makeText(this, "Load failed: ${e.message}", Toast.LENGTH_LONG).show()
+            toast("Load failed: ${e.message}")
         }
     }
 
     private fun writeToUri(uri: Uri) {
         try {
             syncKeyEditorsFromUi()
+            applyFieldValuesIntoEntries()
             val xml = PlayerPrefsXml.toXml(entries)
-            contentResolver.openOutputStream(uri, "wt")?.use { out ->
-                out.write(xml.toByteArray(Charsets.UTF_8))
-            }
-            Toast.makeText(this, "Saved XML", Toast.LENGTH_SHORT).show()
+            contentResolver.openOutputStream(uri, "wt")?.use { it.write(xml.toByteArray(Charsets.UTF_8)) }
+            // Also keep a local working copy
+            workingFile().writeText(xml)
+            setStatus("Exported XML")
+            toast("Exported XML")
         } catch (e: Exception) {
-            Toast.makeText(this, "Save failed: ${e.message}", Toast.LENGTH_LONG).show()
+            toast("Save failed: ${e.message}")
         }
     }
+
+    private fun workingFile(): File = File(filesDir, "working_playerprefs.xml")
 
     private fun queryName(uri: Uri): String? {
         contentResolver.query(uri, null, null, null, null)?.use { c ->
@@ -239,47 +277,194 @@ class OverlayService : Service() {
 
     private fun refreshQuickFields() {
         val b = panelBinding ?: return
-        b.fieldBux.setText(PlayerPrefsXml.findByNeedles(entries, "bux", "money", "cash")?.value)
-        b.fieldKnowledge.setText(PlayerPrefsXml.findByNeedles(entries, "knowledge", "iq", "brain")?.value)
-        b.fieldSubs.setText(PlayerPrefsXml.findByNeedles(entries, "subscriber", "subs")?.value)
-        b.fieldViews.setText(PlayerPrefsXml.findByNeedles(entries, "view", "views")?.value)
+        fun needle(vararg n: String) = PlayerPrefsXml.findByNeedles(entries, *n)?.value.orEmpty()
+        b.fieldBux.setText(needle("bux", "money", "cash", "soft"))
+        b.fieldGems.setText(needle("gem", "premium", "hardcurrency"))
+        b.fieldKnowledge.setText(needle("knowledge", "brain", "iq"))
+        b.fieldSubs.setText(needle("subscriber", "subs", "followers"))
+        b.fieldViews.setText(needle("view"))
+        b.fieldLevel.setText(needle("level", "rank"))
+        b.fieldItems.setText(needle("item", "inventory"))
+        b.fieldFurniture.setText(needle("furniture", "prop", "unlock"))
     }
 
-    private fun applyQuickFields() {
+    private fun applyFieldValuesIntoEntries() {
         val b = panelBinding ?: return
-        syncKeyEditorsFromUi()
-        val n = PlayerPrefsXml.applyQuick(
-            entries,
-            b.fieldBux.text?.toString(),
-            b.fieldKnowledge.text?.toString(),
-            b.fieldSubs.text?.toString(),
-            b.fieldViews.text?.toString(),
-        )
-        rebuildKeyEditors()
-        Toast.makeText(this, "Updated $n matching key(s)", Toast.LENGTH_SHORT).show()
+        fun set(needles: Array<String>, raw: String?) {
+            if (raw.isNullOrBlank()) return
+            var hit = PlayerPrefsXml.findByNeedles(entries, *needles)
+            if (hit == null) {
+                hit = PrefEntry(needles.first().replaceFirstChar { it.uppercase() }, PrefType.INT, raw.trim())
+                entries += hit
+            } else {
+                hit.value = raw.trim()
+            }
+        }
+        set(arrayOf("bux", "money", "cash", "soft"), b.fieldBux.text?.toString())
+        set(arrayOf("gem", "premium", "hardcurrency"), b.fieldGems.text?.toString())
+        set(arrayOf("knowledge", "brain", "iq"), b.fieldKnowledge.text?.toString())
+        set(arrayOf("subscriber", "subs", "followers"), b.fieldSubs.text?.toString())
+        set(arrayOf("view"), b.fieldViews.text?.toString())
+        set(arrayOf("level", "rank"), b.fieldLevel.text?.toString())
+        set(arrayOf("item", "inventory"), b.fieldItems.text?.toString())
+        set(arrayOf("furniture", "prop", "unlock"), b.fieldFurniture.text?.toString())
     }
 
-    private val keyEditors = mutableMapOf<String, EditText>()
+    private fun applyAllFields() {
+        syncKeyEditorsFromUi()
+        applyFieldValuesIntoEntries()
+        // Stamp every default-ish numeric key that matches
+        for (e in entries) {
+            val n = e.name.lowercase()
+            when {
+                listOf("bux", "money", "cash", "soft").any { n.contains(it) } ->
+                    panelBinding?.fieldBux?.text?.toString()?.takeIf { it.isNotBlank() }?.let { e.value = it }
+                listOf("gem", "premium", "hard").any { n.contains(it) } ->
+                    panelBinding?.fieldGems?.text?.toString()?.takeIf { it.isNotBlank() }?.let { e.value = it }
+                listOf("knowledge", "brain").any { n.contains(it) } ->
+                    panelBinding?.fieldKnowledge?.text?.toString()?.takeIf { it.isNotBlank() }?.let { e.value = it }
+                listOf("sub", "follower").any { n.contains(it) } ->
+                    panelBinding?.fieldSubs?.text?.toString()?.takeIf { it.isNotBlank() }?.let { e.value = it }
+                n.contains("view") ->
+                    panelBinding?.fieldViews?.text?.toString()?.takeIf { it.isNotBlank() }?.let { e.value = it }
+            }
+        }
+        workingFile().writeText(PlayerPrefsXml.toXml(entries))
+        rebuildKeyEditors()
+        refreshQuickFields()
+        setStatus("Applied into ${entries.size} keys (not pushed yet)")
+        toast("Applied — tap Push (root) or Export XML")
+    }
+
+    private fun glitchPreset(kind: String) {
+        val b = panelBinding ?: return
+        fun fill(v: String) {
+            b.fieldBux.setText(v)
+            b.fieldGems.setText(v)
+            b.fieldKnowledge.setText(v)
+            b.fieldSubs.setText(v)
+            b.fieldViews.setText(v)
+            b.fieldLevel.setText(if (kind == "neg") "-1" else v)
+            b.fieldItems.setText(v)
+            b.fieldFurniture.setText(v)
+        }
+        when (kind) {
+            "max" -> fill("999999999")
+            "overflow" -> fill(Int.MAX_VALUE.toString())
+            "neg" -> fill("-999999")
+            "chaos" -> {
+                fun r() = Random.nextInt(-2_000_000, 2_000_000_000).toString()
+                b.fieldBux.setText(r())
+                b.fieldGems.setText(r())
+                b.fieldKnowledge.setText(r())
+                b.fieldSubs.setText(r())
+                b.fieldViews.setText(r())
+                b.fieldLevel.setText(r())
+                b.fieldItems.setText(r())
+                b.fieldFurniture.setText(r())
+            }
+        }
+        applyAllFields()
+        // Also smash every int/long/float in the file
+        val smash = when (kind) {
+            "max" -> "999999999"
+            "overflow" -> Int.MAX_VALUE.toString()
+            "neg" -> "-999999"
+            else -> null
+        }
+        if (smash != null) {
+            for (e in entries) {
+                if (e.type != PrefType.STRING && e.type != PrefType.BOOLEAN) e.value = smash
+            }
+        } else {
+            for (e in entries) {
+                if (e.type != PrefType.STRING && e.type != PrefType.BOOLEAN) {
+                    e.value = Random.nextInt(-5_000_000, Int.MAX_VALUE).toString()
+                }
+            }
+        }
+        rebuildKeyEditors()
+        setStatus("GLITCH ($kind) loaded into keys — Push to nuke the save")
+        toast("Glitch ready — Push to game (root) or Export")
+    }
+
+    private fun pullRoot() {
+        Thread {
+            val (ok, payload) = GameSaveAccess.pullPrefsXml()
+            mainHandler.post {
+                if (!ok) {
+                    setStatus(payload)
+                    toast(payload)
+                    return@post
+                }
+                entries = PlayerPrefsXml.parse(payload)
+                GameSaveAccess.ensureDefaults(entries)
+                workingFile().writeText(payload)
+                loadedName = "Pulled live from game (${entries.size} keys)"
+                panelBinding?.fileLabel?.text = loadedName
+                refreshQuickFields()
+                rebuildKeyEditors()
+                setStatus("Pulled live save")
+                toast("Pulled ${entries.size} keys")
+            }
+        }.start()
+    }
+
+    private fun pushRoot() {
+        Thread {
+            syncOnMain {
+                syncKeyEditorsFromUi()
+                applyFieldValuesIntoEntries()
+            }
+            val xml = PlayerPrefsXml.toXml(entries)
+            workingFile().writeText(xml)
+            val (_, msg) = GameSaveAccess.pushPrefsXml(xml, workingFile())
+            mainHandler.post {
+                setStatus(msg)
+                toast(msg)
+            }
+        }.start()
+    }
+
+    private fun syncOnMain(block: () -> Unit) {
+        if (Looper.myLooper() == Looper.getMainLooper()) {
+            block()
+        } else {
+            val lock = Object()
+            var done = false
+            mainHandler.post {
+                block()
+                synchronized(lock) {
+                    done = true
+                    lock.notifyAll()
+                }
+            }
+            synchronized(lock) {
+                while (!done) lock.wait(2000)
+            }
+        }
+    }
 
     private fun rebuildKeyEditors() {
         val container = panelBinding?.keysContainer ?: return
         container.removeAllViews()
         keyEditors.clear()
-        if (entries.isEmpty()) {
-            val tv = TextView(this).apply {
-                text = "Load an XML first."
-                setTextColor(getColor(R.color.muted))
-                textSize = 12f
-            }
-            container.addView(tv)
-            return
-        }
-        for (e in entries.take(80)) {
-            val label = TextView(this).apply {
-                text = "${e.name} (${e.type.name.lowercase()})"
-                setTextColor(getColor(R.color.muted))
-                textSize = 10f
-            }
+        val interesting = entries.filter { e ->
+            val n = e.name.lowercase()
+            listOf(
+                "bux", "money", "cash", "gem", "knowledge", "brain", "sub", "view",
+                "level", "item", "inventory", "furniture", "prop", "unlock", "currency",
+            ).any { n.contains(it) }
+        }.ifEmpty { entries.take(40) }
+
+        for (e in interesting.take(60)) {
+            container.addView(
+                TextView(this).apply {
+                    text = "${e.name} (${e.type.name.lowercase()})"
+                    setTextColor(getColor(R.color.muted))
+                    textSize = 10f
+                },
+            )
             val edit = EditText(this).apply {
                 setText(e.value)
                 setTextColor(getColor(R.color.ink))
@@ -287,17 +472,7 @@ class OverlayService : Service() {
                 setSingleLine()
             }
             keyEditors[e.name] = edit
-            container.addView(label)
             container.addView(edit)
-        }
-        if (entries.size > 80) {
-            container.addView(
-                TextView(this).apply {
-                    text = "…and ${entries.size - 80} more keys (still saved)."
-                    setTextColor(getColor(R.color.muted))
-                    textSize = 11f
-                },
-            )
         }
     }
 
@@ -331,10 +506,13 @@ class OverlayService : Service() {
                 MotionEvent.ACTION_MOVE -> {
                     val dx = (event.rawX - downX).toInt()
                     val dy = (event.rawY - downY).toInt()
-                    if (abs(dx) > 6 || abs(dy) > 6) moved = true
+                    if (abs(dx) > 8 || abs(dy) > 8) moved = true
                     params.x = startX + dx
                     params.y = startY + dy
-                    windowManager.updateViewLayout(v, params)
+                    try {
+                        windowManager.updateViewLayout(v, params)
+                    } catch (_: Exception) {
+                    }
                     true
                 }
                 MotionEvent.ACTION_UP -> {

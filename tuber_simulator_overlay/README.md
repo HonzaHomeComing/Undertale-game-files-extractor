@@ -8,13 +8,20 @@ Package id of the game: `com.outerminds.tubular`
 
 ## Install on your phone (no PC)
 
-1. On your phone, open this APK link:  
+1. Uninstall the old overlay if you already installed it.
+2. Download the new APK:  
    **https://github.com/HonzaHomeComing/Undertale-game-files-extractor/raw/cursor/tuber-simulator-overlay-cb61/tuber_simulator_overlay/dist/TuberSaveOverlay-debug.apk**
-2. Download it.
-3. Open the downloaded file → **Install**  
-   (If blocked: Settings → allow **Install unknown apps** for your browser/Files.)
-4. Open **Tuber Save Overlay** → allow **Display over other apps** → **Start overlay**.
-5. Use the red bubble on top of other apps.
+3. Install → open app → allow **Display over other apps** → **Start overlay**.
+4. Open Tuber Simulator → tap the **red bubble**.
+5. The **cheat menu stays open** over the game:
+   - Currency (Bux, Gems, Knowledge)
+   - Channel (Subscribers, Views, Level)
+   - Items / unlocks
+   - **GLITCH** presets (MAX / OVERFLOW / NEGATIVE / CHAOS)
+   - **Pull / Push (ROOT)** to write into the live game save
+
+Without root: edit + **Export XML**, then copy the file into the game prefs folder somehow.
+With root: **Pull live save** → edit / glitch → **Push to game + restart**.
 
 ## What this is
 

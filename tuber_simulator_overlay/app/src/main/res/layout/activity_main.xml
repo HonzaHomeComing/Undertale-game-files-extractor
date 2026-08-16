@@ -23,7 +23,7 @@
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:layout_marginTop="8dp"
-            android:text="Floats on top of other apps. Load a Tuber Simulator PlayerPrefs XML, edit values, save, then copy it back into the game folder (root/ADB)."
+            android:text="Tap the red bubble while in Tuber Simulator. A full cheat menu stays open over the game (currency, subs, items, glitch buttons). Root needed to Push live into the game."
             android:textColor="@color/muted"
             android:textSize="14sp" />
 
