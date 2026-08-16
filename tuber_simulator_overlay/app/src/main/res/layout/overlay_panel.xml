@@ -254,7 +254,7 @@
                 style="@style/Widget.MaterialComponents.Button.OutlinedButton"
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
-                android:text="Pull live save (ROOT)"
+                android:text="Scan / pull saves"
                 android:textSize="11sp" />
 
             <com.google.android.material.button.MaterialButton
@@ -262,7 +262,7 @@
                 style="@style/Widget.MaterialComponents.Button.OutlinedButton"
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
-                android:text="Push only (no relaunch)"
+                android:text="Push only (root / no relaunch)"
                 android:textSize="11sp" />
 
             <LinearLayout

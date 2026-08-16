@@ -23,7 +23,7 @@
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:layout_marginTop="8dp"
-            android:text="Tap the red bubble in Tuber Simulator. Set values, then tap APPLY &amp; RESTART GAME (writes prefs, force-stops, relaunches). Needs Root — enable it in BlueStacks Settings → Advanced."
+            android:text="@string/main_blurb"
             android:textColor="@color/muted"
             android:textSize="14sp" />
 
@@ -41,6 +41,14 @@
             android:layout_height="wrap_content"
             android:layout_marginTop="16dp"
             android:text="@string/open_overlay_settings" />
+
+        <com.google.android.material.button.MaterialButton
+            android:id="@+id/btnAllFiles"
+            style="@style/Widget.MaterialComponents.Button.OutlinedButton"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="8dp"
+            android:text="@string/open_all_files" />
 
         <com.google.android.material.button.MaterialButton
             android:id="@+id/btnStart"
@@ -61,7 +69,7 @@
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:layout_marginTop="24dp"
-            android:text="Typical save path\n/data/data/com.outerminds.tubular/shared_prefs/\ncom.outerminds.tubular.v2.playerprefs.xml"
+            android:text="@string/main_paths"
             android:textColor="@color/muted"
             android:textSize="12sp"
             android:fontFamily="monospace" />

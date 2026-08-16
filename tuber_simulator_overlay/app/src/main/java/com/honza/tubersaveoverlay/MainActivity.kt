@@ -18,6 +18,7 @@ class MainActivity : AppCompatActivity() {
         setContentView(binding.root)
 
         binding.btnOverlaySettings.setOnClickListener { openOverlaySettings() }
+        binding.btnAllFiles.setOnClickListener { openAllFilesSettings() }
         binding.btnStart.setOnClickListener { startOverlay() }
         binding.btnStop.setOnClickListener { stopOverlay() }
         refreshStatus()
@@ -36,10 +37,24 @@ class MainActivity : AppCompatActivity() {
         }
 
     private fun refreshStatus() {
-        binding.status.text = when {
-            !canDrawOverlays() -> getString(R.string.need_overlay)
-            OverlayService.isRunning -> "Overlay is running — look for the red bubble."
-            else -> "Ready. Grant overlay permission, then Start overlay."
+        val overlay = canDrawOverlays()
+        val files = NoRootSaveAccess.hasAllFilesAccess()
+        binding.status.text = buildString {
+            when {
+                !overlay -> append(getString(R.string.need_overlay))
+                OverlayService.isRunning -> append("Overlay running — look for the red bubble.")
+                else -> append("Ready. Grant permissions, then Start overlay.")
+            }
+            append('\n')
+            append(if (files) "All-files access: OK" else "All-files access: NEEDED (for phone saves)")
+            append('\n')
+            append(
+                if (GameSaveAccess.hasRoot()) {
+                    "Root: OK (live PlayerPrefs push available)"
+                } else {
+                    "Root: no — Apply & Restart uses phone no-root mode"
+                },
+            )
         }
     }
 
@@ -51,11 +66,20 @@ class MainActivity : AppCompatActivity() {
         startActivity(intent)
     }
 
+    private fun openAllFilesSettings() {
+        startActivity(NoRootSaveAccess.allFilesAccessIntent(this))
+    }
+
     private fun startOverlay() {
         if (!canDrawOverlays()) {
             Toast.makeText(this, R.string.need_overlay, Toast.LENGTH_LONG).show()
             openOverlaySettings()
             return
+        }
+        if (!NoRootSaveAccess.hasAllFilesAccess()) {
+            Toast.makeText(this, R.string.need_all_files, Toast.LENGTH_LONG).show()
+            openAllFilesSettings()
+            // Still start overlay so they can use it after granting.
         }
         val intent = Intent(this, OverlayService::class.java).setAction(OverlayService.ACTION_START)
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {

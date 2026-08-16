@@ -1,57 +1,39 @@
 # Tuber Simulator Overlay Save Editor
 
-Floating Android app (“Appear on top of other apps”) that lets you edit a
-**PewDiePie’s Tuber Simulator** Unity `PlayerPrefs` XML save while the game
-(or any app) is open.
+Floating Android app (“Appear on top of other apps”) for **PewDiePie’s Tuber Simulator**
+(`com.outerminds.tubular`) on a **normal phone — no BlueStacks, no root required** for the
+Apply & Restart flow.
 
-Package id of the game: `com.outerminds.tubular`
+## Install on your phone
 
-## Install on your phone (no PC)
-
-1. Uninstall the old overlay if you already installed it.
-2. Download the new APK:  
+1. Uninstall the old overlay if present.
+2. Download:  
    **https://github.com/HonzaHomeComing/Undertale-game-files-extractor/raw/cursor/tuber-simulator-overlay-cb61/tuber_simulator_overlay/dist/TuberSaveOverlay-debug.apk**
-3. Install → open app → allow **Display over other apps** → **Start overlay**.
-4. Open Tuber Simulator → tap the **red bubble**.
-5. The **cheat menu stays open** over the game:
-   - Currency (Bux, Gems, Knowledge)
-   - Channel (Subscribers, Views, Level)
-   - Items / unlocks
-   - **GLITCH** presets (MAX / OVERFLOW / NEGATIVE / CHAOS) — each applies + restarts
-   - Big button: **APPLY & RESTART GAME** (writes prefs → force-stops → relaunches)
+3. Install → open app → allow:
+   - **Display over other apps**
+   - **All files access**
+4. Tap **Start overlay** → open Tuber Simulator → tap the **red bubble**.
+5. Set Bux / Gems / etc. → tap **APPLY & RESTART GAME**.
 
-**BlueStacks (recommended):** Settings → Advanced → **Root ON** → restart BlueStacks.
-Then: Pull live save → set values → **APPLY & RESTART GAME**.
+That will:
 
-Without root: edit + **Export XML**, then copy the file into the game prefs folder somehow.
-With root: **Pull live save** → edit / glitch → **APPLY & RESTART GAME**.
+- Patch any editable text saves under `Android/data/com.outerminds.tubular/`
+- Export your edited XML to `Download/TuberSaveOverlay/playerprefs_edited.xml`
+- Send the game Home → kill its background process → relaunch it
 
-## What this is
+## Important limit (honest)
 
-- A **bubble overlay** you can drag around the screen
-- Tap the bubble → editor panel opens on top of other apps
-- Load a `.xml` PlayerPrefs dump, change values, save it back
-- Quick fields for common names (Bux / Knowledge / Subscribers / Views) plus a
-  full key list from whatever is in your file
+Unity **PlayerPrefs** (the usual Bux/Gems file) live in a **private** folder:
 
-## Important limits
+`/data/data/com.outerminds.tubular/shared_prefs/…playerprefs….xml`
 
-1. **Cloud sync** — Tuber Simulator also stores progress on Outerminds’ servers.
-   Local edits can be overwritten when you Link Account / sync. Force-stop the
-   game before replacing the save, then open offline if you can.
-2. **Save location (needs root or ADB)** — Unity stores prefs at roughly:
-   ```
-   /data/data/com.outerminds.tubular/shared_prefs/com.outerminds.tubular.v2.playerprefs.xml
-   ```
-   On modern Android you normally cannot open that folder without root / `adb`.
-3. This tool edits **your exported copy**. It does not inject into a running
-   process or bypass server checks.
+Android blocks that folder on stock phones. If the game only stores currency there,
+phone-mode Apply & Restart still **restarts** the game and **exports** the XML, but
+cannot rewrite the private prefs without root.
 
-## Build from source (PC / Android Studio)
+Optional root (Magisk / BlueStacks Root ON) unlocks live Pull/Push of those prefs.
 
-1. Open `tuber_simulator_overlay/` in **Android Studio**
-2. Build → Run on your phone (API 26+)
-3. Grant **Display over other apps** when asked
-4. Tap **Start overlay**
+## Build
 
-APK also lives at: `tuber_simulator_overlay/dist/TuberSaveOverlay-debug.apk`
+Open `tuber_simulator_overlay/` in Android Studio (API 26+), or use the prebuilt APK under
+`tuber_simulator_overlay/dist/TuberSaveOverlay-debug.apk`.

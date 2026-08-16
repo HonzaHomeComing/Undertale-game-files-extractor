@@ -177,10 +177,13 @@ class OverlayService : Service() {
 
         val b = panelBinding!!
         b.fileLabel.text = loadedName
-        b.statusLine.text = if (GameSaveAccess.hasRoot()) {
-            "ROOT OK — set values, tap APPLY & RESTART GAME."
-        } else {
-            "No root — turn ON Root in BlueStacks Settings → Advanced, then restart BS."
+        b.statusLine.text = when {
+            GameSaveAccess.hasRoot() ->
+                "ROOT OK — set values, tap APPLY & RESTART GAME."
+            NoRootSaveAccess.hasAllFilesAccess() ->
+                "Phone mode — set values, tap APPLY & RESTART GAME (no root)."
+            else ->
+                "Grant All files access in the overlay app, then APPLY & RESTART."
         }
         b.btnClosePanel.setOnClickListener {
             hidePanel()
@@ -190,7 +193,7 @@ class OverlayService : Service() {
         b.btnSave.setOnClickListener { requestFile(load = false) }
         b.btnApplyRestart.setOnClickListener { applyAndRestartGame() }
         b.btnApplyFields.setOnClickListener { applyAllFields() }
-        b.btnPullRoot.setOnClickListener { pullRoot() }
+        b.btnPullRoot.setOnClickListener { pullSaves() }
         b.btnPushRoot.setOnClickListener { pushRoot(relaunch = false) }
         b.btnGlitchMax.setOnClickListener { glitchPreset("max", restart = true) }
         b.btnGlitchOverflow.setOnClickListener { glitchPreset("overflow", restart = true) }
@@ -337,36 +340,101 @@ class OverlayService : Service() {
         toast("Keys updated — tap APPLY & RESTART GAME")
     }
 
-    /** Main action: write values → force-stop → relaunch Tuber Simulator. */
-    private fun applyAndRestartGame() {
-        if (!GameSaveAccess.hasRoot()) {
-            setStatus("Need Root — BlueStacks Settings → Advanced → Root ON, then restart BS.")
-            toast("Root required")
-            return
+    private fun collectValuesMap(): Map<String, String> {
+        val b = panelBinding
+        val map = linkedMapOf<String, String>()
+        fun put(key: String, raw: String?) {
+            val v = raw?.trim().orEmpty()
+            if (v.isNotEmpty()) map[key] = v
         }
+        if (b != null) {
+            put("Bux", b.fieldBux.text?.toString())
+            put("SoftBux", b.fieldBux.text?.toString())
+            put("Money", b.fieldBux.text?.toString())
+            put("Cash", b.fieldBux.text?.toString())
+            put("Gems", b.fieldGems.text?.toString())
+            put("HardCurrency", b.fieldGems.text?.toString())
+            put("PremiumCurrency", b.fieldGems.text?.toString())
+            put("Knowledge", b.fieldKnowledge.text?.toString())
+            put("BrainPoints", b.fieldKnowledge.text?.toString())
+            put("Subscribers", b.fieldSubs.text?.toString())
+            put("TotalSubscribers", b.fieldSubs.text?.toString())
+            put("Views", b.fieldViews.text?.toString())
+            put("TotalViews", b.fieldViews.text?.toString())
+            put("ChannelLevel", b.fieldLevel.text?.toString())
+            put("PlayerLevel", b.fieldLevel.text?.toString())
+            put("ItemCount", b.fieldItems.text?.toString())
+            put("InventoryCount", b.fieldItems.text?.toString())
+            put("FurnitureUnlocked", b.fieldFurniture.text?.toString())
+            put("bux", b.fieldBux.text?.toString())
+            put("gem", b.fieldGems.text?.toString())
+            put("knowledge", b.fieldKnowledge.text?.toString())
+            put("subscriber", b.fieldSubs.text?.toString())
+            put("view", b.fieldViews.text?.toString())
+        }
+        for (e in entries) {
+            if (e.value.isNotBlank()) map.putIfAbsent(e.name, e.value)
+        }
+        return map
+    }
+
+    /** Main action: write values → stop/kill → relaunch Tuber Simulator. */
+    private fun applyAndRestartGame() {
         setStatus("Applying + restarting Tuber Simulator…")
         toast("Applying + restarting…")
         Thread {
+            var values: Map<String, String> = emptyMap()
             syncOnMain {
                 syncKeyEditorsFromUi()
                 applyFieldValuesIntoEntries()
+                values = collectValuesMap()
             }
             val xml = PlayerPrefsXml.toXml(entries)
             val wf = workingFile()
             wf.writeText(xml)
-            val (ok, msg) = GameSaveAccess.pushPrefsAndStopGame(xml, wf)
-            if (!ok) {
+
+            if (GameSaveAccess.hasRoot()) {
+                val (ok, msg) = GameSaveAccess.pushPrefsAndStopGame(xml, wf)
+                if (!ok) {
+                    mainHandler.post {
+                        setStatus(msg)
+                        toast(msg)
+                    }
+                    return@Thread
+                }
+                Thread.sleep(700)
                 mainHandler.post {
-                    setStatus(msg)
-                    toast(msg)
+                    relaunchGame()
+                    setStatus("Done — game restarted with new values.")
+                    toast("Game restarted with new values")
                 }
                 return@Thread
             }
-            Thread.sleep(700)
+
+            // Non-root phone path
+            if (!NoRootSaveAccess.hasAllFilesAccess()) {
+                mainHandler.post {
+                    setStatus("Grant All files access in Tuber Save Overlay, then retry.")
+                    toast("Need all-files access")
+                    try {
+                        startActivity(
+                            NoRootSaveAccess.allFilesAccessIntent(this).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
+                        )
+                    } catch (_: Exception) {
+                    }
+                }
+                return@Thread
+            }
+            val summary = NoRootSaveAccess.applyAndRestart(this, values, xml)
             mainHandler.post {
-                relaunchGame()
-                setStatus("Done — game restarted with new values.")
-                toast("Game restarted with new values")
+                setStatus(summary)
+                toast(
+                    if (summary.contains("Patched")) {
+                        "Applied + game restarted"
+                    } else {
+                        "Restarted — see status (private prefs need root)"
+                    },
+                )
             }
         }.start()
     }
@@ -425,56 +493,85 @@ class OverlayService : Service() {
         if (restart) {
             setStatus("GLITCH ($kind) → writing + restarting…")
             toast("Glitch + restarting…")
-            Thread {
-                val xml = PlayerPrefsXml.toXml(entries)
-                val wf = workingFile()
-                val (ok, msg) = GameSaveAccess.pushPrefsAndStopGame(xml, wf)
-                if (!ok) {
-                    mainHandler.post {
-                        setStatus(msg)
-                        toast(msg)
-                    }
-                    return@Thread
-                }
-                Thread.sleep(700)
-                mainHandler.post {
-                    relaunchGame()
-                    setStatus("GLITCH ($kind) applied — game restarted.")
-                    toast("Glitch applied — game restarted")
-                }
-            }.start()
+            applyAndRestartGame()
         } else {
             setStatus("GLITCH ($kind) loaded — tap APPLY & RESTART")
             toast("Glitch ready")
         }
     }
 
-    private fun pullRoot() {
+    private fun pullSaves() {
         Thread {
-            val (ok, payload) = GameSaveAccess.pullPrefsXml()
-            mainHandler.post {
-                if (!ok) {
-                    setStatus(payload)
-                    toast(payload)
-                    return@post
+            if (GameSaveAccess.hasRoot()) {
+                val (ok, payload) = GameSaveAccess.pullPrefsXml()
+                mainHandler.post {
+                    if (!ok) {
+                        setStatus(payload)
+                        toast(payload)
+                        return@post
+                    }
+                    entries = PlayerPrefsXml.parse(payload)
+                    GameSaveAccess.ensureDefaults(entries)
+                    workingFile().writeText(payload)
+                    loadedName = "Pulled live from game (${entries.size} keys)"
+                    panelBinding?.fileLabel?.text = loadedName
+                    refreshQuickFields()
+                    rebuildKeyEditors()
+                    setStatus("Pulled — edit values, then APPLY & RESTART GAME")
+                    toast("Pulled ${entries.size} keys")
                 }
-                entries = PlayerPrefsXml.parse(payload)
-                GameSaveAccess.ensureDefaults(entries)
-                workingFile().writeText(payload)
-                loadedName = "Pulled live from game (${entries.size} keys)"
-                panelBinding?.fileLabel?.text = loadedName
-                refreshQuickFields()
-                rebuildKeyEditors()
-                setStatus("Pulled — edit values, then APPLY & RESTART GAME")
-                toast("Pulled ${entries.size} keys")
+                return@Thread
+            }
+            val saves = NoRootSaveAccess.findEditableSaves()
+            val xmlHit = saves.firstOrNull { hit ->
+                hit.file.extension.equals("xml", true) &&
+                    try {
+                        hit.file.readText().contains("<map", ignoreCase = true)
+                    } catch (_: Exception) {
+                        false
+                    }
+            }
+            mainHandler.post {
+                if (xmlHit != null) {
+                    try {
+                        val payload = xmlHit.file.readText()
+                        entries = PlayerPrefsXml.parse(payload)
+                        GameSaveAccess.ensureDefaults(entries)
+                        workingFile().writeText(payload)
+                        loadedName = "Phone save: ${xmlHit.label} (${entries.size} keys)"
+                        panelBinding?.fileLabel?.text = loadedName
+                        refreshQuickFields()
+                        rebuildKeyEditors()
+                        setStatus("Loaded phone XML — edit, then APPLY & RESTART")
+                        toast("Loaded ${entries.size} keys from phone")
+                    } catch (e: Exception) {
+                        setStatus("Read failed: ${e.message}")
+                        toast("Read failed")
+                    }
+                } else {
+                    val n = saves.size
+                    setStatus(
+                        if (n == 0) {
+                            "No phone saves found under Android/data. Set values manually, then APPLY & RESTART."
+                        } else {
+                            "Found $n phone file(s), none were PlayerPrefs XML. Set values → APPLY & RESTART."
+                        },
+                    )
+                    toast(if (n == 0) "No phone saves" else "Found $n files")
+                }
             }
         }.start()
     }
 
     private fun pushRoot(relaunch: Boolean) {
         if (!GameSaveAccess.hasRoot()) {
-            setStatus("Need Root — BlueStacks Settings → Advanced → Root ON.")
-            toast("Root required")
+            // No-root: same as apply & restart (or apply without relaunch)
+            if (relaunch) {
+                applyAndRestartGame()
+            } else {
+                setStatus("No root — use APPLY & RESTART GAME (patches phone saves + relaunches).")
+                toast("Use APPLY & RESTART on phone")
+            }
             return
         }
         setStatus(if (relaunch) "Writing + restarting…" else "Writing prefs (no relaunch)…")
