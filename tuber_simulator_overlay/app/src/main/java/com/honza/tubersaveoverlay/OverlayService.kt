@@ -229,6 +229,9 @@ class OverlayService : Service() {
         b.btnGlitchNeg.setOnClickListener { glitchPreset("neg", restart = false) }
         b.btnGlitchChaos.setOnClickListener { glitchPreset("chaos", restart = false) }
 
+        // Show build so user can confirm they installed the new APK
+        b.statusLine.text = "v${BuildConfig.VERSION_NAME} — get IN-GAME, Snapshot what you SEE, change, LIVE APPLY."
+
         refreshQuickFields()
         rebuildKeyEditors()
         windowManager.addView(panelView, params)
@@ -260,11 +263,13 @@ class OverlayService : Service() {
                     b.fileLabel.text = loadedName
                     refreshQuickFields()
                     rebuildKeyEditors()
-                    captureRamBaseline()
-                    b.statusLine.text = "Ready — get IN-GAME (past splash), edit numbers, tap LIVE APPLY (no restart)."
-                    toast("Snapshot ready — use LIVE APPLY in-game")
+                    // Do NOT set ramBaseline from disk — disk ≠ on-screen RAM after security/fresh start.
+                    b.statusLine.text =
+                        "v${BuildConfig.VERSION_NAME}: type numbers you SEE → Snapshot → change → LIVE APPLY. Do not restart."
+                    toast("v${BuildConfig.VERSION_NAME} — Snapshot on-screen values first")
                 } else {
-                    b.statusLine.text = "ROOT OK — open game once, then Re-pull. Use FRESH START if stuck on splash."
+                    b.statusLine.text =
+                        "v${BuildConfig.VERSION_NAME}: open game in-world, type what you SEE, Snapshot, LIVE APPLY."
                 }
             }
         }.start()
@@ -287,7 +292,19 @@ class OverlayService : Service() {
     }
 
     private fun toast(msg: String) {
-        mainHandler.post { Toast.makeText(this, msg, Toast.LENGTH_SHORT).show() }
+        mainHandler.post {
+            Toast.makeText(this, msg, Toast.LENGTH_LONG).show()
+        }
+    }
+
+    private fun toastLong(msg: String) {
+        mainHandler.post {
+            // Double toast so the reason is hard to miss on BlueStacks
+            Toast.makeText(this, msg, Toast.LENGTH_LONG).show()
+            mainHandler.postDelayed({
+                Toast.makeText(this, msg.take(60), Toast.LENGTH_LONG).show()
+            }, 2500)
+        }
     }
 
     private fun requestFile(load: Boolean) {
@@ -526,11 +543,12 @@ class OverlayService : Service() {
             val result = LiveMemoryEditor.replaceMany(this, changes)
             mainHandler.post {
                 val msg = buildString {
+                    append("v${BuildConfig.VERSION_NAME}: ")
                     append(result.message)
                     if (result.detail.isNotBlank()) append(" | ").append(result.detail)
                 }
                 setStatus(msg)
-                toast(msg.take(80))
+                toastLong(if (result.ok) "SUCCESS: ${result.message}" else "FAIL: ${result.message}")
                 if (result.ok) ramBaseline = news
             }
         }.start()
@@ -593,8 +611,7 @@ class OverlayService : Service() {
 
     private fun glitchPreset(kind: String, restart: Boolean = false) {
         val b = panelBinding ?: return
-        // Snapshot OLD values before overwriting fields (needed for RAM search).
-        if (ramBaseline.isEmpty()) captureRamBaseline()
+        // Only fill fields — user must Snapshot on-screen values BEFORE this, then LIVE APPLY.
         when (kind) {
             "max" -> {
                 b.fieldBux.setText("9999999")
@@ -643,12 +660,9 @@ class OverlayService : Service() {
         GameSaveAccess.clampEntriesForStability(entries)
         rebuildKeyEditors()
         refreshQuickFields()
-        setStatus("SAFE RICH ready — tapping LIVE APPLY (no restart)…")
-        if (!restart) {
-            applyLiveRam()
-        } else {
-            applyDiskAndRestart()
-        }
+        setStatus("SAFE RICH filled — now tap LIVE APPLY (only after Snapshot of on-screen values).")
+        toast("Snapshot first if you haven't, then LIVE APPLY")
+        // Do not auto-apply — wrong baseline was the main failure cause.
     }
 
     /** Lock the numbers currently in the fields as the in-game OLD values for RAM search. */
@@ -681,9 +695,11 @@ class OverlayService : Service() {
                     panelBinding?.fileLabel?.text = loadedName
                     refreshQuickFields()
                     rebuildKeyEditors()
-                    captureRamBaseline()
-                    setStatus("Pulled + snapshotted — change numbers, LIVE APPLY (no restart).")
-                    toast("Pulled + snapshot")
+                    setStatus(
+                        "Pulled disk keys (may differ from screen). " +
+                            "Type what you SEE → Snapshot → change → LIVE APPLY.",
+                    )
+                    toast("Type on-screen values, then Snapshot")
                 }
             }
         }.start()

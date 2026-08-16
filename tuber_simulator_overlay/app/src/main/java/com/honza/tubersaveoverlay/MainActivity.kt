@@ -21,6 +21,7 @@ class MainActivity : AppCompatActivity() {
         binding.btnAllFiles.setOnClickListener { openAllFilesSettings() }
         binding.btnStart.setOnClickListener { startOverlay() }
         binding.btnStop.setOnClickListener { stopOverlay() }
+        binding.status.text = "Build ${BuildConfig.VERSION_NAME} (${BuildConfig.VERSION_CODE}). If you don't see this, uninstall old APK first."
         refreshStatus()
     }
 
