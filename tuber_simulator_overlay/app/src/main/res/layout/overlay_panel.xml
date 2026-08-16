@@ -240,7 +240,7 @@
                 android:id="@+id/btnApplyRestart"
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
-                android:text="APPLY &amp; RESTART GAME"
+                android:text="APPLY LIVE SAVE &amp; RESTART"
                 android:textSize="14sp" />
 
             <com.google.android.material.button.MaterialButton
@@ -248,7 +248,7 @@
                 style="@style/Widget.MaterialComponents.Button.OutlinedButton"
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
-                android:text="Only update keys (don't restart)"
+                android:text="Only update keys in menu"
                 android:textSize="11sp" />
 
             <com.google.android.material.button.MaterialButton
@@ -256,7 +256,7 @@
                 style="@style/Widget.MaterialComponents.Button.OutlinedButton"
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
-                android:text="Scan / pull saves"
+                android:text="Re-pull live save (ROOT)"
                 android:textSize="11sp" />
 
             <com.google.android.material.button.MaterialButton
@@ -264,7 +264,7 @@
                 style="@style/Widget.MaterialComponents.Button.OutlinedButton"
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
-                android:text="Push only (root / no relaunch)"
+                android:text="Write save only (stop game)"
                 android:textSize="11sp" />
 
             <LinearLayout

@@ -11,8 +11,8 @@ android {
         applicationId = "com.honza.tubersaveoverlay"
         minSdk = 26
         targetSdk = 34
-        versionCode = 5
-        versionName = "1.2.0-honest"
+        versionCode = 6
+        versionName = "1.3.0-bluestacks-live"
     }
 
     buildTypes {

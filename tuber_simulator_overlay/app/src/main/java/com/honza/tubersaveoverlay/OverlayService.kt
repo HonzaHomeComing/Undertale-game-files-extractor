@@ -210,22 +210,7 @@ class OverlayService : Service() {
 
         val b = panelBinding!!
         b.fileLabel.text = loadedName
-        // Never call su on the UI thread — it freezes/crashes non-root phones.
-        b.statusLine.text = when {
-            GameSaveAccess.hasRootCached() ->
-                "ROOT OK — Pull → edit → APPLY & RESTART."
-            else ->
-                "No root: Apply can restart the game but CANNOT change Bux/Gems."
-        }
-        Thread {
-            val rooted = GameSaveAccess.hasRoot()
-            mainHandler.post {
-                if (panelBinding !== b) return@post
-                if (rooted) {
-                    b.statusLine.text = "ROOT OK — set values, tap APPLY & RESTART GAME."
-                }
-            }
-        }.start()
+        b.statusLine.text = "Checking BlueStacks root…"
         b.btnClosePanel.setOnClickListener {
             hidePanel()
             ignoreBubbleTapUntil = System.currentTimeMillis() + 400
@@ -245,6 +230,40 @@ class OverlayService : Service() {
         rebuildKeyEditors()
         windowManager.addView(panelView, params)
         toast("Cheat menu open — use X to close")
+
+        // Rooted BlueStacks: auto-pull live save so edits apply to the real file.
+        Thread {
+            GameSaveAccess.invalidateRootCache()
+            val rooted = GameSaveAccess.hasRoot()
+            if (!rooted) {
+                mainHandler.post {
+                    if (panelBinding !== b) return@post
+                    b.statusLine.text = "No root — BlueStacks Settings → Advanced → Root ON, restart BS."
+                }
+                return@Thread
+            }
+            mainHandler.post {
+                if (panelBinding !== b) return@post
+                b.statusLine.text = "ROOT OK — loading live save…"
+            }
+            val (ok, payload) = GameSaveAccess.pullPrefsXml()
+            mainHandler.post {
+                if (panelBinding !== b) return@post
+                if (ok) {
+                    entries = PlayerPrefsXml.parse(payload)
+                    GameSaveAccess.ensureDefaults(entries)
+                    workingFile().writeText(payload)
+                    loadedName = "Live save (${entries.size} keys)"
+                    b.fileLabel.text = loadedName
+                    refreshQuickFields()
+                    rebuildKeyEditors()
+                    b.statusLine.text = "Live save loaded — edit values, tap APPLY & RESTART."
+                    toast("Live save loaded (${entries.size} keys)")
+                } else {
+                    b.statusLine.text = "ROOT OK but pull failed: $payload — open the game once, then Scan."
+                }
+            }
+        }.start()
     }
 
     private fun hidePanel() {
@@ -419,50 +438,51 @@ class OverlayService : Service() {
         return map
     }
 
-    /** Main action: write values → stop/kill → relaunch Tuber Simulator. */
+    /** Rooted BlueStacks: merge edits into live prefs → write → relaunch. */
     private fun applyAndRestartGame() {
-        setStatus("Applying + restarting Tuber Simulator…")
-        toast("Applying + restarting…")
+        setStatus("Applying live save + restarting…")
+        toast("Applying…")
         Thread {
             var values: Map<String, String> = emptyMap()
+            var snapshot: List<PrefEntry> = emptyList()
             syncOnMain {
                 syncKeyEditorsFromUi()
                 applyFieldValuesIntoEntries()
                 values = collectValuesMap()
+                snapshot = entries.map { it.copy() }
             }
-            val xml = PlayerPrefsXml.toXml(entries)
             val wf = workingFile()
-            wf.writeText(xml)
 
-            if (GameSaveAccess.hasRoot()) {
-                val (ok, msg) = GameSaveAccess.pushPrefsAndStopGame(xml, wf)
-                if (!ok) {
-                    mainHandler.post {
-                        setStatus(msg)
-                        toast(msg)
-                    }
-                    return@Thread
-                }
-                Thread.sleep(700)
+            if (!GameSaveAccess.hasRoot()) {
                 mainHandler.post {
-                    relaunchGame()
-                    setStatus("Done — game restarted with new values.")
-                    toast("Game restarted with new values")
+                    setStatus("Need BlueStacks Root ON (Settings → Advanced), then restart BlueStacks.")
+                    toast("Root required")
                 }
                 return@Thread
             }
 
-            // Non-root phone path — usually cannot touch real Bux/Gems.
-            val result = NoRootSaveAccess.applyAndRestart(this, values, xml)
+            val (ok, msg) = GameSaveAccess.applyLiveEdits(values, snapshot, wf)
+            if (!ok) {
+                mainHandler.post {
+                    setStatus(msg)
+                    toast(msg)
+                }
+                return@Thread
+            }
+            // Refresh in-memory entries from what we wrote
+            try {
+                entries = PlayerPrefsXml.parse(wf.readText())
+            } catch (_: Exception) {
+            }
+            Thread.sleep(400)
             mainHandler.post {
-                setStatus(result.summary)
-                toast(
-                    if (result.changedGame) {
-                        "Game values changed + restarted"
-                    } else {
-                        "Restarted only — values NOT changed (need root)"
-                    },
-                )
+                relaunchGame()
+                loadedName = "Applied live (${entries.size} keys)"
+                panelBinding?.fileLabel?.text = loadedName
+                refreshQuickFields()
+                rebuildKeyEditors()
+                setStatus("DONE — $msg — game relaunched.")
+                toast("Values applied — game restarted")
             }
         }.start()
     }
@@ -589,29 +609,25 @@ class OverlayService : Service() {
 
     private fun pushRoot(relaunch: Boolean) {
         Thread {
-            val rooted = GameSaveAccess.hasRoot()
-            if (!rooted) {
+            if (!GameSaveAccess.hasRoot()) {
                 mainHandler.post {
-                    if (relaunch) {
-                        applyAndRestartGame()
-                    } else {
-                        setStatus("No root — use APPLY & RESTART GAME.")
-                        toast("Use APPLY & RESTART on phone")
-                    }
+                    setStatus("Need BlueStacks Root ON.")
+                    toast("Root required")
                 }
                 return@Thread
             }
-            mainHandler.post {
-                setStatus(if (relaunch) "Writing + restarting…" else "Writing prefs (no relaunch)…")
-            }
+            var values: Map<String, String> = emptyMap()
+            var snapshot: List<PrefEntry> = emptyList()
             syncOnMain {
                 syncKeyEditorsFromUi()
                 applyFieldValuesIntoEntries()
+                values = collectValuesMap()
+                snapshot = entries.map { it.copy() }
             }
-            val xml = PlayerPrefsXml.toXml(entries)
-            val wf = workingFile()
-            wf.writeText(xml)
-            val (ok, msg) = GameSaveAccess.pushPrefsAndStopGame(xml, wf)
+            mainHandler.post {
+                setStatus(if (relaunch) "Writing + restarting…" else "Writing live save…")
+            }
+            val (ok, msg) = GameSaveAccess.applyLiveEdits(values, snapshot, workingFile())
             if (!ok) {
                 mainHandler.post {
                     setStatus(msg)
@@ -620,15 +636,15 @@ class OverlayService : Service() {
                 return@Thread
             }
             if (relaunch) {
-                Thread.sleep(700)
+                Thread.sleep(400)
                 mainHandler.post {
                     relaunchGame()
-                    setStatus("Saved — game restarted.")
+                    setStatus("Saved — game restarted. $msg")
                     toast("Saved — game restarted")
                 }
             } else {
                 mainHandler.post {
-                    setStatus("Saved + stopped. Open Tuber Simulator manually.")
+                    setStatus("Saved (game stopped). Open Tuber Simulator. $msg")
                     toast("Saved. Open game manually.")
                 }
             }
