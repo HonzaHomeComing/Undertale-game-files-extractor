@@ -221,6 +221,7 @@ class OverlayService : Service() {
         b.btnApplyFields.setOnClickListener { applyAllFields() }
         b.btnPullRoot.setOnClickListener { pullSaves() }
         b.btnPushRoot.setOnClickListener { pushRoot(relaunch = false) }
+        b.btnUnstick.setOnClickListener { unstickGame() }
         b.btnGlitchMax.setOnClickListener { glitchPreset("max", restart = true) }
         b.btnGlitchOverflow.setOnClickListener { glitchPreset("overflow", restart = true) }
         b.btnGlitchNeg.setOnClickListener { glitchPreset("neg", restart = true) }
@@ -487,63 +488,95 @@ class OverlayService : Service() {
         }.start()
     }
 
+    private fun unstickGame() {
+        setStatus("Fixing stuck splash — clamping insane values…")
+        toast("Unsticking…")
+        Thread {
+            val (ok, msg) = GameSaveAccess.unstickGame(workingFile())
+            if (!ok) {
+                mainHandler.post {
+                    setStatus(msg)
+                    toast(msg)
+                }
+                return@Thread
+            }
+            try {
+                entries = PlayerPrefsXml.parse(workingFile().readText())
+            } catch (_: Exception) {
+            }
+            Thread.sleep(400)
+            mainHandler.post {
+                loadedName = "Unstuck save (${entries.size} keys)"
+                panelBinding?.fileLabel?.text = loadedName
+                refreshQuickFields()
+                rebuildKeyEditors()
+                relaunchGame()
+                setStatus("DONE — $msg")
+                toast("Game unstuck — relaunched")
+            }
+        }.start()
+    }
+
     private fun glitchPreset(kind: String, restart: Boolean = true) {
         val b = panelBinding ?: return
-        fun fill(v: String) {
-            b.fieldBux.setText(v)
-            b.fieldGems.setText(v)
-            b.fieldKnowledge.setText(v)
-            b.fieldSubs.setText(v)
-            b.fieldViews.setText(v)
-            b.fieldLevel.setText(if (kind == "neg") "-1" else v)
-            b.fieldItems.setText(v)
-            b.fieldFurniture.setText(v)
-        }
+        // SAFE presets — huge levels brick the OUTERMINDS splash.
         when (kind) {
-            "max" -> fill("999999999")
-            "overflow" -> fill(Int.MAX_VALUE.toString())
-            "neg" -> fill("-999999")
+            "max" -> {
+                b.fieldBux.setText("9999999")
+                b.fieldGems.setText("999999")
+                b.fieldKnowledge.setText("999999")
+                b.fieldSubs.setText("1000000")
+                b.fieldViews.setText("10000000")
+                b.fieldLevel.setText("25")
+                b.fieldItems.setText("500")
+                b.fieldFurniture.setText("200")
+            }
+            "overflow" -> {
+                // Still capped — true Int.MAX crashes load
+                b.fieldBux.setText("99999999")
+                b.fieldGems.setText("9999999")
+                b.fieldKnowledge.setText("9999999")
+                b.fieldSubs.setText("50000000")
+                b.fieldViews.setText("50000000")
+                b.fieldLevel.setText("30")
+                b.fieldItems.setText("1000")
+                b.fieldFurniture.setText("500")
+            }
+            "neg" -> {
+                b.fieldBux.setText("0")
+                b.fieldGems.setText("0")
+                b.fieldKnowledge.setText("0")
+                b.fieldSubs.setText("0")
+                b.fieldViews.setText("0")
+                b.fieldLevel.setText("1")
+                b.fieldItems.setText("0")
+                b.fieldFurniture.setText("0")
+            }
             "chaos" -> {
-                fun r() = Random.nextInt(-2_000_000, 2_000_000_000).toString()
-                b.fieldBux.setText(r())
-                b.fieldGems.setText(r())
-                b.fieldKnowledge.setText(r())
-                b.fieldSubs.setText(r())
-                b.fieldViews.setText(r())
-                b.fieldLevel.setText(r())
-                b.fieldItems.setText(r())
-                b.fieldFurniture.setText(r())
+                fun r(max: Int) = Random.nextInt(0, max).toString()
+                b.fieldBux.setText(r(5_000_000))
+                b.fieldGems.setText(r(500_000))
+                b.fieldKnowledge.setText(r(500_000))
+                b.fieldSubs.setText(r(2_000_000))
+                b.fieldViews.setText(r(10_000_000))
+                b.fieldLevel.setText(Random.nextInt(1, 35).toString())
+                b.fieldItems.setText(r(500))
+                b.fieldFurniture.setText(r(200))
             }
         }
-        // Apply into entries without the "memory only" toast spam
         syncKeyEditorsFromUi()
         applyFieldValuesIntoEntries()
-        val smash = when (kind) {
-            "max" -> "999999999"
-            "overflow" -> Int.MAX_VALUE.toString()
-            "neg" -> "-999999"
-            else -> null
-        }
-        if (smash != null) {
-            for (e in entries) {
-                if (e.type != PrefType.STRING && e.type != PrefType.BOOLEAN) e.value = smash
-            }
-        } else {
-            for (e in entries) {
-                if (e.type != PrefType.STRING && e.type != PrefType.BOOLEAN) {
-                    e.value = Random.nextInt(-5_000_000, Int.MAX_VALUE).toString()
-                }
-            }
-        }
+        // Do NOT smash every key — that set ChannelLevel to billions and stuck splash.
+        GameSaveAccess.clampEntriesForStability(entries)
         workingFile().writeText(PlayerPrefsXml.toXml(entries))
         rebuildKeyEditors()
         refreshQuickFields()
         if (restart) {
-            setStatus("GLITCH ($kind) → writing + restarting…")
-            toast("Glitch + restarting…")
+            setStatus("SAFE GLITCH ($kind) → writing + restarting…")
+            toast("Applying safe glitch…")
             applyAndRestartGame()
         } else {
-            setStatus("GLITCH ($kind) loaded — tap APPLY & RESTART")
+            setStatus("Glitch ($kind) ready — tap APPLY")
             toast("Glitch ready")
         }
     }

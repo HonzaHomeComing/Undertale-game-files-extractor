@@ -1,31 +1,25 @@
-# Tuber Simulator Overlay Save Editor
+# Tuber Simulator Overlay (BlueStacks root)
 
-Floating overlay for **PewDiePie’s Tuber Simulator** (`com.outerminds.tubular`).
+Floating cheat overlay for **PewDiePie’s Tuber Simulator** on **rooted BlueStacks**.
 
-## Hard limit (read this)
+## Install in BlueStacks
 
-Bux / Gems / Knowledge live in Unity **PlayerPrefs**:
+1. BlueStacks → **Settings → Advanced → Root ON** → restart BlueStacks  
+2. Install:  
+   **https://github.com/HonzaHomeComing/Undertale-game-files-extractor/raw/cursor/tuber-simulator-overlay-cb61/tuber_simulator_overlay/dist/TuberSaveOverlay-debug.apk**  
+3. Allow **Display over other apps** → **Start overlay**  
+4. Open Tuber Simulator → tap the **red bubble**  
+5. Menu **auto-loads the live save** → edit Bux/Gems/etc → **APPLY LIVE SAVE & RESTART**
 
-`/data/data/com.outerminds.tubular/shared_prefs/…playerprefs….xml`
+## What Apply does
 
-On a **normal non-root phone**, Android blocks that folder. The overlay can restart
-the game and export an XML to `Download/`, but **the game will not use that file**.
-A status like “Patched … Download/TuberSaveOverlay” means only our export was
-edited — **not** the live save.
+1. Force-stops the game (so it can’t overwrite the file)  
+2. Merges your edits into the real `playerprefs` XML under `/data/data/…`  
+3. Writes the file with root + fixes ownership  
+4. Relaunches the game  
 
-**Ways that actually change values:**
+Unity keeps prefs in memory, so a **quick restart is required** for new values to show. You edit while the overlay is open over the game; Apply does the stop/write/relaunch.
 
-1. **Phone with Magisk / KernelSU root** → Pull → edit → APPLY & RESTART  
-2. **BlueStacks** → Settings → Advanced → **Root ON** → same flow  
+## Magisk phone
 
-## Install
-
-https://github.com/HonzaHomeComing/Undertale-game-files-extractor/raw/cursor/tuber-simulator-overlay-cb61/tuber_simulator_overlay/dist/TuberSaveOverlay-debug.apk
-
-1. Allow **Display over other apps**
-2. **Start overlay** → red bubble → cheat menu
-3. With root: **Scan / pull saves** → set values → **APPLY & RESTART GAME**
-
-## Build
-
-Open `tuber_simulator_overlay/` in Android Studio (API 26+).
+Same APK works if Magisk root is granted to the overlay — same Apply flow.

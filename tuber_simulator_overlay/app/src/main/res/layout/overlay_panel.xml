@@ -178,9 +178,16 @@
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
                 android:layout_marginTop="8dp"
-                android:text="GLITCH OUT"
+                android:text="FIX / GLITCH"
                 android:textColor="@color/accent"
                 android:textStyle="bold" />
+
+            <com.google.android.material.button.MaterialButton
+                android:id="@+id/btnUnstick"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="UNSTICK GAME (fix splash crash)"
+                android:textSize="12sp" />
 
             <LinearLayout
                 android:layout_width="match_parent"
@@ -188,14 +195,16 @@
                 android:orientation="horizontal">
                 <com.google.android.material.button.MaterialButton
                     android:id="@+id/btnGlitchMax"
+                    style="@style/Widget.MaterialComponents.Button.OutlinedButton"
                     android:layout_width="0dp"
                     android:layout_height="wrap_content"
                     android:layout_marginEnd="4dp"
                     android:layout_weight="1"
-                    android:text="MAX ALL"
+                    android:text="SAFE RICH"
                     android:textSize="11sp" />
                 <com.google.android.material.button.MaterialButton
                     android:id="@+id/btnGlitchOverflow"
+                    style="@style/Widget.MaterialComponents.Button.OutlinedButton"
                     android:layout_width="0dp"
                     android:layout_height="wrap_content"
                     android:layout_marginStart="4dp"

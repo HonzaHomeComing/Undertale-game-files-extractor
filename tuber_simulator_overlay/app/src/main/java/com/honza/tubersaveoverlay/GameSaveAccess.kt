@@ -165,6 +165,7 @@ object GameSaveAccess {
 
         // Stamp common currency needles from map onto every similar key name.
         stampNeedles(liveEntries, fieldValues)
+        clampEntriesForStability(liveEntries)
 
         val xml = PlayerPrefsXml.toXml(liveEntries)
         workingFile.parentFile?.mkdirs()
@@ -242,6 +243,101 @@ object GameSaveAccess {
                 entries += d.copy()
                 have += d.name.lowercase()
             }
+        }
+    }
+
+    /**
+     * Clamp insane values that brick boot (e.g. channel level in the hundreds of millions).
+     * Keeps rich currency, but caps levels/counts to ranges the game can load.
+     */
+    fun clampEntriesForStability(entries: MutableList<PrefEntry>): Int {
+        var changed = 0
+        for (e in entries) {
+            if (e.type == PrefType.STRING || e.type == PrefType.BOOLEAN) continue
+            val n = e.name.lowercase()
+            val num = e.value.toLongOrNull()
+                ?: e.value.toDoubleOrNull()?.toLong()
+                ?: continue
+            val capped = when {
+                listOf("level", "rank", "tier", "prestige", "season").any { n.contains(it) } ->
+                    num.coerceIn(1L, 40L)
+                listOf("room", "slot", "chapter", "quest", "tutorial", "stage").any { n.contains(it) } ->
+                    num.coerceIn(0L, 200L)
+                listOf("bux", "money", "cash", "gem", "knowledge", "brain", "currency", "coin")
+                    .any { n.contains(it) } ->
+                    num.coerceIn(0L, 9_999_999L)
+                listOf("sub", "follower", "view").any { n.contains(it) } ->
+                    num.coerceIn(0L, 50_000_000L)
+                listOf("item", "inventory", "furniture", "prop", "unlock", "count", "amount")
+                    .any { n.contains(it) } ->
+                    num.coerceIn(0L, 5_000L)
+                else -> num.coerceIn(-1_000L, 10_000_000L)
+            }
+            if (capped.toString() != e.value) {
+                e.value = capped.toString()
+                changed++
+            }
+        }
+        return changed
+    }
+
+    /** Force-stop, clamp/fix insane prefs that brick the splash screen, write back. */
+    fun unstickGame(workingFile: File): Pair<Boolean, String> {
+        if (!hasRoot(2_000)) {
+            return false to "Need root to fix the save."
+        }
+        runSu("am force-stop $PACKAGE", timeoutMs = 4_000)
+        try {
+            Thread.sleep(700)
+        } catch (_: InterruptedException) {
+        }
+
+        var path = findPrefsPath()
+        if (path == null) {
+            path = CANDIDATE_PATHS.first()
+            runSu("mkdir -p \"\$(dirname \"$path\")\"", timeoutMs = 3_000)
+        }
+
+        val pull = runSu("cat \"$path\"", timeoutMs = 6_000)
+        val entries: MutableList<PrefEntry> = if (pull.success && pull.output.contains("<")) {
+            PlayerPrefsXml.parse(pull.output)
+        } else {
+            mutableListOf()
+        }
+        ensureDefaults(entries)
+        clampEntriesForStability(entries)
+
+        fun setAll(needles: List<String>, v: String) {
+            for (e in entries) {
+                if (needles.any { e.name.lowercase().contains(it) }) e.value = v
+            }
+        }
+        setAll(listOf("bux", "money", "cash", "soft"), "999999")
+        setAll(listOf("gem", "premium", "hard"), "50000")
+        setAll(listOf("knowledge", "brain"), "100000")
+        setAll(listOf("sub", "follower"), "100000")
+        setAll(listOf("view"), "1000000")
+        setAll(listOf("level", "rank"), "15")
+        clampEntriesForStability(entries)
+
+        val xml = PlayerPrefsXml.toXml(entries)
+        workingFile.parentFile?.mkdirs()
+        workingFile.writeText(xml)
+        workingFile.setReadable(true, false)
+        val abs = workingFile.absolutePath
+        val writeScript = buildString {
+            append("cp \"$abs\" \"$path\"; ")
+            append("chmod 660 \"$path\"; ")
+            append("APPUID=\$(stat -c %u /data/data/$PACKAGE 2>/dev/null); ")
+            append("if [ -n \"\$APPUID\" ]; then chown \"\$APPUID\":\"\$APPUID\" \"$path\"; fi; ")
+            append("restorecon \"$path\" 2>/dev/null; ")
+            append("ls -l \"$path\"")
+        }
+        val res = runSu(writeScript, timeoutMs = 10_000)
+        return if (res.success || res.output.contains("playerprefs", ignoreCase = true)) {
+            true to "Unstuck — level capped, safe rich values written (${entries.size} keys)."
+        } else {
+            false to "Unstick write failed: ${res.output}"
         }
     }
 
