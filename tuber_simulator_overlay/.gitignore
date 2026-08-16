@@ -9,3 +9,6 @@
 *.ap_
 *.dex
 .DS_Store
+
+!dist/
+!dist/*.apk
