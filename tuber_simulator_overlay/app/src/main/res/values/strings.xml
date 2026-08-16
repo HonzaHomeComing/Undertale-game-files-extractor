@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Tuber Save Overlay</string>
+    <string name="overlay_channel">Save overlay</string>
+    <string name="overlay_running">Tuber save editor is floating</string>
+    <string name="need_overlay">Allow “Display over other apps” for this app, then start the overlay.</string>
+    <string name="start_overlay">Start overlay</string>
+    <string name="stop_overlay">Stop overlay</string>
+    <string name="open_overlay_settings">Open overlay settings</string>
+</resources>
