@@ -4,11 +4,11 @@
     <string name="overlay_channel">Save overlay</string>
     <string name="overlay_running">Tuber save editor is floating</string>
     <string name="need_overlay">Allow “Display over other apps” for this app, then start the overlay.</string>
-    <string name="need_all_files">Allow “All files access” so the overlay can edit phone saves and restart the game.</string>
+    <string name="need_all_files">Allow “All files access” so the overlay can scan Android/data.</string>
     <string name="start_overlay">Start overlay</string>
     <string name="stop_overlay">Stop overlay</string>
     <string name="open_overlay_settings">1. Open overlay settings</string>
     <string name="open_all_files">2. Allow all files access</string>
-    <string name="main_blurb">For a normal (non-root) phone: grant overlay + all-files access, start the overlay, open Tuber Simulator, tap the red bubble, set values, then tap APPLY &amp; RESTART GAME. That patches any editable Android/data saves and relaunches the game — no BlueStacks needed.</string>
-    <string name="main_paths">Phone saves scanned:\nAndroid/data/com.outerminds.tubular/\nDownload/TuberSaveOverlay/\n\nRoot-only (optional):\n/data/data/…/shared_prefs/*playerprefs*.xml</string>
+    <string name="main_blurb">Important: Tuber Simulator stores Bux/Gems in a private folder Android locks on non-root phones. Restarting alone does nothing.\n\nTo actually change values you need Magisk/KernelSU root on the phone, or BlueStacks with Root ON. This overlay edits + force-stops + relaunches once root can reach the prefs file.</string>
+    <string name="main_paths">Real save (needs root):\n/data/data/com.outerminds.tubular/shared_prefs/\n*playerprefs*.xml\n\nExport only (ignored by game):\nDownload/TuberSaveOverlay/</string>
 </resources>

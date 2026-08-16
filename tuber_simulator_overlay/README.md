@@ -1,39 +1,31 @@
 # Tuber Simulator Overlay Save Editor
 
-Floating Android app (“Appear on top of other apps”) for **PewDiePie’s Tuber Simulator**
-(`com.outerminds.tubular`) on a **normal phone — no BlueStacks, no root required** for the
-Apply & Restart flow.
+Floating overlay for **PewDiePie’s Tuber Simulator** (`com.outerminds.tubular`).
 
-## Install on your phone
+## Hard limit (read this)
 
-1. Uninstall the old overlay if present.
-2. Download:  
-   **https://github.com/HonzaHomeComing/Undertale-game-files-extractor/raw/cursor/tuber-simulator-overlay-cb61/tuber_simulator_overlay/dist/TuberSaveOverlay-debug.apk**
-3. Install → open app → allow:
-   - **Display over other apps**
-   - **All files access**
-4. Tap **Start overlay** → open Tuber Simulator → tap the **red bubble**.
-5. Set Bux / Gems / etc. → tap **APPLY & RESTART GAME**.
-
-That will:
-
-- Patch any editable text saves under `Android/data/com.outerminds.tubular/`
-- Export your edited XML to `Download/TuberSaveOverlay/playerprefs_edited.xml`
-- Send the game Home → kill its background process → relaunch it
-
-## Important limit (honest)
-
-Unity **PlayerPrefs** (the usual Bux/Gems file) live in a **private** folder:
+Bux / Gems / Knowledge live in Unity **PlayerPrefs**:
 
 `/data/data/com.outerminds.tubular/shared_prefs/…playerprefs….xml`
 
-Android blocks that folder on stock phones. If the game only stores currency there,
-phone-mode Apply & Restart still **restarts** the game and **exports** the XML, but
-cannot rewrite the private prefs without root.
+On a **normal non-root phone**, Android blocks that folder. The overlay can restart
+the game and export an XML to `Download/`, but **the game will not use that file**.
+A status like “Patched … Download/TuberSaveOverlay” means only our export was
+edited — **not** the live save.
 
-Optional root (Magisk / BlueStacks Root ON) unlocks live Pull/Push of those prefs.
+**Ways that actually change values:**
+
+1. **Phone with Magisk / KernelSU root** → Pull → edit → APPLY & RESTART  
+2. **BlueStacks** → Settings → Advanced → **Root ON** → same flow  
+
+## Install
+
+https://github.com/HonzaHomeComing/Undertale-game-files-extractor/raw/cursor/tuber-simulator-overlay-cb61/tuber_simulator_overlay/dist/TuberSaveOverlay-debug.apk
+
+1. Allow **Display over other apps**
+2. **Start overlay** → red bubble → cheat menu
+3. With root: **Scan / pull saves** → set values → **APPLY & RESTART GAME**
 
 ## Build
 
-Open `tuber_simulator_overlay/` in Android Studio (API 26+), or use the prebuilt APK under
-`tuber_simulator_overlay/dist/TuberSaveOverlay-debug.apk`.
+Open `tuber_simulator_overlay/` in Android Studio (API 26+).

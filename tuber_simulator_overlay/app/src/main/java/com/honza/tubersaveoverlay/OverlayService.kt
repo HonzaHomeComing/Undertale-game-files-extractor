@@ -213,11 +213,9 @@ class OverlayService : Service() {
         // Never call su on the UI thread — it freezes/crashes non-root phones.
         b.statusLine.text = when {
             GameSaveAccess.hasRootCached() ->
-                "ROOT OK — set values, tap APPLY & RESTART GAME."
-            NoRootSaveAccess.hasAllFilesAccess() ->
-                "Phone mode — set values, tap APPLY & RESTART GAME."
+                "ROOT OK — Pull → edit → APPLY & RESTART."
             else ->
-                "Phone mode — set values, tap APPLY & RESTART GAME."
+                "No root: Apply can restart the game but CANNOT change Bux/Gems."
         }
         Thread {
             val rooted = GameSaveAccess.hasRoot()
@@ -454,28 +452,15 @@ class OverlayService : Service() {
                 return@Thread
             }
 
-            // Non-root phone path
-            if (!NoRootSaveAccess.hasAllFilesAccess()) {
-                mainHandler.post {
-                    setStatus("Grant All files access in Tuber Save Overlay, then retry.")
-                    toast("Need all-files access")
-                    try {
-                        startActivity(
-                            NoRootSaveAccess.allFilesAccessIntent(this).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
-                        )
-                    } catch (_: Exception) {
-                    }
-                }
-                return@Thread
-            }
-            val summary = NoRootSaveAccess.applyAndRestart(this, values, xml)
+            // Non-root phone path — usually cannot touch real Bux/Gems.
+            val result = NoRootSaveAccess.applyAndRestart(this, values, xml)
             mainHandler.post {
-                setStatus(summary)
+                setStatus(result.summary)
                 toast(
-                    if (summary.contains("Patched")) {
-                        "Applied + game restarted"
+                    if (result.changedGame) {
+                        "Game values changed + restarted"
                     } else {
-                        "Restarted — see status (private prefs need root)"
+                        "Restarted only — values NOT changed (need root)"
                     },
                 )
             }
@@ -565,7 +550,7 @@ class OverlayService : Service() {
                 }
                 return@Thread
             }
-            val saves = NoRootSaveAccess.findEditableSaves()
+            val saves = NoRootSaveAccess.findGameSaves()
             val xmlHit = saves.firstOrNull { hit ->
                 hit.file.extension.equals("xml", true) &&
                     try {
@@ -585,22 +570,18 @@ class OverlayService : Service() {
                         panelBinding?.fileLabel?.text = loadedName
                         refreshQuickFields()
                         rebuildKeyEditors()
-                        setStatus("Loaded phone XML — edit, then APPLY & RESTART")
+                        setStatus("Loaded Android/data XML — edit, then APPLY & RESTART")
                         toast("Loaded ${entries.size} keys from phone")
                     } catch (e: Exception) {
                         setStatus("Read failed: ${e.message}")
                         toast("Read failed")
                     }
                 } else {
-                    val n = saves.size
                     setStatus(
-                        if (n == 0) {
-                            "No phone saves found under Android/data. Set values manually, then APPLY & RESTART."
-                        } else {
-                            "Found $n phone file(s), none were PlayerPrefs XML. Set values → APPLY & RESTART."
-                        },
+                        "Scan: ${NoRootSaveAccess.diagnoseAndroidData()} " +
+                            "Bux/Gems are in a ROOT-only folder on this game.",
                     )
-                    toast(if (n == 0) "No phone saves" else "Found $n files")
+                    toast("No editable game save without root")
                 }
             }
         }.start()

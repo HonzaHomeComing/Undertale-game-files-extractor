@@ -10,18 +10,27 @@ import android.provider.Settings
 import java.io.File
 
 /**
- * No-root save access for Tuber Simulator on a normal phone.
+ * No-root helpers for Tuber Simulator.
  *
- * Unity PlayerPrefs live under /data/data/... and stay locked without root.
- * This path:
- *  1) Patches any readable/writable text saves under Android/data/<package>/
- *  2) Always exports the edited PlayerPrefs XML to Download/TuberSaveOverlay/
- *  3) Restarts the game (Home → kill background → launch) without su
+ * Real currency (Bux/Gems) is almost always in
+ * `/data/data/com.outerminds.tubular/shared_prefs/` — **not writable without root**.
+ *
+ * This only patches files under the game's **Android/data** folder when the OEM
+ * still allows it. Exporting to Download does NOT affect the game.
  */
 object NoRootSaveAccess {
     const val PACKAGE = GameSaveAccess.PACKAGE
 
     data class SaveHit(val file: File, val label: String)
+
+    data class ApplyResult(
+        val gameEdits: Int,
+        val androidDataReachable: Boolean,
+        val exportPath: String?,
+        val restartMsg: String,
+        val summary: String,
+        val changedGame: Boolean,
+    )
 
     fun hasAllFilesAccess(): Boolean =
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
@@ -44,7 +53,8 @@ object NoRootSaveAccess {
         }
     }
 
-    fun gameExternalRoots(): List<File> {
+    /** Only the game's external sandbox — never Download/ (our own exports). */
+    fun gameAndroidDataRoots(): List<File> {
         val bases = mutableListOf<File>()
         Environment.getExternalStorageDirectory()?.let { bases += it }
         try {
@@ -56,46 +66,65 @@ object NoRootSaveAccess {
             listOf(
                 File(base, "Android/data/$PACKAGE"),
                 File(base, "Android/media/$PACKAGE"),
-                File(base, "Download/TuberSaveOverlay"),
-                File(base, "Download/TuberSimulator"),
             )
         }.distinctBy { it.absolutePath }
     }
 
-    fun findEditableSaves(): List<SaveHit> {
+    fun diagnoseAndroidData(): String {
+        val roots = gameAndroidDataRoots()
+        val existing = roots.filter { it.exists() }
+        if (existing.isEmpty()) {
+            return "Android/data/$PACKAGE not visible (normal on Android 11+ without root)."
+        }
+        val readable = existing.count { it.canRead() && it.listFiles() != null }
+        val files = findGameSaves().size
+        return "Android/data visible=${existing.size}, listable=$readable, candidate files=$files"
+    }
+
+    fun findGameSaves(): List<SaveHit> {
         val out = mutableListOf<SaveHit>()
         val interestingExt = setOf(
             "json", "xml", "txt", "dat", "save", "bin", "bytes", "playerprefs", "prefs",
         )
-        for (root in gameExternalRoots()) {
+        for (root in gameAndroidDataRoots()) {
             if (!root.exists()) continue
-            root.walkTopDown()
-                .maxDepth(10)
-                .filter { it.isFile && it.canRead() && it.length() in 8..(8_000_000) }
-                .forEach { f ->
-                    val name = f.name.lowercase()
-                    val ext = f.extension.lowercase()
-                    val looksUseful = ext in interestingExt ||
-                        name.contains("save") ||
-                        name.contains("player") ||
-                        name.contains("prefs") ||
-                        name.contains("profile") ||
-                        name.contains("user") ||
-                        name.contains("data")
-                    if (!looksUseful) return@forEach
-                    if (ext in setOf("png", "jpg", "jpeg", "ogg", "mp3", "mp4", "wav", "webp")) {
-                        return@forEach
+            val listed = root.listFiles()
+            if (listed == null) continue
+            try {
+                root.walkTopDown()
+                    .maxDepth(12)
+                    .filter { it.isFile && it.canRead() && it.length() in 8..(12_000_000) }
+                    .forEach { f ->
+                        val name = f.name.lowercase()
+                        val ext = f.extension.lowercase()
+                        val looksUseful = ext in interestingExt ||
+                            name.contains("save") ||
+                            name.contains("player") ||
+                            name.contains("prefs") ||
+                            name.contains("profile") ||
+                            name.contains("user") ||
+                            name.contains("data") ||
+                            name.contains("bux") ||
+                            name.endsWith(".bytes")
+                        if (!looksUseful) return@forEach
+                        if (ext in setOf("png", "jpg", "jpeg", "ogg", "mp3", "mp4", "wav", "webp")) {
+                            return@forEach
+                        }
+                        val label = try {
+                            f.relativeTo(root).path
+                        } catch (_: Exception) {
+                            f.name
+                        }
+                        out += SaveHit(f, label)
                     }
-                    val label = try {
-                        f.relativeTo(root).path
-                    } catch (_: Exception) {
-                        f.name
-                    }
-                    out += SaveHit(f, "${root.name}/$label")
-                }
+            } catch (_: Exception) {
+            }
         }
         return out.distinctBy { it.file.absolutePath }
     }
+
+    /** @deprecated use findGameSaves — kept so older call sites compile if any remain */
+    fun findEditableSaves(): List<SaveHit> = findGameSaves()
 
     fun exportXmlToDownloads(xml: String): File? {
         val base = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
@@ -111,16 +140,15 @@ object NoRootSaveAccess {
         }
     }
 
-    /** Best-effort mirror into the game's external files folder (Unity persistentDataPath). */
     fun tryWritePrefsMirror(xml: String): String? {
-        for (root in gameExternalRoots().filter { it.path.contains("Android/data") }) {
+        for (root in gameAndroidDataRoots()) {
+            if (!root.exists() && !root.mkdirs()) continue
+            if (root.listFiles() == null && !root.canWrite()) continue
             val filesDir = File(root, "files")
-            if (!filesDir.exists()) filesDir.mkdirs()
-            if (!filesDir.exists()) continue
+            filesDir.mkdirs()
             val targets = listOf(
                 File(filesDir, "playerprefs_edited.xml"),
                 File(filesDir, "$PACKAGE.v2.playerprefs.xml"),
-                File(root, "shared_prefs/$PACKAGE.v2.playerprefs.xml"),
             )
             for (t in targets) {
                 try {
@@ -134,21 +162,21 @@ object NoRootSaveAccess {
         return null
     }
 
-    /**
-     * Patch numeric literals next to currency-like keys in text files.
-     * Returns how many replacements were made across files.
-     */
     fun patchSaves(
         saves: List<SaveHit>,
         values: Map<String, String>,
     ): Pair<Int, String> {
         if (saves.isEmpty()) {
-            return 0 to "No editable saves under Android/data/$PACKAGE (currency is usually root-only PlayerPrefs)."
+            return 0 to "No writable game files under Android/data/$PACKAGE"
         }
         var total = 0
         val notes = mutableListOf<String>()
         for (hit in saves) {
             val f = hit.file
+            // Never treat our Download exports as game saves (path guard).
+            if (f.absolutePath.contains("/Download/TuberSaveOverlay", ignoreCase = true)) {
+                continue
+            }
             if (!f.canWrite() && !f.setWritable(true)) {
                 notes += "skip ${hit.label} (not writable)"
                 continue
@@ -196,34 +224,45 @@ object NoRootSaveAccess {
                 }
             }
         }
-        return total to notes.joinToString("; ").ifBlank { "no changes written" }
+        return total to notes.joinToString("; ").ifBlank { "no game-file changes" }
     }
 
-    /**
-     * Full no-root apply: patch external saves, export XML, restart game.
-     */
-    fun applyAndRestart(context: Context, values: Map<String, String>, xml: String): String {
-        val saves = findEditableSaves()
+    fun applyAndRestart(context: Context, values: Map<String, String>, xml: String): ApplyResult {
+        val saves = findGameSaves()
+        val reachable = gameAndroidDataRoots().any { it.exists() && it.listFiles() != null }
         val (count, note) = patchSaves(saves, values)
         val export = exportXmlToDownloads(xml)
         val mirror = tryWritePrefsMirror(xml)
         val restart = restartGame(context)
-        val parts = mutableListOf<String>()
-        if (count > 0) {
-            parts += "Patched $count values ($note)"
+
+        val changed = count > 0
+        val summary = if (changed) {
+            buildString {
+                append("CHANGED GAME: $count edits ($note). $restart")
+                if (export != null) append(" · backup XML in Download/TuberSaveOverlay")
+            }
         } else {
-            parts += note
+            buildString {
+                append("DID NOT CHANGE GAME VALUES. ")
+                append(diagnoseAndroidData())
+                append(" · ")
+                append(note)
+                if (mirror != null) append(" · wrote unused mirror $mirror")
+                if (export != null) append(" · exported XML only to Download (game ignores this)")
+                append(" · $restart")
+                append(" · Bux/Gems need Magisk ROOT (or BlueStacks Root ON).")
+            }
         }
-        if (export != null) parts += "XML → ${export.absolutePath}"
-        if (mirror != null) parts += "Mirror → $mirror"
-        parts += restart
-        if (count == 0) {
-            parts += "Tip: this game keeps Bux/Gems in a private folder Android locks without root."
-        }
-        return parts.joinToString(" · ")
+        return ApplyResult(
+            gameEdits = count,
+            androidDataReachable = reachable,
+            exportPath = export?.absolutePath,
+            restartMsg = restart,
+            summary = summary,
+            changedGame = changed,
+        )
     }
 
-    /** JSON/"key": 123 or XML name="key" value="123" style. */
     private fun patchKeyValue(text: String, key: String, newValue: String): Pair<Int, String> {
         var count = 0
         var out = text
@@ -261,9 +300,6 @@ object NoRootSaveAccess {
         return count to out
     }
 
-    /**
-     * Restart without root: go Home → kill background processes → launch game.
-     */
     fun restartGame(context: Context): String {
         val pm = context.packageManager
         val launch = pm.getLaunchIntentForPackage(PACKAGE)
