@@ -281,7 +281,28 @@ object GameSaveAccess {
         return changed
     }
 
-    /** Force-stop, clamp/fix insane prefs that brick the splash screen, write back. */
+    fun freshStartClearData(): Pair<Boolean, String> {
+        if (!hasRoot(2_000)) return false to "Need root"
+        runSu("am force-stop $PACKAGE", timeoutMs = 4_000)
+        try {
+            Thread.sleep(400)
+        } catch (_: InterruptedException) {
+        }
+        // Wipe prefs (keeps APK) — clears splash security lock from bad save
+        val wipe = runSu(
+            "rm -rf /data/data/$PACKAGE/shared_prefs/* /data/user/0/$PACKAGE/shared_prefs/*; " +
+                "pm clear $PACKAGE 2>/dev/null; echo CLEARED",
+            timeoutMs = 8_000,
+        )
+        prefsPathCache.set(null)
+        return if (wipe.output.contains("CLEARED") || wipe.success) {
+            true to "Fresh save — game data cleared. Open game, get in-world, then use LIVE APPLY (no restart)."
+        } else {
+            false to "Clear failed: ${wipe.output}"
+        }
+    }
+
+    /** Clamp prefs on disk without clearing everything (still may trip restart security). */
     fun unstickGame(workingFile: File): Pair<Boolean, String> {
         if (!hasRoot(2_000)) {
             return false to "Need root to fix the save."

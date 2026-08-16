@@ -178,7 +178,7 @@
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
                 android:layout_marginTop="8dp"
-                android:text="FIX / GLITCH"
+                android:text="FIX / LIVE"
                 android:textColor="@color/accent"
                 android:textStyle="bold" />
 
@@ -186,7 +186,7 @@
                 android:id="@+id/btnUnstick"
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
-                android:text="UNSTICK GAME (fix splash crash)"
+                android:text="FRESH START (clear data if splash locked)"
                 android:textSize="12sp" />
 
             <LinearLayout
@@ -224,7 +224,7 @@
                     android:layout_height="wrap_content"
                     android:layout_marginEnd="4dp"
                     android:layout_weight="1"
-                    android:text="NEGATIVE"
+                    android:text="ZERO"
                     android:textSize="11sp" />
                 <com.google.android.material.button.MaterialButton
                     android:id="@+id/btnGlitchChaos"
@@ -249,7 +249,7 @@
                 android:id="@+id/btnApplyRestart"
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
-                android:text="APPLY LIVE SAVE &amp; RESTART"
+                android:text="LIVE APPLY IN RAM (no restart)"
                 android:textSize="14sp" />
 
             <com.google.android.material.button.MaterialButton
@@ -257,7 +257,7 @@
                 style="@style/Widget.MaterialComponents.Button.OutlinedButton"
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
-                android:text="Only update keys in menu"
+                android:text="Disk write + restart (trips security)"
                 android:textSize="11sp" />
 
             <com.google.android.material.button.MaterialButton
@@ -265,7 +265,7 @@
                 style="@style/Widget.MaterialComponents.Button.OutlinedButton"
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
-                android:text="Re-pull live save (ROOT)"
+                android:text="Snapshot fields as OLD values"
                 android:textSize="11sp" />
 
             <com.google.android.material.button.MaterialButton
@@ -273,7 +273,7 @@
                 style="@style/Widget.MaterialComponents.Button.OutlinedButton"
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
-                android:text="Write save only (stop game)"
+                android:text="Write save only (disk, no relaunch)"
                 android:textSize="11sp" />
 
             <LinearLayout

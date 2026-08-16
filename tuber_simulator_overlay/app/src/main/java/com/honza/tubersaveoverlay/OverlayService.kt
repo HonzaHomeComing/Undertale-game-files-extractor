@@ -54,6 +54,8 @@ class OverlayService : Service() {
     private var loadedName: String = "Working save: empty — Pull (root) or Load XML"
     private var ignoreBubbleTapUntil = 0L
     private val keyEditors = mutableMapOf<String, EditText>()
+    /** In-game numbers at snapshot time — used as RAM search targets for LIVE APPLY. */
+    private var ramBaseline: Map<String, Long> = emptyMap()
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -217,22 +219,22 @@ class OverlayService : Service() {
         }
         b.btnLoad.setOnClickListener { requestFile(load = true) }
         b.btnSave.setOnClickListener { requestFile(load = false) }
-        b.btnApplyRestart.setOnClickListener { applyAndRestartGame() }
-        b.btnApplyFields.setOnClickListener { applyAllFields() }
-        b.btnPullRoot.setOnClickListener { pullSaves() }
+        b.btnApplyRestart.setOnClickListener { applyLiveRam() }
+        b.btnApplyFields.setOnClickListener { applyDiskAndRestart() }
+        b.btnPullRoot.setOnClickListener { snapshotOldValues() }
         b.btnPushRoot.setOnClickListener { pushRoot(relaunch = false) }
-        b.btnUnstick.setOnClickListener { unstickGame() }
-        b.btnGlitchMax.setOnClickListener { glitchPreset("max", restart = true) }
-        b.btnGlitchOverflow.setOnClickListener { glitchPreset("overflow", restart = true) }
-        b.btnGlitchNeg.setOnClickListener { glitchPreset("neg", restart = true) }
-        b.btnGlitchChaos.setOnClickListener { glitchPreset("chaos", restart = true) }
+        b.btnUnstick.setOnClickListener { freshStartGame() }
+        b.btnGlitchMax.setOnClickListener { glitchPreset("max", restart = false) }
+        b.btnGlitchOverflow.setOnClickListener { glitchPreset("overflow", restart = false) }
+        b.btnGlitchNeg.setOnClickListener { glitchPreset("neg", restart = false) }
+        b.btnGlitchChaos.setOnClickListener { glitchPreset("chaos", restart = false) }
 
         refreshQuickFields()
         rebuildKeyEditors()
         windowManager.addView(panelView, params)
         toast("Cheat menu open — use X to close")
 
-        // Rooted BlueStacks: auto-pull live save so edits apply to the real file.
+        // Rooted BlueStacks: auto-pull live save snapshot (for RAM search baselines).
         Thread {
             GameSaveAccess.invalidateRootCache()
             val rooted = GameSaveAccess.hasRoot()
@@ -245,7 +247,7 @@ class OverlayService : Service() {
             }
             mainHandler.post {
                 if (panelBinding !== b) return@post
-                b.statusLine.text = "ROOT OK — loading live save…"
+                b.statusLine.text = "ROOT OK — snapshotting save for LIVE RAM…"
             }
             val (ok, payload) = GameSaveAccess.pullPrefsXml()
             mainHandler.post {
@@ -254,14 +256,15 @@ class OverlayService : Service() {
                     entries = PlayerPrefsXml.parse(payload)
                     GameSaveAccess.ensureDefaults(entries)
                     workingFile().writeText(payload)
-                    loadedName = "Live save (${entries.size} keys)"
+                    loadedName = "Snapshot (${entries.size} keys)"
                     b.fileLabel.text = loadedName
                     refreshQuickFields()
                     rebuildKeyEditors()
-                    b.statusLine.text = "Live save loaded — edit values, tap APPLY & RESTART."
-                    toast("Live save loaded (${entries.size} keys)")
+                    captureRamBaseline()
+                    b.statusLine.text = "Ready — get IN-GAME (past splash), edit numbers, tap LIVE APPLY (no restart)."
+                    toast("Snapshot ready — use LIVE APPLY in-game")
                 } else {
-                    b.statusLine.text = "ROOT OK but pull failed: $payload — open the game once, then Scan."
+                    b.statusLine.text = "ROOT OK — open game once, then Re-pull. Use FRESH START if stuck on splash."
                 }
             }
         }.start()
@@ -439,10 +442,96 @@ class OverlayService : Service() {
         return map
     }
 
-    /** Rooted BlueStacks: merge edits into live prefs → write → relaunch. */
-    private fun applyAndRestartGame() {
-        setStatus("Applying live save + restarting…")
-        toast("Applying…")
+    private fun captureRamBaseline() {
+        val b = panelBinding
+        val map = linkedMapOf<String, Long>()
+        fun put(key: String, raw: String?) {
+            val v = raw?.trim()?.toLongOrNull() ?: return
+            map[key] = v
+        }
+        if (b != null) {
+            put("bux", b.fieldBux.text?.toString())
+            put("gems", b.fieldGems.text?.toString())
+            put("knowledge", b.fieldKnowledge.text?.toString())
+            put("subs", b.fieldSubs.text?.toString())
+            put("views", b.fieldViews.text?.toString())
+            put("level", b.fieldLevel.text?.toString())
+            put("items", b.fieldItems.text?.toString())
+            put("furniture", b.fieldFurniture.text?.toString())
+        }
+        ramBaseline = map
+    }
+
+    /** Patch running game memory — no restart (avoids splash security). */
+    private fun applyLiveRam() {
+        setStatus("LIVE RAM apply — scanning game process (no restart)…")
+        toast("Live RAM edit…")
+        Thread {
+            if (!GameSaveAccess.hasRoot()) {
+                mainHandler.post {
+                    setStatus("Need BlueStacks Root ON")
+                    toast("Root required")
+                }
+                return@Thread
+            }
+            var news = mapOf<String, Long>()
+            syncOnMain {
+                syncKeyEditorsFromUi()
+                applyFieldValuesIntoEntries()
+                val b = panelBinding
+                val m = linkedMapOf<String, Long>()
+                fun put(key: String, raw: String?) {
+                    val v = raw?.trim()?.toLongOrNull() ?: return
+                    m[key] = v
+                }
+                if (b != null) {
+                    put("bux", b.fieldBux.text?.toString())
+                    put("gems", b.fieldGems.text?.toString())
+                    put("knowledge", b.fieldKnowledge.text?.toString())
+                    put("subs", b.fieldSubs.text?.toString())
+                    put("views", b.fieldViews.text?.toString())
+                    put("level", b.fieldLevel.text?.toString())
+                    put("items", b.fieldItems.text?.toString())
+                    put("furniture", b.fieldFurniture.text?.toString())
+                }
+                news = m
+            }
+            if (ramBaseline.isEmpty()) {
+                // Assume baseline = current fields before user edited — can't know; use disk snapshot
+                mainHandler.post {
+                    setStatus("Re-pull / open menu once so OLD values are snapshotted, then change numbers and LIVE APPLY.")
+                    toast("Snapshot missing — re-open menu")
+                }
+                return@Thread
+            }
+            val changes = mutableListOf<Pair<Long, Long>>()
+            for ((k, newV) in news) {
+                val oldV = ramBaseline[k] ?: continue
+                if (oldV != newV) changes += oldV to newV
+            }
+            if (changes.isEmpty()) {
+                mainHandler.post {
+                    setStatus("Change at least one number away from the snapshot, then LIVE APPLY.")
+                    toast("No changes vs snapshot")
+                }
+                return@Thread
+            }
+            val result = LiveMemoryEditor.replaceMany(changes)
+            mainHandler.post {
+                setStatus(result.message)
+                toast(if (result.ok) "Live RAM applied — stay in game" else "Live RAM failed")
+                if (result.ok) {
+                    // New baseline = what we just wrote
+                    ramBaseline = news
+                }
+            }
+        }.start()
+    }
+
+    /** Disk write + restart — often trips Outerminds splash security. */
+    private fun applyDiskAndRestart() {
+        setStatus("Disk write + restart (may trip security)…")
+        toast("Disk apply…")
         Thread {
             var values: Map<String, String> = emptyMap()
             var snapshot: List<PrefEntry> = emptyList()
@@ -452,74 +541,52 @@ class OverlayService : Service() {
                 values = collectValuesMap()
                 snapshot = entries.map { it.copy() }
             }
-            val wf = workingFile()
-
             if (!GameSaveAccess.hasRoot()) {
                 mainHandler.post {
-                    setStatus("Need BlueStacks Root ON (Settings → Advanced), then restart BlueStacks.")
+                    setStatus("Need root")
                     toast("Root required")
                 }
                 return@Thread
             }
-
-            val (ok, msg) = GameSaveAccess.applyLiveEdits(values, snapshot, wf)
-            if (!ok) {
-                mainHandler.post {
+            val (ok, msg) = GameSaveAccess.applyLiveEdits(values, snapshot, workingFile())
+            mainHandler.post {
+                if (!ok) {
                     setStatus(msg)
                     toast(msg)
+                    return@post
                 }
-                return@Thread
-            }
-            // Refresh in-memory entries from what we wrote
-            try {
-                entries = PlayerPrefsXml.parse(wf.readText())
-            } catch (_: Exception) {
-            }
-            Thread.sleep(400)
-            mainHandler.post {
                 relaunchGame()
-                loadedName = "Applied live (${entries.size} keys)"
-                panelBinding?.fileLabel?.text = loadedName
-                refreshQuickFields()
-                rebuildKeyEditors()
-                setStatus("DONE — $msg — game relaunched.")
-                toast("Values applied — game restarted")
+                setStatus("Disk written — $msg (if splash hangs, use FRESH START then LIVE APPLY)")
+                toast("Restarted — if stuck, Fresh Start")
             }
         }.start()
     }
 
-    private fun unstickGame() {
-        setStatus("Fixing stuck splash — clamping insane values…")
-        toast("Unsticking…")
+    private fun freshStartGame() {
+        setStatus("FRESH START — clearing game data to bypass splash lock…")
+        toast("Clearing game data…")
         Thread {
-            val (ok, msg) = GameSaveAccess.unstickGame(workingFile())
-            if (!ok) {
-                mainHandler.post {
-                    setStatus(msg)
-                    toast(msg)
-                }
-                return@Thread
-            }
-            try {
-                entries = PlayerPrefsXml.parse(workingFile().readText())
-            } catch (_: Exception) {
-            }
-            Thread.sleep(400)
+            val (ok, msg) = GameSaveAccess.freshStartClearData()
             mainHandler.post {
-                loadedName = "Unstuck save (${entries.size} keys)"
-                panelBinding?.fileLabel?.text = loadedName
-                refreshQuickFields()
-                rebuildKeyEditors()
-                relaunchGame()
-                setStatus("DONE — $msg")
-                toast("Game unstuck — relaunched")
+                setStatus(msg)
+                toast(if (ok) "Cleared — open game" else msg)
+            }
+            if (ok) {
+                Thread.sleep(500)
+                mainHandler.post { relaunchGame() }
             }
         }.start()
     }
 
-    private fun glitchPreset(kind: String, restart: Boolean = true) {
+    /** @deprecated name kept for any leftover refs */
+    private fun applyAndRestartGame() = applyLiveRam()
+
+    private fun unstickGame() = freshStartGame()
+
+    private fun glitchPreset(kind: String, restart: Boolean = false) {
         val b = panelBinding ?: return
-        // SAFE presets — huge levels brick the OUTERMINDS splash.
+        // Snapshot OLD values before overwriting fields (needed for RAM search).
+        if (ramBaseline.isEmpty()) captureRamBaseline()
         when (kind) {
             "max" -> {
                 b.fieldBux.setText("9999999")
@@ -532,7 +599,6 @@ class OverlayService : Service() {
                 b.fieldFurniture.setText("200")
             }
             "overflow" -> {
-                // Still capped — true Int.MAX crashes load
                 b.fieldBux.setText("99999999")
                 b.fieldGems.setText("9999999")
                 b.fieldKnowledge.setText("9999999")
@@ -566,75 +632,50 @@ class OverlayService : Service() {
         }
         syncKeyEditorsFromUi()
         applyFieldValuesIntoEntries()
-        // Do NOT smash every key — that set ChannelLevel to billions and stuck splash.
         GameSaveAccess.clampEntriesForStability(entries)
-        workingFile().writeText(PlayerPrefsXml.toXml(entries))
         rebuildKeyEditors()
         refreshQuickFields()
-        if (restart) {
-            setStatus("SAFE GLITCH ($kind) → writing + restarting…")
-            toast("Applying safe glitch…")
-            applyAndRestartGame()
+        setStatus("SAFE RICH ready — tapping LIVE APPLY (no restart)…")
+        if (!restart) {
+            applyLiveRam()
         } else {
-            setStatus("Glitch ($kind) ready — tap APPLY")
-            toast("Glitch ready")
+            applyDiskAndRestart()
         }
     }
 
+    /** Lock the numbers currently in the fields as the in-game OLD values for RAM search. */
+    private fun snapshotOldValues() {
+        syncKeyEditorsFromUi()
+        applyFieldValuesIntoEntries()
+        captureRamBaseline()
+        setStatus(
+            "Snapshot locked: " +
+                ramBaseline.entries.joinToString { "${it.key}=${it.value}" }.ifBlank { "(empty)" } +
+                " — now change fields to NEW values and tap LIVE APPLY.",
+        )
+        toast("OLD values snapshotted")
+    }
+
     private fun pullSaves() {
+        snapshotOldValues()
         Thread {
             if (GameSaveAccess.hasRoot()) {
                 val (ok, payload) = GameSaveAccess.pullPrefsXml()
                 mainHandler.post {
                     if (!ok) {
-                        setStatus(payload)
-                        toast(payload)
+                        setStatus(payload + " — you can still type on-screen values and Snapshot.")
                         return@post
                     }
                     entries = PlayerPrefsXml.parse(payload)
                     GameSaveAccess.ensureDefaults(entries)
                     workingFile().writeText(payload)
-                    loadedName = "Pulled live from game (${entries.size} keys)"
+                    loadedName = "Pulled (${entries.size} keys)"
                     panelBinding?.fileLabel?.text = loadedName
                     refreshQuickFields()
                     rebuildKeyEditors()
-                    setStatus("Pulled — edit values, then APPLY & RESTART GAME")
-                    toast("Pulled ${entries.size} keys")
-                }
-                return@Thread
-            }
-            val saves = NoRootSaveAccess.findGameSaves()
-            val xmlHit = saves.firstOrNull { hit ->
-                hit.file.extension.equals("xml", true) &&
-                    try {
-                        hit.file.readText().contains("<map", ignoreCase = true)
-                    } catch (_: Exception) {
-                        false
-                    }
-            }
-            mainHandler.post {
-                if (xmlHit != null) {
-                    try {
-                        val payload = xmlHit.file.readText()
-                        entries = PlayerPrefsXml.parse(payload)
-                        GameSaveAccess.ensureDefaults(entries)
-                        workingFile().writeText(payload)
-                        loadedName = "Phone save: ${xmlHit.label} (${entries.size} keys)"
-                        panelBinding?.fileLabel?.text = loadedName
-                        refreshQuickFields()
-                        rebuildKeyEditors()
-                        setStatus("Loaded Android/data XML — edit, then APPLY & RESTART")
-                        toast("Loaded ${entries.size} keys from phone")
-                    } catch (e: Exception) {
-                        setStatus("Read failed: ${e.message}")
-                        toast("Read failed")
-                    }
-                } else {
-                    setStatus(
-                        "Scan: ${NoRootSaveAccess.diagnoseAndroidData()} " +
-                            "Bux/Gems are in a ROOT-only folder on this game.",
-                    )
-                    toast("No editable game save without root")
+                    captureRamBaseline()
+                    setStatus("Pulled + snapshotted — change numbers, LIVE APPLY (no restart).")
+                    toast("Pulled + snapshot")
                 }
             }
         }.start()

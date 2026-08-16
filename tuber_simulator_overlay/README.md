@@ -1,25 +1,16 @@
-# Tuber Simulator Overlay (BlueStacks root)
+# Tuber Simulator Overlay — live RAM (BlueStacks root)
 
-Floating cheat overlay for **PewDiePie’s Tuber Simulator** on **rooted BlueStacks**.
+## Why restart failed
+Writing PlayerPrefs + restart trips Outerminds’ load check → stuck on OUTERMINDS splash.
+**LIVE APPLY IN RAM** patches the running game process and does **not** restart.
 
-## Install in BlueStacks
+## Flow
+1. BlueStacks **Root ON**
+2. Install APK, Start overlay
+3. If stuck on splash → **FRESH START** (clears data) → open game until you’re in-world
+4. Type the numbers you **see on screen** into the fields → **Snapshot fields as OLD values**
+5. Change fields to the new amounts → **LIVE APPLY IN RAM (no restart)**
+6. Stay in the game — don’t restart
 
-1. BlueStacks → **Settings → Advanced → Root ON** → restart BlueStacks  
-2. Install:  
-   **https://github.com/HonzaHomeComing/Undertale-game-files-extractor/raw/cursor/tuber-simulator-overlay-cb61/tuber_simulator_overlay/dist/TuberSaveOverlay-debug.apk**  
-3. Allow **Display over other apps** → **Start overlay**  
-4. Open Tuber Simulator → tap the **red bubble**  
-5. Menu **auto-loads the live save** → edit Bux/Gems/etc → **APPLY LIVE SAVE & RESTART**
-
-## What Apply does
-
-1. Force-stops the game (so it can’t overwrite the file)  
-2. Merges your edits into the real `playerprefs` XML under `/data/data/…`  
-3. Writes the file with root + fixes ownership  
-4. Relaunches the game  
-
-Unity keeps prefs in memory, so a **quick restart is required** for new values to show. You edit while the overlay is open over the game; Apply does the stop/write/relaunch.
-
-## Magisk phone
-
-Same APK works if Magisk root is granted to the overlay — same Apply flow.
+## Download
+https://github.com/HonzaHomeComing/Undertale-game-files-extractor/raw/cursor/tuber-simulator-overlay-cb61/tuber_simulator_overlay/dist/TuberSaveOverlay-debug.apk
