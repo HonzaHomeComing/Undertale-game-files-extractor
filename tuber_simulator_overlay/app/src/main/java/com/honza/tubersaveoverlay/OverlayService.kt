@@ -464,8 +464,8 @@ class OverlayService : Service() {
 
     /** Patch running game memory — no restart (avoids splash security). */
     private fun applyLiveRam() {
-        setStatus("LIVE RAM apply — scanning game process (no restart)…")
-        toast("Live RAM edit…")
+        setStatus("LIVE RAM — diagnosing + scanning (keep game open)…")
+        toast("Live RAM… keep game on screen")
         Thread {
             if (!GameSaveAccess.hasRoot()) {
                 mainHandler.post {
@@ -474,6 +474,9 @@ class OverlayService : Service() {
                 }
                 return@Thread
             }
+            val diag = LiveMemoryEditor.diagnose(this)
+            mainHandler.post { setStatus("Scan: $diag") }
+
             var news = mapOf<String, Long>()
             syncOnMain {
                 syncKeyEditorsFromUi()
@@ -497,10 +500,11 @@ class OverlayService : Service() {
                 news = m
             }
             if (ramBaseline.isEmpty()) {
-                // Assume baseline = current fields before user edited — can't know; use disk snapshot
                 mainHandler.post {
-                    setStatus("Re-pull / open menu once so OLD values are snapshotted, then change numbers and LIVE APPLY.")
-                    toast("Snapshot missing — re-open menu")
+                    setStatus(
+                        "No OLD snapshot. Type the numbers you SEE in-game → Snapshot → change → LIVE APPLY. ($diag)",
+                    )
+                    toast("Snapshot OLD values first")
                 }
                 return@Thread
             }
@@ -511,19 +515,23 @@ class OverlayService : Service() {
             }
             if (changes.isEmpty()) {
                 mainHandler.post {
-                    setStatus("Change at least one number away from the snapshot, then LIVE APPLY.")
-                    toast("No changes vs snapshot")
+                    setStatus("Change a field away from snapshot first. Snapshot=${ramBaseline}. $diag")
+                    toast("Change a value first")
                 }
                 return@Thread
             }
-            val result = LiveMemoryEditor.replaceMany(changes)
             mainHandler.post {
-                setStatus(result.message)
-                toast(if (result.ok) "Live RAM applied — stay in game" else "Live RAM failed")
-                if (result.ok) {
-                    // New baseline = what we just wrote
-                    ramBaseline = news
+                setStatus("Patching RAM ${changes.joinToString { "${it.first}→${it.second}" }} …")
+            }
+            val result = LiveMemoryEditor.replaceMany(this, changes)
+            mainHandler.post {
+                val msg = buildString {
+                    append(result.message)
+                    if (result.detail.isNotBlank()) append(" | ").append(result.detail)
                 }
+                setStatus(msg)
+                toast(msg.take(80))
+                if (result.ok) ramBaseline = news
             }
         }.start()
     }

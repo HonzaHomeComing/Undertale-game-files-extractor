@@ -11,8 +11,8 @@ android {
         applicationId = "com.honza.tubersaveoverlay"
         minSdk = 26
         targetSdk = 34
-        versionCode = 8
-        versionName = "1.4.0-live-ram"
+        versionCode = 9
+        versionName = "1.4.1-ram-diag"
     }
 
     buildTypes {
