@@ -14,6 +14,7 @@ import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
 import android.provider.OpenableColumns
+import android.view.ContextThemeWrapper
 import android.view.Gravity
 import android.view.LayoutInflater
 import android.view.MotionEvent
@@ -143,10 +144,16 @@ class OverlayService : Service() {
             WindowManager.LayoutParams.TYPE_PHONE
         }
 
+    /** Service context has no theme — Material/?attr layouts crash without this. */
+    private fun overlayInflater(): LayoutInflater {
+        val themed = ContextThemeWrapper(this, R.style.Theme_TuberSaveOverlay)
+        return LayoutInflater.from(themed)
+    }
+
     private fun showBubble() {
         if (bubbleView != null) return
         try {
-            bubbleBinding = OverlayBubbleBinding.inflate(LayoutInflater.from(this))
+            bubbleBinding = OverlayBubbleBinding.inflate(overlayInflater())
             bubbleView = bubbleBinding!!.root
             val params = WindowManager.LayoutParams(
                 WindowManager.LayoutParams.WRAP_CONTENT,
@@ -183,7 +190,7 @@ class OverlayService : Service() {
 
     private fun showPanel() {
         if (panelView != null) return
-        panelBinding = OverlayPanelBinding.inflate(LayoutInflater.from(this))
+        panelBinding = OverlayPanelBinding.inflate(overlayInflater())
         panelView = panelBinding!!.root
 
         val params = WindowManager.LayoutParams(

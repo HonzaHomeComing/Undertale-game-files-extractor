@@ -11,8 +11,8 @@ android {
         applicationId = "com.honza.tubersaveoverlay"
         minSdk = 26
         targetSdk = 34
-        versionCode = 3
-        versionName = "1.1.1-crashfix"
+        versionCode = 4
+        versionName = "1.1.2-menu-fix"
     }
 
     buildTypes {

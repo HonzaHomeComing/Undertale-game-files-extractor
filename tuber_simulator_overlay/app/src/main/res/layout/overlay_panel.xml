@@ -27,8 +27,10 @@
             android:id="@+id/btnClosePanel"
             android:layout_width="40dp"
             android:layout_height="40dp"
-            android:background="?attr/selectableItemBackgroundBorderless"
+            android:background="@android:color/transparent"
             android:contentDescription="Close"
+            android:padding="8dp"
+            android:scaleType="centerInside"
             android:src="@android:drawable/ic_menu_close_clear_cancel"
             android:tint="@color/ink" />
     </LinearLayout>
