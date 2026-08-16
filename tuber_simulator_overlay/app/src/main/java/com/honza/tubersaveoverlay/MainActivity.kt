@@ -43,31 +43,51 @@ class MainActivity : AppCompatActivity() {
             when {
                 !overlay -> append(getString(R.string.need_overlay))
                 OverlayService.isRunning -> append("Overlay running — look for the red bubble.")
-                else -> append("Ready. Grant permissions, then Start overlay.")
+                else -> append("Ready. Grant overlay permission, then Start overlay.")
             }
             append('\n')
-            append(if (files) "All-files access: OK" else "All-files access: NEEDED (for phone saves)")
+            append(if (files) "All-files access: OK" else "All-files access: optional (button below)")
             append('\n')
             append(
-                if (GameSaveAccess.hasRoot()) {
-                    "Root: OK (live PlayerPrefs push available)"
-                } else {
-                    "Root: no — Apply & Restart uses phone no-root mode"
+                when (GameSaveAccess.hasRootCached()) {
+                    true -> "Root: OK"
+                    else -> "Root: not required for phone mode"
                 },
             )
         }
+        // Probe root off the UI thread (su can hang on non-root phones).
+        Thread {
+            val rooted = GameSaveAccess.hasRoot()
+            runOnUiThread {
+                if (!::binding.isInitialized) return@runOnUiThread
+                val base = binding.status.text?.toString().orEmpty()
+                    .lineSequence()
+                    .filterNot { it.startsWith("Root:") }
+                    .joinToString("\n")
+                binding.status.text = base + "\nRoot: " + if (rooted) "OK" else "not required for phone mode"
+            }
+        }.start()
     }
 
     private fun openOverlaySettings() {
-        val intent = Intent(
-            Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
-            Uri.parse("package:$packageName"),
-        )
-        startActivity(intent)
+        try {
+            startActivity(
+                Intent(
+                    Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
+                    Uri.parse("package:$packageName"),
+                ),
+            )
+        } catch (e: Exception) {
+            Toast.makeText(this, "Open Settings → Apps → this app → Display over other apps", Toast.LENGTH_LONG).show()
+        }
     }
 
     private fun openAllFilesSettings() {
-        startActivity(NoRootSaveAccess.allFilesAccessIntent(this))
+        try {
+            startActivity(NoRootSaveAccess.allFilesAccessIntent(this))
+        } catch (e: Exception) {
+            Toast.makeText(this, "Open Settings → Apps → this app → Files / storage → Allow all", Toast.LENGTH_LONG).show()
+        }
     }
 
     private fun startOverlay() {
@@ -76,25 +96,28 @@ class MainActivity : AppCompatActivity() {
             openOverlaySettings()
             return
         }
-        if (!NoRootSaveAccess.hasAllFilesAccess()) {
-            Toast.makeText(this, R.string.need_all_files, Toast.LENGTH_LONG).show()
-            openAllFilesSettings()
-            // Still start overlay so they can use it after granting.
+        try {
+            val intent = Intent(this, OverlayService::class.java).setAction(OverlayService.ACTION_START)
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                startForegroundService(intent)
+            } else {
+                startService(intent)
+            }
+            Toast.makeText(this, "Overlay started — look for the red bubble", Toast.LENGTH_LONG).show()
+        } catch (e: Exception) {
+            Toast.makeText(this, "Start failed: ${e.message}", Toast.LENGTH_LONG).show()
         }
-        val intent = Intent(this, OverlayService::class.java).setAction(OverlayService.ACTION_START)
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            startForegroundService(intent)
-        } else {
-            startService(intent)
-        }
-        refreshStatus()
-        Toast.makeText(this, "Overlay started", Toast.LENGTH_SHORT).show()
+        binding.status.text = "Overlay starting — look for the red bubble on screen."
+        binding.root.postDelayed({ refreshStatus() }, 400)
     }
 
     private fun stopOverlay() {
-        startService(
-            Intent(this, OverlayService::class.java).setAction(OverlayService.ACTION_STOP),
-        )
+        try {
+            startService(
+                Intent(this, OverlayService::class.java).setAction(OverlayService.ACTION_STOP),
+            )
+        } catch (_: Exception) {
+        }
         refreshStatus()
     }
 }

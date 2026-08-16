@@ -3,9 +3,12 @@ package com.honza.tubersaveoverlay
 import java.io.BufferedReader
 import java.io.File
 import java.io.InputStreamReader
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicReference
 
 /**
- * Root helpers to read/write Tuber Simulator PlayerPrefs, then the UI relaunches the game.
+ * Root helpers to read/write Tuber Simulator PlayerPrefs.
+ * Never call [hasRoot] / [runSu] on the main thread — `su` can hang on non-root phones.
  */
 object GameSaveAccess {
     const val PACKAGE = "com.outerminds.tubular"
@@ -40,7 +43,30 @@ object GameSaveAccess {
         PrefEntry("PropsUnlocked", PrefType.INT, "0"),
     )
 
-    fun hasRoot(): Boolean = runSu("id").success && runSu("id").output.contains("uid=0")
+    private val rootCache = AtomicReference<Boolean?>(null)
+
+    /** Instant: cached value or false (assume no root until probed off the UI thread). */
+    fun hasRootCached(): Boolean = rootCache.get() == true
+
+    /**
+     * Probe root with a short timeout. Safe to call from a background thread only.
+     * On phones without root, `su` often hangs — we kill it after [timeoutMs].
+     */
+    fun hasRoot(timeoutMs: Long = 700): Boolean {
+        rootCache.get()?.let { return it }
+        val ok = probeRoot(timeoutMs)
+        rootCache.set(ok)
+        return ok
+    }
+
+    fun invalidateRootCache() {
+        rootCache.set(null)
+    }
+
+    private fun probeRoot(timeoutMs: Long): Boolean {
+        val res = runSu("id", timeoutMs)
+        return res.success && res.output.contains("uid=0")
+    }
 
     fun findPrefsPath(): String? {
         for (p in CANDIDATE_PATHS) {
@@ -65,10 +91,9 @@ object GameSaveAccess {
      */
     fun pushPrefsAndStopGame(xml: String, workingFile: File): Pair<Boolean, String> {
         val path = findPrefsPath()
-            ?: return false to "No playerprefs path (need root / BlueStacks root ON)."
+            ?: return false to "No playerprefs path (need root)."
         workingFile.parentFile?.mkdirs()
         workingFile.writeText(xml)
-        // Make readable by root copy; BlueStacks sometimes needs world-readable temp
         workingFile.setReadable(true, false)
 
         val script = """
@@ -77,17 +102,15 @@ object GameSaveAccess {
             am force-stop $PACKAGE
             sleep 0.4
             """.trimIndent().replace("\n", "; ")
-        val res = runSu(script)
+        val res = runSu(script, timeoutMs = 8_000)
         return if (res.success) {
             true to "Saved. Restarting Tuber Simulator…"
         } else {
-            // Still try force-stop; report error
-            runSu("am force-stop $PACKAGE")
-            false to "Push failed (is BlueStacks root ON?): ${res.output}"
+            runSu("am force-stop $PACKAGE", timeoutMs = 3_000)
+            false to "Push failed: ${res.output}"
         }
     }
 
-    /** @deprecated use pushPrefsAndStopGame */
     fun pushPrefsXml(xml: String, workingFile: File): Pair<Boolean, String> =
         pushPrefsAndStopGame(xml, workingFile)
 
@@ -103,16 +126,27 @@ object GameSaveAccess {
 
     data class SuResult(val success: Boolean, val output: String)
 
-    fun runSu(command: String): SuResult {
+    fun runSu(command: String, timeoutMs: Long = 5_000): SuResult {
         return try {
             val p = ProcessBuilder("su", "-c", command)
                 .redirectErrorStream(true)
                 .start()
-            val out = BufferedReader(InputStreamReader(p.inputStream)).readText()
-            val code = p.waitFor()
-            SuResult(code == 0, out.trim())
+            val finished = try {
+                p.waitFor(timeoutMs, TimeUnit.MILLISECONDS)
+            } catch (_: Exception) {
+                false
+            }
+            if (!finished) {
+                try {
+                    p.destroyForcibly()
+                } catch (_: Exception) {
+                }
+                return SuResult(false, "su timed out (${timeoutMs}ms)")
+            }
+            val out = BufferedReader(InputStreamReader(p.inputStream)).readText().trim()
+            SuResult(p.exitValue() == 0, out)
         } catch (e: Exception) {
-            SuResult(false, e.message ?: "su missing — turn on Root in BlueStacks Settings → Advanced")
+            SuResult(false, e.message ?: "su missing")
         }
     }
 }

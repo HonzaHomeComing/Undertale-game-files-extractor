@@ -6,6 +6,7 @@ import android.app.NotificationManager
 import android.app.PendingIntent
 import android.app.Service
 import android.content.Intent
+import android.content.pm.ServiceInfo
 import android.graphics.PixelFormat
 import android.net.Uri
 import android.os.Build
@@ -82,9 +83,15 @@ class OverlayService : Service() {
             }
             else -> {
                 if (!isRunning) {
-                    startAsForeground()
-                    showBubble()
-                    isRunning = true
+                    try {
+                        startAsForeground()
+                        showBubble()
+                        isRunning = true
+                    } catch (e: Exception) {
+                        toast("Overlay failed: ${e.message}")
+                        stopSelf()
+                        return START_NOT_STICKY
+                    }
                 }
             }
         }
@@ -117,7 +124,15 @@ class OverlayService : Service() {
             .setContentIntent(open)
             .setOngoing(true)
             .build()
-        startForeground(42, notification)
+        if (Build.VERSION.SDK_INT >= 34) {
+            startForeground(
+                42,
+                notification,
+                ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE,
+            )
+        } else {
+            startForeground(42, notification)
+        }
     }
 
     private fun overlayType(): Int =
@@ -130,28 +145,40 @@ class OverlayService : Service() {
 
     private fun showBubble() {
         if (bubbleView != null) return
-        bubbleBinding = OverlayBubbleBinding.inflate(LayoutInflater.from(this))
-        bubbleView = bubbleBinding!!.root
-        val params = WindowManager.LayoutParams(
-            WindowManager.LayoutParams.WRAP_CONTENT,
-            WindowManager.LayoutParams.WRAP_CONTENT,
-            overlayType(),
-            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
-                WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
-                WindowManager.LayoutParams.FLAG_HARDWARE_ACCELERATED,
-            PixelFormat.TRANSLUCENT,
-        ).apply {
-            gravity = Gravity.TOP or Gravity.START
-            x = 36
-            y = 220
+        try {
+            bubbleBinding = OverlayBubbleBinding.inflate(LayoutInflater.from(this))
+            bubbleView = bubbleBinding!!.root
+            val params = WindowManager.LayoutParams(
+                WindowManager.LayoutParams.WRAP_CONTENT,
+                WindowManager.LayoutParams.WRAP_CONTENT,
+                overlayType(),
+                WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                    WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
+                    WindowManager.LayoutParams.FLAG_HARDWARE_ACCELERATED,
+                PixelFormat.TRANSLUCENT,
+            ).apply {
+                gravity = Gravity.TOP or Gravity.START
+                x = 36
+                y = 220
+            }
+            bubbleParams = params
+            attachDrag(bubbleView!!, params) {
+                if (System.currentTimeMillis() < ignoreBubbleTapUntil) return@attachDrag
+                if (panelView == null) {
+                    try {
+                        showPanel()
+                    } catch (e: Exception) {
+                        toast("Menu failed: ${e.message}")
+                    }
+                }
+            }
+            windowManager.addView(bubbleView, params)
+            toast("Red bubble ready — tap it")
+        } catch (e: Exception) {
+            bubbleView = null
+            bubbleBinding = null
+            throw e
         }
-        bubbleParams = params
-        // Bubble only OPENS the menu (X closes). Avoids flashy open/close toggles.
-        attachDrag(bubbleView!!, params) {
-            if (System.currentTimeMillis() < ignoreBubbleTapUntil) return@attachDrag
-            if (panelView == null) showPanel()
-        }
-        windowManager.addView(bubbleView, params)
     }
 
     private fun showPanel() {
@@ -159,7 +186,6 @@ class OverlayService : Service() {
         panelBinding = OverlayPanelBinding.inflate(LayoutInflater.from(this))
         panelView = panelBinding!!.root
 
-        // Focusable so EditTexts work over the game; NOT_TOUCH_MODAL so game can still run under it.
         val params = WindowManager.LayoutParams(
             dp(340),
             dp(520),
@@ -177,14 +203,24 @@ class OverlayService : Service() {
 
         val b = panelBinding!!
         b.fileLabel.text = loadedName
+        // Never call su on the UI thread — it freezes/crashes non-root phones.
         b.statusLine.text = when {
-            GameSaveAccess.hasRoot() ->
+            GameSaveAccess.hasRootCached() ->
                 "ROOT OK — set values, tap APPLY & RESTART GAME."
             NoRootSaveAccess.hasAllFilesAccess() ->
-                "Phone mode — set values, tap APPLY & RESTART GAME (no root)."
+                "Phone mode — set values, tap APPLY & RESTART GAME."
             else ->
-                "Grant All files access in the overlay app, then APPLY & RESTART."
+                "Phone mode — set values, tap APPLY & RESTART GAME."
         }
+        Thread {
+            val rooted = GameSaveAccess.hasRoot()
+            mainHandler.post {
+                if (panelBinding !== b) return@post
+                if (rooted) {
+                    b.statusLine.text = "ROOT OK — set values, tap APPLY & RESTART GAME."
+                }
+            }
+        }.start()
         b.btnClosePanel.setOnClickListener {
             hidePanel()
             ignoreBubbleTapUntil = System.currentTimeMillis() + 400
@@ -564,18 +600,22 @@ class OverlayService : Service() {
     }
 
     private fun pushRoot(relaunch: Boolean) {
-        if (!GameSaveAccess.hasRoot()) {
-            // No-root: same as apply & restart (or apply without relaunch)
-            if (relaunch) {
-                applyAndRestartGame()
-            } else {
-                setStatus("No root — use APPLY & RESTART GAME (patches phone saves + relaunches).")
-                toast("Use APPLY & RESTART on phone")
-            }
-            return
-        }
-        setStatus(if (relaunch) "Writing + restarting…" else "Writing prefs (no relaunch)…")
         Thread {
+            val rooted = GameSaveAccess.hasRoot()
+            if (!rooted) {
+                mainHandler.post {
+                    if (relaunch) {
+                        applyAndRestartGame()
+                    } else {
+                        setStatus("No root — use APPLY & RESTART GAME.")
+                        toast("Use APPLY & RESTART on phone")
+                    }
+                }
+                return@Thread
+            }
+            mainHandler.post {
+                setStatus(if (relaunch) "Writing + restarting…" else "Writing prefs (no relaunch)…")
+            }
             syncOnMain {
                 syncKeyEditorsFromUi()
                 applyFieldValuesIntoEntries()
