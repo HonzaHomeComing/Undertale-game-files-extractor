@@ -101,3 +101,9 @@ Scan without deleting:
 ```bat
 python UndertaleDataWiper.py --scan-only
 ```
+
+## Tuber Simulator overlay (separate Android tool)
+
+Folder **`tuber_simulator_overlay/`** is a phone app that floats **on top of other apps** and edits PewDiePie’s Tuber Simulator `PlayerPrefs` XML saves.
+
+Open that folder in **Android Studio**, build the APK, grant **Display over other apps**, then use the red bubble. See `tuber_simulator_overlay/README.md` for ADB/root save paths and cloud-sync limits.
